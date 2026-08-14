@@ -153,47 +153,74 @@ impl NavState {
 /// hunk-jump math can be unit tested directly.
 #[derive(Default)]
 struct DiffViewState {
+    /// Topmost visible row (derived: follows the cursor).
     scroll: usize,
+    /// The addressed row — what j/k move, what gets highlighted, and what a
+    /// future annotation anchors to.
+    cursor: usize,
 }
 
 impl DiffViewState {
-    fn down(&mut self, row_count: usize) {
-        self.scroll = (self.scroll + 1).min(row_count.saturating_sub(1));
-    }
-
-    fn up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(1);
-    }
-
-    fn page_down(&mut self, page: usize, row_count: usize) {
-        self.scroll = (self.scroll + page).min(row_count.saturating_sub(1));
-    }
-
-    fn page_up(&mut self, page: usize) {
-        self.scroll = self.scroll.saturating_sub(page);
-    }
-
-    fn top(&mut self) {
-        self.scroll = 0;
-    }
-
-    fn bottom(&mut self, row_count: usize) {
-        self.scroll = row_count.saturating_sub(1);
-    }
-
-    /// Jump to the next hunk-header row strictly after the current scroll
-    /// position. No-op if there is none.
-    fn next_hunk(&mut self, hunk_rows: &[usize]) {
-        if let Some(&next) = hunk_rows.iter().find(|&&r| r > self.scroll) {
-            self.scroll = next;
+    /// Keep the cursor visible: scroll follows it at both edges.
+    fn follow(&mut self, viewport: usize) {
+        let viewport = viewport.max(1);
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + viewport {
+            self.scroll = self.cursor + 1 - viewport;
         }
     }
 
-    /// Jump to the previous hunk-header row strictly before the current
-    /// scroll position. No-op if there is none.
-    fn prev_hunk(&mut self, hunk_rows: &[usize]) {
-        if let Some(&prev) = hunk_rows.iter().rev().find(|&&r| r < self.scroll) {
-            self.scroll = prev;
+    fn reset(&mut self) {
+        self.scroll = 0;
+        self.cursor = 0;
+    }
+
+    fn down(&mut self, row_count: usize, viewport: usize) {
+        self.cursor = (self.cursor + 1).min(row_count.saturating_sub(1));
+        self.follow(viewport);
+    }
+
+    fn up(&mut self, viewport: usize) {
+        self.cursor = self.cursor.saturating_sub(1);
+        self.follow(viewport);
+    }
+
+    fn page_down(&mut self, page: usize, row_count: usize, viewport: usize) {
+        self.cursor = (self.cursor + page).min(row_count.saturating_sub(1));
+        self.follow(viewport);
+    }
+
+    fn page_up(&mut self, page: usize, viewport: usize) {
+        self.cursor = self.cursor.saturating_sub(page);
+        self.follow(viewport);
+    }
+
+    fn top(&mut self) {
+        self.cursor = 0;
+        self.scroll = 0;
+    }
+
+    fn bottom(&mut self, row_count: usize, viewport: usize) {
+        self.cursor = row_count.saturating_sub(1);
+        self.follow(viewport);
+    }
+
+    /// Move the cursor to the next hunk-header row strictly after it.
+    /// No-op if there is none.
+    fn next_hunk(&mut self, hunk_rows: &[usize], viewport: usize) {
+        if let Some(&next) = hunk_rows.iter().find(|&&r| r > self.cursor) {
+            self.cursor = next;
+            self.follow(viewport);
+        }
+    }
+
+    /// Move the cursor to the previous hunk-header row strictly before it.
+    /// No-op if there is none.
+    fn prev_hunk(&mut self, hunk_rows: &[usize], viewport: usize) {
+        if let Some(&prev) = hunk_rows.iter().rev().find(|&&r| r < self.cursor) {
+            self.cursor = prev;
+            self.follow(viewport);
         }
     }
 }
@@ -234,12 +261,19 @@ fn hunk_row_indices(rows: &[DiffRow]) -> Vec<usize> {
         .collect()
 }
 
-/// Half a screen's worth of diff rows, derived from the terminal size using
-/// the same chrome accounting as the real layout (header + note + footer +
-/// the diff pane's top/bottom border).
+/// Visible diff rows, derived from the terminal size via the SAME split
+/// logic as the real layout (header + note + footer chrome, then body_split,
+/// then the diff pane's top/bottom border) — so cursor-following stays
+/// correct in both the side-by-side and stacked layouts.
+fn diff_viewport_rows(term_size: Size) -> usize {
+    let body = Rect::new(0, 0, term_size.width, term_size.height.saturating_sub(3));
+    let (_, diff_area) = body_split(body);
+    (diff_area.height.saturating_sub(2) as usize).max(1)
+}
+
+/// Half a screen's worth of diff rows.
 fn half_page(term_size: Size) -> usize {
-    let inner = (term_size.height as usize).saturating_sub(5);
-    (inner / 2).max(1)
+    (diff_viewport_rows(term_size) / 2).max(1)
 }
 
 /// Marker color, matching git status vocabulary.
@@ -380,28 +414,50 @@ impl<'a> App<'a> {
                     _ => {}
                 }
                 if self.nav.selected != before {
-                    self.diff.scroll = 0;
+                    self.diff.reset();
                 }
             }
             Focus::Diff => {
                 let row_count = self.diff_rows().len();
+                let viewport = diff_viewport_rows(term_size);
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count),
-                    KeyCode::Char('k') | KeyCode::Up => self.diff.up(),
+                    KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count, viewport),
+                    KeyCode::Char('k') | KeyCode::Up => self.diff.up(viewport),
                     KeyCode::Char('d') | KeyCode::PageDown => {
-                        self.diff.page_down(half_page(term_size), row_count)
+                        self.diff.page_down(half_page(term_size), row_count, viewport)
                     }
                     KeyCode::Char('u') | KeyCode::PageUp => {
-                        self.diff.page_up(half_page(term_size))
+                        self.diff.page_up(half_page(term_size), viewport)
                     }
-                    KeyCode::Char('n') => self.diff.next_hunk(&hunk_row_indices(&self.diff_rows())),
-                    KeyCode::Char('p') => self.diff.prev_hunk(&hunk_row_indices(&self.diff_rows())),
+                    KeyCode::Char('n') => {
+                        self.diff.next_hunk(&hunk_row_indices(&self.diff_rows()), viewport)
+                    }
+                    KeyCode::Char('p') => {
+                        self.diff.prev_hunk(&hunk_row_indices(&self.diff_rows()), viewport)
+                    }
                     KeyCode::Char('g') => self.diff.top(),
-                    KeyCode::Char('G') => self.diff.bottom(row_count),
+                    KeyCode::Char('G') => self.diff.bottom(row_count, viewport),
                     KeyCode::Char('h') | KeyCode::Tab => self.focus = Focus::Navigator,
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// `path:line` for the cursor row, shown in the footer so the reviewer
+    /// always knows where they are. Prefers the new-file line number; removed
+    /// lines fall back to the old side, marked as such.
+    fn cursor_position(&self) -> Option<String> {
+        let file = self.selected_file()?;
+        let rows = self.diff_rows();
+        match rows.get(self.diff.cursor)? {
+            DiffRow::Line(line) => match (line.new_no, line.old_no) {
+                (Some(n), _) => Some(format!("{}:{}", file.path, n)),
+                (None, Some(o)) => Some(format!("{}:{} (old)", file.path, o)),
+                (None, None) => Some(file.path.clone()),
+            },
+            DiffRow::HunkHeader(_) => Some(format!("{} (hunk)", file.path)),
+            DiffRow::Binary | DiffRow::NoContent => Some(file.path.clone()),
         }
     }
 }
@@ -452,9 +508,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Focus::Navigator => format!(
                 " j/k move \u{b7} g/G first/last \u{b7} l/enter/tab focus diff \u{b7} {GLOBAL_HINTS}"
             ),
-            Focus::Diff => format!(
-                " j/k scroll \u{b7} d/u half page \u{b7} n/p next/prev hunk \u{b7} g/G top/bottom \u{b7} h/tab focus navigator \u{b7} {GLOBAL_HINTS}"
-            ),
+            Focus::Diff => {
+                // Position first: when the footer clips in a narrow pane,
+                // "where am I" survives and only the key hints get cut.
+                let pos = app.cursor_position().unwrap_or_default();
+                format!(
+                    " {pos} \u{b7} j/k move \u{b7} d/u half page \u{b7} n/p hunk \u{b7} g/G top/bottom \u{b7} h/tab navigator \u{b7} {GLOBAL_HINTS}"
+                )
+            }
         },
     };
     let footer = Paragraph::new(text).style(Style::default().add_modifier(Modifier::REVERSED));
@@ -567,10 +628,21 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
 
     // Pre-highlighted in `App::new`; drawing just clones the cached, owned
     // lines rather than re-running syntect on every frame.
-    let lines: Vec<Line> = app.row_cache.get(&app.nav.selected).cloned().unwrap_or_default();
+    let mut lines: Vec<Line> = app.row_cache.get(&app.nav.selected).cloned().unwrap_or_default();
+    // Cursor row: overlay a background on every span (overriding add/remove
+    // tints — visibility of "where am I" beats the origin tint for one row).
+    if let Some(line) = lines.get_mut(app.diff.cursor) {
+        for span in &mut line.spans {
+            span.style = span.style.bg(CURSOR_BG);
+        }
+    }
     let paragraph = Paragraph::new(lines).block(block).scroll((app.diff.scroll as u16, 0));
     frame.render_widget(paragraph, area);
 }
+
+/// Cursor-row background: a cool slate that reads over both the plain ground
+/// and the add/remove tints.
+const CURSOR_BG: Color = Color::Rgb(48, 54, 72);
 
 /// Add-line content background (dark green).
 const ADD_BG: Color = Color::Rgb(0, 60, 0);
@@ -743,46 +815,77 @@ mod tests {
     #[test]
     fn next_and_prev_hunk_jump_to_neighboring_headers() {
         let hunks = vec![0usize, 4];
-        let mut state = DiffViewState { scroll: 0 };
+        let mut state = DiffViewState { scroll: 0, cursor: 0 };
+        let vp = 10;
 
-        // From the first header, next jumps to the second; a further next is a no-op.
-        state.next_hunk(&hunks);
-        assert_eq!(state.scroll, 4);
-        state.next_hunk(&hunks);
-        assert_eq!(state.scroll, 4);
+        // From the first header, next jumps the CURSOR to the second header;
+        // a further next is a no-op.
+        state.next_hunk(&hunks, vp);
+        assert_eq!(state.cursor, 4);
+        state.next_hunk(&hunks, vp);
+        assert_eq!(state.cursor, 4);
 
         // From a row between headers, prev jumps back to the nearest header before it.
-        state.scroll = 6;
-        state.prev_hunk(&hunks);
-        assert_eq!(state.scroll, 4);
-        state.prev_hunk(&hunks);
-        assert_eq!(state.scroll, 0);
+        state.cursor = 6;
+        state.prev_hunk(&hunks, vp);
+        assert_eq!(state.cursor, 4);
+        state.prev_hunk(&hunks, vp);
+        assert_eq!(state.cursor, 0);
         // No header before row 0: no-op.
-        state.prev_hunk(&hunks);
-        assert_eq!(state.scroll, 0);
+        state.prev_hunk(&hunks, vp);
+        assert_eq!(state.cursor, 0);
     }
 
     #[test]
-    fn diff_view_scroll_clamps_at_both_ends() {
-        let mut state = DiffViewState { scroll: 0 };
-        state.up(); // already at 0, saturating
-        assert_eq!(state.scroll, 0);
+    fn diff_view_cursor_clamps_at_both_ends() {
+        let mut state = DiffViewState { scroll: 0, cursor: 0 };
+        let vp = 10;
+        state.up(vp); // already at 0, saturating
+        assert_eq!(state.cursor, 0);
 
-        state.down(3); // row_count 3 -> max scroll index 2
-        state.down(3);
-        state.down(3);
-        assert_eq!(state.scroll, 2);
+        state.down(3, vp); // row_count 3 -> max cursor index 2
+        state.down(3, vp);
+        state.down(3, vp);
+        assert_eq!(state.cursor, 2);
 
-        state.page_up(10);
-        assert_eq!(state.scroll, 0);
+        state.page_up(10, vp);
+        assert_eq!(state.cursor, 0);
 
-        state.page_down(10, 3);
-        assert_eq!(state.scroll, 2);
+        state.page_down(10, 3, vp);
+        assert_eq!(state.cursor, 2);
 
-        state.bottom(3);
-        assert_eq!(state.scroll, 2);
+        state.bottom(3, vp);
+        assert_eq!(state.cursor, 2);
         state.top();
-        assert_eq!(state.scroll, 0);
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn scroll_follows_cursor_at_both_edges() {
+        let mut state = DiffViewState { scroll: 0, cursor: 0 };
+        let (rows, vp) = (100, 10);
+
+        // Moving below the viewport bottom drags scroll down so the cursor
+        // stays the last visible row.
+        for _ in 0..15 {
+            state.down(rows, vp);
+        }
+        assert_eq!(state.cursor, 15);
+        assert_eq!(state.scroll, 6); // 15 - 10 + 1
+
+        // Inside the viewport: scroll stays put.
+        state.up(vp);
+        assert_eq!((state.cursor, state.scroll), (14, 6));
+
+        // Moving above the viewport top drags scroll up to the cursor.
+        state.cursor = 6;
+        state.up(vp);
+        assert_eq!((state.cursor, state.scroll), (5, 5));
+
+        // A far jump (G) lands the cursor on the last row, viewport showing
+        // the tail.
+        state.bottom(rows, vp);
+        assert_eq!((state.cursor, state.scroll), (99, 90));
     }
 
     #[test]
