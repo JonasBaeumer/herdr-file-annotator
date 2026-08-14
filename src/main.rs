@@ -1,7 +1,9 @@
+mod diff;
 mod herdr;
 mod mcp;
 mod pane;
 mod protocol;
+mod ui;
 
 use std::process::ExitCode;
 
