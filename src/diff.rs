@@ -54,9 +54,15 @@ pub struct DiffLine {
 pub struct Hunk {
     /// The full `@@ -a,b +c,d @@ …` header line as emitted by git.
     pub header: String,
+    // The numeric hunk coordinates aren't read yet: the UI renders the raw
+    // header and per-line numbers instead. M3 annotation anchoring reads them.
+    #[allow(dead_code)]
     pub old_start: u32,
+    #[allow(dead_code)]
     pub old_count: u32,
+    #[allow(dead_code)]
     pub new_start: u32,
+    #[allow(dead_code)]
     pub new_count: u32,
     pub lines: Vec<DiffLine>,
 }
