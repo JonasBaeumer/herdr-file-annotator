@@ -166,39 +166,25 @@ struct DiffViewState {
 }
 
 impl DiffViewState {
-    /// Keep the cursor visible: scroll follows it at both edges.
-    fn follow(&mut self, viewport: usize) {
-        let viewport = viewport.max(1);
-        if self.cursor < self.scroll {
-            self.scroll = self.cursor;
-        } else if self.cursor >= self.scroll + viewport {
-            self.scroll = self.cursor + 1 - viewport;
-        }
-    }
-
     fn reset(&mut self) {
         self.scroll = 0;
         self.cursor = 0;
     }
 
-    fn down(&mut self, row_count: usize, viewport: usize) {
+    fn down(&mut self, row_count: usize) {
         self.cursor = (self.cursor + 1).min(row_count.saturating_sub(1));
-        self.follow(viewport);
     }
 
-    fn up(&mut self, viewport: usize) {
+    fn up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
-        self.follow(viewport);
     }
 
-    fn page_down(&mut self, page: usize, row_count: usize, viewport: usize) {
+    fn page_down(&mut self, page: usize, row_count: usize) {
         self.cursor = (self.cursor + page).min(row_count.saturating_sub(1));
-        self.follow(viewport);
     }
 
-    fn page_up(&mut self, page: usize, viewport: usize) {
+    fn page_up(&mut self, page: usize) {
         self.cursor = self.cursor.saturating_sub(page);
-        self.follow(viewport);
     }
 
     fn top(&mut self) {
@@ -206,27 +192,73 @@ impl DiffViewState {
         self.scroll = 0;
     }
 
-    fn bottom(&mut self, row_count: usize, viewport: usize) {
+    fn bottom(&mut self, row_count: usize) {
         self.cursor = row_count.saturating_sub(1);
-        self.follow(viewport);
     }
 
     /// Move the cursor to the next hunk-header row strictly after it.
     /// No-op if there is none.
-    fn next_hunk(&mut self, hunk_rows: &[usize], viewport: usize) {
+    fn next_hunk(&mut self, hunk_rows: &[usize]) {
         if let Some(&next) = hunk_rows.iter().find(|&&r| r > self.cursor) {
             self.cursor = next;
-            self.follow(viewport);
         }
     }
 
     /// Move the cursor to the previous hunk-header row strictly before it.
     /// No-op if there is none.
-    fn prev_hunk(&mut self, hunk_rows: &[usize], viewport: usize) {
+    fn prev_hunk(&mut self, hunk_rows: &[usize]) {
         if let Some(&prev) = hunk_rows.iter().rev().find(|&&r| r < self.cursor) {
             self.cursor = prev;
-            self.follow(viewport);
         }
+    }
+}
+
+/// Mapping between BASE rows (the flattened diff rows the cursor moves over,
+/// what annotations anchor to) and DISPLAY rows (base rows plus the inline
+/// comment rows woven in directly under the lines they annotate). The cursor
+/// lives in base space; the scroll offset lives in display space so the
+/// rendered `Paragraph` can be scrolled directly.
+struct DispMap {
+    /// One entry per inline comment row: the base row it hangs under.
+    /// Sorted ascending; duplicates mean several comments under one row.
+    ends: Vec<usize>,
+}
+
+impl DispMap {
+    fn new(mut ends: Vec<usize>) -> Self {
+        ends.sort_unstable();
+        DispMap { ends }
+    }
+
+    /// Display index of a base row: shifted down one for every comment row
+    /// hanging under an earlier base row.
+    fn disp(&self, base: usize) -> usize {
+        base + self.ends.iter().take_while(|&&e| e < base).count()
+    }
+
+    /// Number of comment rows hanging directly under this base row.
+    fn extra_at(&self, base: usize) -> usize {
+        self.ends.iter().filter(|&&e| e == base).count()
+    }
+
+    #[cfg(test)]
+    fn total(&self, base_count: usize) -> usize {
+        base_count + self.ends.len()
+    }
+}
+
+/// Display-space scroll follow: keep the cursor row AND any comment rows
+/// hanging under it inside the viewport. Pure so it's directly testable.
+fn follow_display(scroll: usize, cursor: usize, map: &DispMap, viewport: usize) -> usize {
+    let viewport = viewport.max(1);
+    let dc = map.disp(cursor);
+    let tail = dc + map.extra_at(cursor);
+    if dc < scroll {
+        dc
+    } else if tail >= scroll + viewport {
+        (tail + 1).saturating_sub(viewport)
+    } else {
+        scroll
     }
 }
 
@@ -623,7 +655,40 @@ impl<'a> App<'a> {
         }
 
         self.handle_nav_key(key, term_size);
+        self.ensure_cursor_visible(term_size);
         None
+    }
+
+    /// The display map for the currently selected file: saved annotations
+    /// plus the live comment being typed (its preview row occupies display
+    /// space too, so scrolling must account for it).
+    fn disp_map(&self) -> DispMap {
+        let mut ends: Vec<usize> = self
+            .pending
+            .iter()
+            .filter(|p| p.file_idx == self.nav.selected)
+            .map(|p| p.row_end)
+            .collect();
+        if let Some(InputMode::Comment { editing, row_end, .. }) = &self.input {
+            // An edit reuses its existing annotation's slot; a new comment
+            // adds a preview row.
+            if editing.is_none() {
+                ends.push(*row_end);
+            }
+        }
+        DispMap::new(ends)
+    }
+
+    /// Display-space scroll follow, run after every key that can move the
+    /// cursor or change which comment rows exist.
+    fn ensure_cursor_visible(&mut self, term_size: Size) {
+        let map = self.disp_map();
+        self.diff.scroll = follow_display(
+            self.diff.scroll,
+            self.diff.cursor,
+            &map,
+            diff_viewport_rows(term_size),
+        );
     }
 
     /// `c` in diff focus, input closed: open the comment prompt. Uses the
@@ -705,24 +770,23 @@ impl<'a> App<'a> {
             }
             Focus::Diff => {
                 let row_count = self.diff_rows().len();
-                let viewport = diff_viewport_rows(term_size);
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count, viewport),
-                    KeyCode::Char('k') | KeyCode::Up => self.diff.up(viewport),
+                    KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count),
+                    KeyCode::Char('k') | KeyCode::Up => self.diff.up(),
                     KeyCode::Char('d') | KeyCode::PageDown => {
-                        self.diff.page_down(half_page(term_size), row_count, viewport)
+                        self.diff.page_down(half_page(term_size), row_count)
                     }
                     KeyCode::Char('u') | KeyCode::PageUp => {
-                        self.diff.page_up(half_page(term_size), viewport)
+                        self.diff.page_up(half_page(term_size))
                     }
                     KeyCode::Char('n') => {
-                        self.diff.next_hunk(&hunk_row_indices(&self.diff_rows()), viewport)
+                        self.diff.next_hunk(&hunk_row_indices(&self.diff_rows()))
                     }
                     KeyCode::Char('p') => {
-                        self.diff.prev_hunk(&hunk_row_indices(&self.diff_rows()), viewport)
+                        self.diff.prev_hunk(&hunk_row_indices(&self.diff_rows()))
                     }
                     KeyCode::Char('g') => self.diff.top(),
-                    KeyCode::Char('G') => self.diff.bottom(row_count, viewport),
+                    KeyCode::Char('G') => self.diff.bottom(row_count),
                     KeyCode::Char('h') | KeyCode::Tab => self.focus = Focus::Navigator,
                     KeyCode::Char('v') => {
                         self.visual_anchor = match self.visual_anchor {
@@ -970,8 +1034,51 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
             span.style = span.style.bg(CURSOR_BG);
         }
     }
+
+    // Inline comment rows, woven in directly under the lines they annotate
+    // (GitHub-style) so feedback sits next to the code instead of living only
+    // in the bottom bar. Must run AFTER all base-row patches above — the
+    // patches index base rows, and insertion shifts everything below it.
+    // Descending insertion order keeps earlier indices valid.
+    let mut comment_rows: Vec<(usize, Line)> = app
+        .pending
+        .iter()
+        .filter(|p| p.file_idx == app.nav.selected)
+        .map(|p| (p.row_end, inline_comment_line(p.annotation.tag.as_deref(), &p.annotation.comment, false)))
+        .collect();
+    if let Some(InputMode::Comment { buf, tag, editing, row_end, .. }) = &app.input {
+        if editing.is_none() {
+            // Live preview of the comment being typed.
+            comment_rows.push((*row_end, inline_comment_line(tag.as_ref().map(|t| t.label()), buf, true)));
+        }
+    }
+    comment_rows.sort_by(|a, b| b.0.cmp(&a.0));
+    for (end, line) in comment_rows {
+        let at = (end + 1).min(lines.len());
+        lines.insert(at, line);
+    }
+
     let paragraph = Paragraph::new(lines).block(block).scroll((app.diff.scroll as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// Comment-row background: a warm dark slate distinct from both the code
+/// ground and the cursor row.
+const COMMENT_BG: Color = Color::Rgb(38, 34, 28);
+
+/// Build one inline comment row: `  └ [tag] comment text`, tinted by tag.
+/// `live` marks the in-progress preview while the reviewer is still typing.
+fn inline_comment_line(tag: Option<&str>, text: &str, live: bool) -> Line<'static> {
+    let marker = format!("  \u{2514} [{}] ", tag.unwrap_or("note"));
+    let base = Style::default().bg(COMMENT_BG);
+    let mut spans = vec![
+        Span::styled(marker, base.fg(tag_color(tag)).add_modifier(Modifier::BOLD)),
+        Span::styled(text.to_string(), base.fg(Color::White).add_modifier(Modifier::ITALIC)),
+    ];
+    if live {
+        spans.push(Span::styled("\u{258f}", base.fg(Color::White))); // typing caret
+    }
+    Line::from(spans)
 }
 
 /// Cursor-row background: a cool slate that reads over both the plain ground
@@ -1154,76 +1261,89 @@ mod tests {
     fn next_and_prev_hunk_jump_to_neighboring_headers() {
         let hunks = vec![0usize, 4];
         let mut state = DiffViewState { scroll: 0, cursor: 0 };
-        let vp = 10;
 
         // From the first header, next jumps the CURSOR to the second header;
         // a further next is a no-op.
-        state.next_hunk(&hunks, vp);
+        state.next_hunk(&hunks);
         assert_eq!(state.cursor, 4);
-        state.next_hunk(&hunks, vp);
+        state.next_hunk(&hunks);
         assert_eq!(state.cursor, 4);
 
         // From a row between headers, prev jumps back to the nearest header before it.
         state.cursor = 6;
-        state.prev_hunk(&hunks, vp);
+        state.prev_hunk(&hunks);
         assert_eq!(state.cursor, 4);
-        state.prev_hunk(&hunks, vp);
+        state.prev_hunk(&hunks);
         assert_eq!(state.cursor, 0);
         // No header before row 0: no-op.
-        state.prev_hunk(&hunks, vp);
+        state.prev_hunk(&hunks);
         assert_eq!(state.cursor, 0);
     }
 
     #[test]
     fn diff_view_cursor_clamps_at_both_ends() {
         let mut state = DiffViewState { scroll: 0, cursor: 0 };
-        let vp = 10;
-        state.up(vp); // already at 0, saturating
+        state.up(); // already at 0, saturating
         assert_eq!(state.cursor, 0);
 
-        state.down(3, vp); // row_count 3 -> max cursor index 2
-        state.down(3, vp);
-        state.down(3, vp);
+        state.down(3); // row_count 3 -> max cursor index 2
+        state.down(3);
+        state.down(3);
         assert_eq!(state.cursor, 2);
 
-        state.page_up(10, vp);
+        state.page_up(10);
         assert_eq!(state.cursor, 0);
 
-        state.page_down(10, 3, vp);
+        state.page_down(10, 3);
         assert_eq!(state.cursor, 2);
 
-        state.bottom(3, vp);
+        state.bottom(3);
         assert_eq!(state.cursor, 2);
         state.top();
         assert_eq!(state.cursor, 0);
     }
 
     #[test]
-    fn scroll_follows_cursor_at_both_edges() {
-        let mut state = DiffViewState { scroll: 0, cursor: 0 };
-        let (rows, vp) = (100, 10);
+    fn scroll_follows_cursor_in_display_space() {
+        let no_comments = DispMap::new(vec![]);
+        let vp = 10;
 
-        // Moving below the viewport bottom drags scroll down so the cursor
-        // stays the last visible row.
-        for _ in 0..15 {
-            state.down(rows, vp);
+        // Below the viewport bottom: scroll advances so the cursor is the
+        // last visible display row.
+        let mut scroll = 0;
+        for cursor in 0..=15 {
+            scroll = follow_display(scroll, cursor, &no_comments, vp);
         }
-        assert_eq!(state.cursor, 15);
-        assert_eq!(state.scroll, 6); // 15 - 10 + 1
+        assert_eq!(scroll, 6); // 15 - 10 + 1
 
-        // Inside the viewport: scroll stays put.
-        state.up(vp);
-        assert_eq!((state.cursor, state.scroll), (14, 6));
+        // Inside the viewport: unchanged.
+        assert_eq!(follow_display(6, 14, &no_comments, vp), 6);
 
-        // Moving above the viewport top drags scroll up to the cursor.
-        state.cursor = 6;
-        state.up(vp);
-        assert_eq!((state.cursor, state.scroll), (5, 5));
+        // Above the viewport top: scroll snaps up to the cursor.
+        assert_eq!(follow_display(6, 5, &no_comments, vp), 5);
+    }
 
-        // A far jump (G) lands the cursor on the last row, viewport showing
-        // the tail.
-        state.bottom(rows, vp);
-        assert_eq!((state.cursor, state.scroll), (99, 90));
+    #[test]
+    fn disp_map_shifts_rows_below_comment_anchors() {
+        // Comments hang under base rows 3 (twice) and 7.
+        let map = DispMap::new(vec![7, 3, 3]);
+        assert_eq!(map.disp(0), 0);
+        assert_eq!(map.disp(3), 3); // its own comments sit BELOW it
+        assert_eq!(map.extra_at(3), 2);
+        assert_eq!(map.disp(4), 6); // shifted by the two comments under row 3
+        assert_eq!(map.disp(8), 11); // shifted by all three
+        assert_eq!(map.total(10), 13);
+    }
+
+    #[test]
+    fn follow_keeps_comment_rows_under_cursor_visible() {
+        // A comment hangs under base row 9; viewport of 10 starting at 0
+        // shows display rows 0..=9, but row 9's comment is display row 10 —
+        // follow must scroll by one so the annotation text stays on screen.
+        let map = DispMap::new(vec![9]);
+        assert_eq!(follow_display(0, 9, &map, 10), 1);
+        // Without the comment, no scroll needed.
+        assert_eq!(follow_display(0, 9, &DispMap::new(vec![]), 10), 0);
     }
 
     #[test]
