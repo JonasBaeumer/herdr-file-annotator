@@ -1,0 +1,20 @@
+[package]
+name = "herdr-annotator"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Herdr plugin: an agent-summoned, blocking diff-review pane with line annotations."
+repository = "https://github.com/JonasBaeumer/herdr-file-annotator"
+
+[[bin]]
+name = "herdr-annotator"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossterm = "0.28"
+
+[profile.release]
+strip = true
