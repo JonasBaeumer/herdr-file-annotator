@@ -1,8 +1,10 @@
 //! Ratatui review UI: file navigator + diff view.
 //!
-//! M2 scope: a two-pane layout (file navigator on the left, the selected
-//! file's diff on the right) replacing M1's single scrolling view. No
-//! annotations yet — those arrive in M3.
+//! M2 added a two-pane layout (file navigator on the left, the selected
+//! file's diff on the right) replacing M1's single scrolling view. M3 adds
+//! line-anchored annotations: a visual-select-and-comment flow anchored to
+//! the diff cursor, surfaced as gutter markers and returned to `pane.rs` as
+//! `Outcome::annotations`.
 
 use std::collections::HashMap;
 use std::io;
@@ -29,12 +31,15 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use crate::diff::{DiffLine, DiffModel, FileDiff, FileStatus, Origin};
-use crate::protocol::{ReviewRequest, Verdict};
+use crate::protocol::{Annotation, LineRange, ReviewRequest, Side, Verdict};
 
 /// What the reviewer decided, handed back to `pane.rs`.
 pub struct Outcome {
     pub verdict: Verdict,
     pub summary: Option<String>,
+    /// All annotations the reviewer left, in creation order. Empty for
+    /// `Verdict::Cancelled` — a cancelled review carries no feedback.
+    pub annotations: Vec<Annotation>,
 }
 
 /// Syntax highlighting resources: a syntax set (language grammars) and a
@@ -261,6 +266,139 @@ fn hunk_row_indices(rows: &[DiffRow]) -> Vec<usize> {
         .collect()
 }
 
+/// Semantic label a reviewer can attach to a comment. `Ctrl-T` cycles
+/// through these (and back to no tag) while the comment input is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tag {
+    Verify,
+    Fix,
+    Question,
+    Nit,
+}
+
+impl Tag {
+    /// The lowercase wire label, also used as the protocol's `Annotation::tag`.
+    fn label(&self) -> &'static str {
+        match self {
+            Tag::Verify => "verify",
+            Tag::Fix => "fix",
+            Tag::Question => "question",
+            Tag::Nit => "nit",
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Tag> {
+        match label {
+            "verify" => Some(Tag::Verify),
+            "fix" => Some(Tag::Fix),
+            "question" => Some(Tag::Question),
+            "nit" => Some(Tag::Nit),
+            _ => None,
+        }
+    }
+
+    /// Cycle order: none → Verify → Fix → Question → Nit → none.
+    fn next(current: Option<Tag>) -> Option<Tag> {
+        match current {
+            None => Some(Tag::Verify),
+            Some(Tag::Verify) => Some(Tag::Fix),
+            Some(Tag::Fix) => Some(Tag::Question),
+            Some(Tag::Question) => Some(Tag::Nit),
+            Some(Tag::Nit) => None,
+        }
+    }
+}
+
+/// Gutter-marker color for a tag, matching the protocol's string label
+/// (pending annotations store the tag as `Option<String>`, not `Tag`,
+/// since that's what crosses the wire). Untagged annotations render White.
+fn tag_color(tag: Option<&str>) -> Color {
+    match tag {
+        Some("verify") => Color::Yellow,
+        Some("fix") => Color::Red,
+        Some("question") => Color::Cyan,
+        Some("nit") => Color::DarkGray,
+        _ => Color::White,
+    }
+}
+
+/// What the "request changes" / "comment" input bar is doing right now.
+enum InputMode {
+    /// The "request changes" summary prompt (unchanged from M2's `input:
+    /// Option<String>`, just relocated into this enum).
+    Summary { buf: String },
+    /// The annotation comment prompt, opened by `c` in diff focus.
+    Comment {
+        buf: String,
+        tag: Option<Tag>,
+        /// `Some(idx)` when editing an existing `pending[idx]` rather than
+        /// creating a new annotation.
+        editing: Option<usize>,
+        /// Flattened-row range (inclusive) this comment will anchor to.
+        row_start: usize,
+        row_end: usize,
+    },
+}
+
+/// An annotation the reviewer has left but not yet submitted with a verdict.
+/// `row_start`/`row_end` are flattened-row indices (inclusive) into
+/// `files[file_idx]`'s rows — used for gutter markers and for finding the
+/// annotation under the cursor to edit or delete.
+struct PendingAnnotation {
+    file_idx: usize,
+    row_start: usize,
+    row_end: usize,
+    annotation: Annotation,
+}
+
+/// Build an `Annotation` from a flattened-row selection. Only `DiffRow::Line`
+/// rows in `row_start..=row_end` count; hunk headers and placeholder rows are
+/// ignored. Prefers the new-file side: if any covered line has a `new_no`
+/// (context or added lines), the annotation anchors to the new side with the
+/// min/max of those line numbers; otherwise, if any covered line has an
+/// `old_no` (a remove-only selection), it anchors to the old side. A
+/// selection covering no `DiffRow::Line` at all (headers/placeholder only)
+/// resolves to `None` — nothing to save.
+fn resolve_annotation(
+    file: &FileDiff,
+    rows: &[DiffRow],
+    row_start: usize,
+    row_end: usize,
+    tag: Option<Tag>,
+    comment: String,
+) -> Option<Annotation> {
+    let mut new_nos: Vec<u32> = Vec::new();
+    let mut old_nos: Vec<u32> = Vec::new();
+    for idx in row_start..=row_end {
+        if let Some(DiffRow::Line(line)) = rows.get(idx) {
+            if let Some(n) = line.new_no {
+                new_nos.push(n);
+            }
+            if let Some(o) = line.old_no {
+                old_nos.push(o);
+            }
+        }
+    }
+
+    let (side, start, end) = if let (Some(&min), Some(&max)) =
+        (new_nos.iter().min(), new_nos.iter().max())
+    {
+        (Side::New, min, max)
+    } else if let (Some(&min), Some(&max)) = (old_nos.iter().min(), old_nos.iter().max()) {
+        (Side::Old, min, max)
+    } else {
+        return None;
+    };
+
+    Some(Annotation {
+        file: file.path.clone(),
+        lines: LineRange { start, end },
+        side,
+        tag: tag.map(|t| t.label().to_string()),
+        comment,
+    })
+}
+
 /// Visible diff rows, derived from the terminal size via the SAME split
 /// logic as the real layout (header + note + footer chrome, then body_split,
 /// then the diff pane's top/bottom border) — so cursor-following stays
@@ -301,8 +439,16 @@ struct App<'a> {
     focus: Focus,
     nav: NavState,
     diff: DiffViewState,
-    /// Some(buffer) while the "request changes" summary prompt is open.
-    input: Option<String>,
+    /// Some(mode) while the "request changes" summary prompt or the
+    /// annotation comment prompt is open.
+    input: Option<InputMode>,
+    /// Set by `v` in diff focus at the cursor row; the active selection is
+    /// `min(anchor, cursor)..=max(anchor, cursor)` and grows/shrinks as the
+    /// cursor moves. Diff-focus only; cleared by a second `v`, by `Esc`, or
+    /// by opening a comment with `c`.
+    visual_anchor: Option<usize>,
+    /// Annotations the reviewer has left so far, in creation order.
+    pending: Vec<PendingAnnotation>,
     /// Fully syntax-highlighted body rows per file, keyed by index into
     /// `model.files`. Computed once up front in `new` rather than lazily on
     /// first view: model sizes here (a code review's changed files) are
@@ -329,6 +475,8 @@ impl<'a> App<'a> {
             nav: NavState::default(),
             diff: DiffViewState::default(),
             input: None,
+            visual_anchor: None,
+            pending: Vec::new(),
             row_cache,
         }
     }
@@ -348,6 +496,11 @@ impl<'a> App<'a> {
         self.selected_file().map(flatten_rows).unwrap_or_default()
     }
 
+    /// All pending annotations, in creation order, cloned for handoff.
+    fn pending_annotations(&self) -> Vec<Annotation> {
+        self.pending.iter().map(|p| p.annotation.clone()).collect()
+    }
+
     /// Handle one key event. Returns `Some(outcome)` once the reviewer has
     /// made a final decision (approve / request changes / cancel).
     fn handle_key(&mut self, key: KeyEvent, term_size: Size) -> Option<Outcome> {
@@ -356,39 +509,114 @@ impl<'a> App<'a> {
             return Some(Outcome {
                 verdict: Verdict::Cancelled,
                 summary: Some("reviewer cancelled".into()),
+                annotations: Vec::new(),
             });
         }
 
-        if let Some(buf) = self.input.as_mut() {
-            match key.code {
-                KeyCode::Enter => {
-                    let text = buf.trim().to_string();
-                    let summary = if text.is_empty() { None } else { Some(text) };
-                    return Some(Outcome { verdict: Verdict::RequestChanges, summary });
-                }
-                KeyCode::Esc => self.input = None,
-                KeyCode::Backspace => {
-                    buf.pop();
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => buf.push(c),
-                _ => {}
+        // Taken out (rather than borrowed via `as_mut`) so the Comment arm
+        // below is free to call `self.files()` / mutate `self.pending`
+        // without fighting the borrow checker over an outstanding borrow of
+        // `self.input`.
+        if let Some(mut mode) = self.input.take() {
+            let mut close = false;
+            let mut outcome = None;
+            match &mut mode {
+                InputMode::Summary { buf } => match key.code {
+                    KeyCode::Enter => {
+                        let text = buf.trim().to_string();
+                        let summary = if text.is_empty() { None } else { Some(text) };
+                        outcome = Some(Outcome {
+                            verdict: Verdict::RequestChanges,
+                            summary,
+                            annotations: self.pending_annotations(),
+                        });
+                        close = true;
+                    }
+                    KeyCode::Esc => close = true,
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        buf.push(c)
+                    }
+                    _ => {}
+                },
+                InputMode::Comment { buf, tag, editing, row_start, row_end } => match key.code {
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        *tag = Tag::next(*tag);
+                    }
+                    KeyCode::Enter => {
+                        let text = buf.trim().to_string();
+                        if !text.is_empty() {
+                            let resolved = self
+                                .files()
+                                .get(self.nav.selected)
+                                .map(|file| (file, flatten_rows(file)))
+                                .and_then(|(file, rows)| {
+                                    resolve_annotation(file, &rows, *row_start, *row_end, *tag, text)
+                                });
+                            if let Some(annotation) = resolved {
+                                let item = PendingAnnotation {
+                                    file_idx: self.nav.selected,
+                                    row_start: *row_start,
+                                    row_end: *row_end,
+                                    annotation,
+                                };
+                                match *editing {
+                                    Some(idx) => self.pending[idx] = item,
+                                    None => self.pending.push(item),
+                                }
+                            }
+                        }
+                        close = true;
+                    }
+                    KeyCode::Esc => close = true,
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        buf.push(c)
+                    }
+                    _ => {}
+                },
             }
-            return None;
+            if !close {
+                self.input = Some(mode);
+            }
+            return outcome;
         }
 
-        // Global verdict keys (disabled while the summary input is open, handled above).
+        // Global verdict keys (disabled while an input prompt is open, handled above).
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('q') => {
                 return Some(Outcome {
                     verdict: Verdict::Cancelled,
                     summary: Some("reviewer cancelled".into()),
+                    annotations: Vec::new(),
+                });
+            }
+            KeyCode::Esc => {
+                // A live visual selection swallows Esc (clear it) rather
+                // than cancelling the whole review.
+                if self.visual_anchor.is_some() {
+                    self.visual_anchor = None;
+                    return None;
+                }
+                return Some(Outcome {
+                    verdict: Verdict::Cancelled,
+                    summary: Some("reviewer cancelled".into()),
+                    annotations: Vec::new(),
                 });
             }
             KeyCode::Char('a') => {
-                return Some(Outcome { verdict: Verdict::Approve, summary: None });
+                return Some(Outcome {
+                    verdict: Verdict::Approve,
+                    summary: None,
+                    annotations: self.pending_annotations(),
+                });
             }
             KeyCode::Char('r') => {
-                self.input = Some(String::new());
+                self.input = Some(InputMode::Summary { buf: String::new() });
                 return None;
             }
             _ => {}
@@ -396,6 +624,64 @@ impl<'a> App<'a> {
 
         self.handle_nav_key(key, term_size);
         None
+    }
+
+    /// `c` in diff focus, input closed: open the comment prompt. Uses the
+    /// visual selection if a `v` anchor is set (and clears it); otherwise
+    /// the cursor row alone — unless that row is already covered by a
+    /// pending annotation on this file, in which case it opens in edit mode
+    /// (prefilled, replacing rather than duplicating on save).
+    fn open_comment_input(&mut self) {
+        let cursor = self.diff.cursor;
+        if let Some(anchor) = self.visual_anchor.take() {
+            self.input = Some(InputMode::Comment {
+                buf: String::new(),
+                tag: None,
+                editing: None,
+                row_start: anchor.min(cursor),
+                row_end: anchor.max(cursor),
+            });
+            return;
+        }
+
+        let selected = self.nav.selected;
+        if let Some(idx) = self
+            .pending
+            .iter()
+            .position(|p| p.file_idx == selected && p.row_start <= cursor && cursor <= p.row_end)
+        {
+            let p = &self.pending[idx];
+            self.input = Some(InputMode::Comment {
+                buf: p.annotation.comment.clone(),
+                tag: p.annotation.tag.as_deref().and_then(Tag::from_label),
+                editing: Some(idx),
+                row_start: p.row_start,
+                row_end: p.row_end,
+            });
+            return;
+        }
+
+        self.input = Some(InputMode::Comment {
+            buf: String::new(),
+            tag: None,
+            editing: None,
+            row_start: cursor,
+            row_end: cursor,
+        });
+    }
+
+    /// `x` in diff focus, input closed: delete the pending annotation
+    /// covering the cursor row on the current file, if any.
+    fn delete_pending_at_cursor(&mut self) {
+        let cursor = self.diff.cursor;
+        let selected = self.nav.selected;
+        if let Some(idx) = self
+            .pending
+            .iter()
+            .position(|p| p.file_idx == selected && p.row_start <= cursor && cursor <= p.row_end)
+        {
+            self.pending.remove(idx);
+        }
     }
 
     fn handle_nav_key(&mut self, key: KeyEvent, term_size: Size) {
@@ -438,6 +724,14 @@ impl<'a> App<'a> {
                     KeyCode::Char('g') => self.diff.top(),
                     KeyCode::Char('G') => self.diff.bottom(row_count, viewport),
                     KeyCode::Char('h') | KeyCode::Tab => self.focus = Focus::Navigator,
+                    KeyCode::Char('v') => {
+                        self.visual_anchor = match self.visual_anchor {
+                            Some(_) => None,
+                            None => Some(self.diff.cursor),
+                        };
+                    }
+                    KeyCode::Char('c') => self.open_comment_input(),
+                    KeyCode::Char('x') => self.delete_pending_at_cursor(),
                     _ => {}
                 }
             }
@@ -475,7 +769,7 @@ fn draw(frame: &mut Frame, app: &App) {
         .split(area);
 
     draw_header(frame, rows[0], app.request);
-    draw_note(frame, rows[1], app.request);
+    draw_note(frame, rows[1], app.request, app.pending.len());
     draw_body(frame, rows[2], app);
     draw_footer(frame, rows[3], app);
 }
@@ -490,12 +784,15 @@ fn draw_header(frame: &mut Frame, area: Rect, request: &ReviewRequest) {
     frame.render_widget(header, area);
 }
 
-fn draw_note(frame: &mut Frame, area: Rect, request: &ReviewRequest) {
-    let note = request
+fn draw_note(frame: &mut Frame, area: Rect, request: &ReviewRequest, pending_count: usize) {
+    let mut note = request
         .note
         .as_deref()
         .map(|n| format!(" agent: {n}"))
         .unwrap_or_else(|| " agent is waiting for your review".to_string());
+    if pending_count > 0 {
+        note.push_str(&format!(" \u{b7} {pending_count} annotation(s)"));
+    }
     let note = Paragraph::new(note).style(Style::default().fg(Color::Yellow));
     frame.render_widget(note, area);
 }
@@ -503,7 +800,11 @@ fn draw_note(frame: &mut Frame, area: Rect, request: &ReviewRequest) {
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     const GLOBAL_HINTS: &str = "a approve \u{b7} r request changes \u{b7} q cancel";
     let text = match &app.input {
-        Some(buf) => format!(" request changes \u{2014} summary: {buf}"),
+        Some(InputMode::Summary { buf }) => format!(" request changes \u{2014} summary: {buf}"),
+        Some(InputMode::Comment { buf, tag, .. }) => {
+            let tag_label = tag.map(|t| t.label()).unwrap_or("none");
+            format!(" comment [tag: {tag_label}]: {buf}")
+        }
         None => match app.focus {
             Focus::Navigator => format!(
                 " j/k move \u{b7} g/G first/last \u{b7} l/enter/tab focus diff \u{b7} {GLOBAL_HINTS}"
@@ -513,7 +814,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 // "where am I" survives and only the key hints get cut.
                 let pos = app.cursor_position().unwrap_or_default();
                 format!(
-                    " {pos} \u{b7} j/k move \u{b7} d/u half page \u{b7} n/p hunk \u{b7} g/G top/bottom \u{b7} h/tab navigator \u{b7} {GLOBAL_HINTS}"
+                    " {pos} \u{b7} j/k move \u{b7} d/u half page \u{b7} n/p hunk \u{b7} g/G top/bottom \u{b7} h/tab navigator \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} {GLOBAL_HINTS}"
                 )
             }
         },
@@ -629,6 +930,39 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
     // Pre-highlighted in `App::new`; drawing just clones the cached, owned
     // lines rather than re-running syntect on every frame.
     let mut lines: Vec<Line> = app.row_cache.get(&app.nav.selected).cloned().unwrap_or_default();
+
+    // Gutter markers: one per row covered by a pending annotation on this
+    // file, colored by tag. Overwrites the first character of the gutter
+    // span in place so the column width doesn't shift.
+    for pending in app.pending.iter().filter(|p| p.file_idx == app.nav.selected) {
+        let color = tag_color(pending.annotation.tag.as_deref());
+        for row in pending.row_start..=pending.row_end {
+            if let Some(line) = lines.get_mut(row) {
+                if let Some(span) = line.spans.first_mut() {
+                    let mut chars: Vec<char> = span.content.chars().collect();
+                    if let Some(first) = chars.first_mut() {
+                        *first = '\u{25cf}'; // ●
+                    }
+                    span.content = chars.into_iter().collect::<String>().into();
+                    span.style = span.style.fg(color);
+                }
+            }
+        }
+    }
+
+    // Visual selection: apply before the cursor overlay so the cursor row's
+    // background wins where the two overlap.
+    if let Some(anchor) = app.visual_anchor {
+        let (start, end) = (anchor.min(app.diff.cursor), anchor.max(app.diff.cursor));
+        for row in start..=end {
+            if let Some(line) = lines.get_mut(row) {
+                for span in &mut line.spans {
+                    span.style = span.style.bg(VISUAL_SELECTION_BG);
+                }
+            }
+        }
+    }
+
     // Cursor row: overlay a background on every span (overriding add/remove
     // tints — visibility of "where am I" beats the origin tint for one row).
     if let Some(line) = lines.get_mut(app.diff.cursor) {
@@ -643,6 +977,10 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
 /// Cursor-row background: a cool slate that reads over both the plain ground
 /// and the add/remove tints.
 const CURSOR_BG: Color = Color::Rgb(48, 54, 72);
+
+/// Visual-selection background: a warm, muted amber distinct from both the
+/// cursor slate and the add/remove tints.
+const VISUAL_SELECTION_BG: Color = Color::Rgb(60, 45, 25);
 
 /// Add-line content background (dark green).
 const ADD_BG: Color = Color::Rgb(0, 60, 0);
@@ -982,5 +1320,145 @@ mod tests {
         assert_eq!(nav.height, 30);
         assert_eq!(nav.width, 36);
         assert_eq!(nav.x + nav.width, diff.x);
+    }
+
+    // --- M3 annotation flow ------------------------------------------
+
+    fn sample_request() -> ReviewRequest {
+        ReviewRequest {
+            version: 1,
+            working_dir: "/tmp/repo".to_string(),
+            baseline: None,
+            note: None,
+        }
+    }
+
+    /// A hunk of two consecutive removed lines and nothing else, for
+    /// exercising the remove-only (`Side::Old`) branch of `resolve_annotation`
+    /// with a genuine min/max (not just a single row).
+    fn remove_only_file() -> FileDiff {
+        FileDiff {
+            path: "src/gone.rs".to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            adds: 0,
+            dels: 2,
+            hunks: vec![Hunk {
+                header: "@@ -5,2 +5,0 @@".to_string(),
+                old_start: 5,
+                old_count: 2,
+                new_start: 5,
+                new_count: 0,
+                lines: vec![
+                    line(Origin::Remove, Some(5), None, "old_a();"),
+                    line(Origin::Remove, Some(6), None, "old_b();"),
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn resolve_annotation_mixed_range_prefers_new_side() {
+        let file = sample_file();
+        let rows = flatten_rows(&file);
+        // rows[5..=7] (second hunk): Remove(old 10), Add(new 11), Context(old 11, new 12).
+        let annotation = resolve_annotation(&file, &rows, 5, 7, None, "check this".to_string())
+            .expect("range contains Line rows");
+        assert_eq!(annotation.side, Side::New);
+        assert_eq!(annotation.lines.start, 11);
+        assert_eq!(annotation.lines.end, 12);
+        assert_eq!(annotation.file, "src/lib.rs");
+        assert_eq!(annotation.comment, "check this");
+    }
+
+    #[test]
+    fn resolve_annotation_remove_only_range_resolves_to_old_side() {
+        let file = remove_only_file();
+        let rows = flatten_rows(&file);
+        // rows[0] is the hunk header; rows[1..=2] are the two remove lines.
+        let annotation = resolve_annotation(&file, &rows, 1, 2, Some(Tag::Fix), "dead code".to_string())
+            .expect("remove-only range still resolves");
+        assert_eq!(annotation.side, Side::Old);
+        assert_eq!(annotation.lines.start, 5);
+        assert_eq!(annotation.lines.end, 6);
+        assert_eq!(annotation.tag.as_deref(), Some("fix"));
+    }
+
+    #[test]
+    fn resolve_annotation_header_only_range_returns_none() {
+        let file = sample_file();
+        let rows = flatten_rows(&file);
+        // rows[0] is a HunkHeader; no DiffRow::Line in a single-header range.
+        assert!(resolve_annotation(&file, &rows, 0, 0, None, "nope".to_string()).is_none());
+    }
+
+    #[test]
+    fn editing_existing_annotation_replaces_rather_than_duplicates() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+
+        // Move the cursor onto a Line row (row 1: the first line of hunk 1).
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        assert_eq!(app.diff.cursor, 1);
+
+        // `c` with no anchor and nothing pending: fresh comment at the cursor row.
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size).is_none());
+        for ch in "first".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size).is_none());
+        assert_eq!(app.pending.len(), 1);
+        assert_eq!(app.pending[0].annotation.comment, "first");
+
+        // `c` again at the same cursor row: the existing annotation covers
+        // it, so this must open in edit mode, prefilled.
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size).is_none());
+        match &app.input {
+            Some(InputMode::Comment { editing, buf, .. }) => {
+                assert_eq!(*editing, Some(0));
+                assert_eq!(buf, "first");
+            }
+            other => panic!("expected comment input in edit mode, got a different state (variant present: {})", other.is_some()),
+        }
+
+        // Replace the text and save: must overwrite pending[0], not append.
+        for _ in 0.."first".chars().count() {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), size);
+        }
+        for ch in "second".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size).is_none());
+
+        assert_eq!(app.pending.len(), 1, "editing must replace, not duplicate");
+        assert_eq!(app.pending[0].annotation.comment, "second");
+    }
+
+    #[test]
+    fn esc_clears_visual_anchor_without_cancelling_but_q_still_cancels() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+
+        // `v` sets the anchor; no outcome.
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), size).is_none());
+        assert!(app.visual_anchor.is_some());
+
+        // Esc with a live anchor clears it and does NOT cancel the review.
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), size).is_none());
+        assert!(app.visual_anchor.is_none());
+
+        // A second Esc, now with no anchor, would cancel — but `q` always cancels.
+        let outcome = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), size)
+            .expect("q cancels");
+        assert_eq!(outcome.verdict, Verdict::Cancelled);
+        assert!(outcome.annotations.is_empty());
     }
 }

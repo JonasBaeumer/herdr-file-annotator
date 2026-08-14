@@ -2,7 +2,7 @@
 //!
 //! Connects to the handoff socket, loads the diff, hands off to the ratatui
 //! UI (`ui::run`) for the actual review, and reports the reviewer's verdict
-//! back over the socket. Line-anchored annotations arrive in M3.
+//! and any line-anchored annotations back over the socket.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,7 +31,7 @@ pub fn run() -> Result<()> {
         version: PROTOCOL_VERSION,
         verdict: outcome.verdict,
         summary: outcome.summary,
-        annotations: Vec::new(),
+        annotations: outcome.annotations,
     };
     conn.send_result(&result)?;
     println!(
