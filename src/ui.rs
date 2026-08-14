@@ -478,7 +478,20 @@ fn draw_empty_message(frame: &mut Frame, area: Rect) {
     frame.render_widget(msg, rows[1]);
 }
 
+/// Below this width a side-by-side split leaves the diff no room for code
+/// after the 24-col navigator minimum (herdr splits get narrow fast), so we
+/// stack: navigator strip on top, diff below.
+const STACK_THRESHOLD: u16 = 64;
+
 fn body_split(area: Rect) -> (Rect, Rect) {
+    if area.width < STACK_THRESHOLD {
+        let nav_height = ((area.height as u32 * 30 / 100) as u16).clamp(4, 10).min(area.height);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(nav_height), Constraint::Min(0)])
+            .split(area);
+        return (rows[0], rows[1]);
+    }
     let nav_width = ((area.width as u32 * 30 / 100) as u16).max(24).min(area.width);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -833,5 +846,38 @@ mod tests {
         assert_eq!(add_line.spans[1].style.bg, Some(ADD_BG));
         // The gutter does not.
         assert_eq!(add_line.spans[0].style.bg, None);
+
+        // Syntax highlighting is real: the content carries syntect RGB
+        // foregrounds, and a Rust keyword line is not monochrome (the `let`
+        // token differs from at least one other token's color).
+        let fgs: Vec<_> = add_line.spans[2..]
+            .iter()
+            .map(|s| s.style.fg)
+            .collect();
+        assert!(
+            fgs.iter().all(|fg| matches!(fg, Some(Color::Rgb(..)))),
+            "expected RGB foregrounds from syntect, got {fgs:?}"
+        );
+        assert!(
+            fgs.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "expected more than one distinct token color, got {fgs:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_body_stacks_navigator_above_diff() {
+        // 40 cols (the width the e2e run hit): side-by-side leaves no room
+        // for code, so the split must go vertical.
+        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30));
+        assert_eq!(nav.width, 40);
+        assert_eq!(diff.width, 40);
+        assert!(nav.height >= 4 && nav.height <= 10);
+        assert_eq!(nav.y + nav.height, diff.y);
+
+        // Wide pane keeps the horizontal split with the 24-col floor.
+        let (nav, diff) = body_split(Rect::new(0, 0, 120, 30));
+        assert_eq!(nav.height, 30);
+        assert_eq!(nav.width, 36);
+        assert_eq!(nav.x + nav.width, diff.x);
     }
 }
