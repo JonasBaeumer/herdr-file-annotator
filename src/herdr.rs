@@ -21,30 +21,32 @@ pub fn inside_herdr() -> bool {
 
 /// Open the review pane beside the calling agent's pane, injecting the handoff
 /// socket path. herdr CLI server errors arrive as JSON on stderr with exit 1.
+///
+/// Flag shape matters (verified against herdr 0.8.0): a split open takes
+/// `--placement split --target-pane <id> --direction <dir>` and must NOT also
+/// pass `--workspace` — combining them makes the server reject the request with
+/// "split and zoomed plugin panes target an existing pane; use target_pane_id".
+/// `--workspace` belongs to tab placement only (same split reviewr uses).
 pub fn open_review_pane(socket_path: &str) -> Result<()> {
-    let workspace = std::env::var("HERDR_WORKSPACE_ID")
-        .context("HERDR_WORKSPACE_ID is not set — the agent does not appear to run inside herdr")?;
     let mut cmd = Command::new(herdr_bin());
-    cmd.args([
-        "plugin",
-        "pane",
-        "open",
-        "--plugin",
-        PLUGIN_ID,
-        "--entrypoint",
-        PANE_ENTRYPOINT,
-        "--workspace",
-        &workspace,
-        "--direction",
-        "right",
-        "--focus",
-        "--env",
-    ]);
-    cmd.arg(format!("{}={}", crate::protocol::SOCKET_ENV, socket_path));
-    // Split beside the agent's own pane when we know it; otherwise herdr picks.
-    if let Ok(pane_id) = std::env::var("HERDR_PANE_ID") {
-        cmd.args(["--target-pane", &pane_id]);
+    cmd.args(["plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", PANE_ENTRYPOINT]);
+    match std::env::var("HERDR_PANE_ID") {
+        // Normal case: split beside the agent's own pane.
+        Ok(pane_id) => {
+            cmd.args(["--placement", "split", "--target-pane", &pane_id, "--direction", "right"]);
+        }
+        // No pane context (e.g. agent launched outside a managed pane): fall
+        // back to a tab in the agent's workspace.
+        Err(_) => {
+            let workspace = std::env::var("HERDR_WORKSPACE_ID").context(
+                "neither HERDR_PANE_ID nor HERDR_WORKSPACE_ID is set — the agent does not appear to run inside herdr",
+            )?;
+            cmd.args(["--placement", "tab", "--workspace", &workspace]);
+        }
     }
+    cmd.arg("--focus");
+    cmd.arg("--env");
+    cmd.arg(format!("{}={}", crate::protocol::SOCKET_ENV, socket_path));
     let output = cmd.output().context("spawning herdr CLI")?;
     if !output.status.success() {
         bail!(
