@@ -4,7 +4,10 @@
 //! file's diff on the right) replacing M1's single scrolling view. No
 //! annotations yet — those arrive in M3.
 
+use std::collections::HashMap;
 use std::io;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use crossterm::{
@@ -21,6 +24,9 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use crate::diff::{DiffLine, DiffModel, FileDiff, FileStatus, Origin};
 use crate::protocol::{ReviewRequest, Verdict};
@@ -29,6 +35,39 @@ use crate::protocol::{ReviewRequest, Verdict};
 pub struct Outcome {
     pub verdict: Verdict,
     pub summary: Option<String>,
+}
+
+/// Syntax highlighting resources: a syntax set (language grammars) and a
+/// single fixed theme. Built once (`SyntaxSet::load_defaults_newlines` and
+/// `ThemeSet::load_defaults` are both nontrivial parses) and reused for the
+/// lifetime of the process via `OnceLock`, rather than being threaded
+/// through as owned state on `App` (which would tangle `App`'s lifetime
+/// with the highlighter's).
+struct Highlighter {
+    syntax_set: SyntaxSet,
+    theme: Theme,
+}
+
+static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
+
+fn highlighter() -> &'static Highlighter {
+    HIGHLIGHTER.get_or_init(|| {
+        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let theme_set = ThemeSet::load_defaults();
+        let theme = theme_set.themes["base16-eighties.dark"].clone();
+        Highlighter { syntax_set, theme }
+    })
+}
+
+/// Look up the syntax for a file by its path's extension, falling back to
+/// plain text (no highlighting, just the theme's default foreground) when
+/// there's no extension or no matching grammar.
+fn syntax_for_path<'a>(hl: &'a Highlighter, path: &str) -> &'a SyntaxReference {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(|ext| hl.syntax_set.find_syntax_by_extension(ext))
+        .unwrap_or_else(|| hl.syntax_set.find_syntax_plain_text())
 }
 
 /// Run the review UI to completion and return the reviewer's verdict.
@@ -230,10 +269,25 @@ struct App<'a> {
     diff: DiffViewState,
     /// Some(buffer) while the "request changes" summary prompt is open.
     input: Option<String>,
+    /// Fully syntax-highlighted body rows per file, keyed by index into
+    /// `model.files`. Computed once up front in `new` rather than lazily on
+    /// first view: model sizes here (a code review's changed files) are
+    /// moderate, and precomputing avoids needing interior mutability just
+    /// so `draw` (which only borrows `App` immutably) can populate a cache
+    /// on demand. Never invalidated — the model is immutable for the life
+    /// of the UI.
+    row_cache: HashMap<usize, Vec<Line<'static>>>,
 }
 
 impl<'a> App<'a> {
     fn new(request: &'a ReviewRequest, model: &'a Result<DiffModel>) -> Self {
+        let mut row_cache = HashMap::new();
+        if let Ok(m) = model {
+            let hl = highlighter();
+            for (i, file) in m.files.iter().enumerate() {
+                row_cache.insert(i, highlight_file_rows(hl, file));
+            }
+        }
         App {
             request,
             model,
@@ -241,6 +295,7 @@ impl<'a> App<'a> {
             nav: NavState::default(),
             diff: DiffViewState::default(),
             input: None,
+            row_cache,
         }
     }
 
@@ -492,41 +547,109 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
     let title = file.map(file_display_path).unwrap_or_else(|| "diff".to_string());
     let block = pane_block(title, app.focus == Focus::Diff);
 
-    let Some(file) = file else {
+    if file.is_none() {
         frame.render_widget(block, area);
         return;
-    };
+    }
 
-    let rows = flatten_rows(file);
-    let lines: Vec<Line> = rows.iter().map(diff_row_line).collect();
+    // Pre-highlighted in `App::new`; drawing just clones the cached, owned
+    // lines rather than re-running syntect on every frame.
+    let lines: Vec<Line> = app.row_cache.get(&app.nav.selected).cloned().unwrap_or_default();
     let paragraph = Paragraph::new(lines).block(block).scroll((app.diff.scroll as u16, 0));
     frame.render_widget(paragraph, area);
 }
 
-fn diff_row_line<'a>(row: &DiffRow<'a>) -> Line<'a> {
-    match row {
-        DiffRow::HunkHeader(header) => {
-            Line::styled((*header).to_string(), Style::default().fg(Color::Cyan))
+/// Add-line content background (dark green).
+const ADD_BG: Color = Color::Rgb(0, 60, 0);
+/// Remove-line content background (dark red).
+const REMOVE_BG: Color = Color::Rgb(70, 0, 0);
+
+/// Highlight a whole file's flattened diff rows into owned, display-ready
+/// `Line`s. Run once per file (see `App`'s row cache) rather than per draw
+/// frame: `syntect` highlighting is real parsing work, not something to
+/// repeat 30+ times a second while the reviewer scrolls.
+///
+/// Highlighting runs hunk-by-hunk: each hunk gets a fresh `HighlightLines`
+/// seeded with the file's syntax, fed context/add/remove lines in order.
+/// This is an approximation (the hunk mixes two file states, old and new)
+/// but keeps highlighter state coherent within a hunk without needing to
+/// reconstruct the two full file sides.
+fn highlight_file_rows(hl: &'static Highlighter, file: &FileDiff) -> Vec<Line<'static>> {
+    let syntax = syntax_for_path(hl, &file.path);
+    let rows = flatten_rows(file);
+    let mut out = Vec::with_capacity(rows.len());
+    let mut hunk_hl: Option<HighlightLines<'static>> = None;
+
+    for row in &rows {
+        match row {
+            DiffRow::HunkHeader(header) => {
+                hunk_hl = Some(HighlightLines::new(syntax, &hl.theme));
+                out.push(Line::styled((*header).to_string(), Style::default().fg(Color::Cyan)));
+            }
+            DiffRow::Binary => {
+                out.push(Line::styled("(binary file)", Style::default().fg(Color::DarkGray)))
+            }
+            DiffRow::NoContent => {
+                out.push(Line::styled("(no content)", Style::default().fg(Color::DarkGray)))
+            }
+            DiffRow::Line(line) => {
+                let state = hunk_hl.get_or_insert_with(|| HighlightLines::new(syntax, &hl.theme));
+                out.push(highlight_diff_line(hl, state, line));
+            }
         }
-        DiffRow::Binary => Line::styled("(binary file)", Style::default().fg(Color::DarkGray)),
-        DiffRow::NoContent => Line::styled("(no content)", Style::default().fg(Color::DarkGray)),
-        DiffRow::Line(line) => diff_line_spans(line),
     }
+    out
 }
 
-fn diff_line_spans(line: &DiffLine) -> Line<'_> {
+/// Highlight one diff line's content and compose it with the existing
+/// gutter/marker signaling: a dim line-number gutter, an origin-colored
+/// `+`/`-`/` ` marker, then syntect-colored content spans. Add/remove lines
+/// get a background tint on the marker and content (not the gutter) so the
+/// signal reads at a glance without drowning per-token foreground colors.
+fn highlight_diff_line(
+    hl: &'static Highlighter,
+    state: &mut HighlightLines<'static>,
+    line: &DiffLine,
+) -> Line<'static> {
     let old_str = line.old_no.map(|n| n.to_string()).unwrap_or_default();
     let new_str = line.new_no.map(|n| n.to_string()).unwrap_or_default();
     let gutter = format!("{old_str:>4} {new_str:>4} ");
-    let (marker, color) = match line.origin {
-        Origin::Add => ("+", Color::Green),
-        Origin::Remove => ("-", Color::Red),
-        Origin::Context => (" ", Color::Reset),
+
+    let (marker, marker_fg, bg) = match line.origin {
+        Origin::Add => ("+", Color::Green, Some(ADD_BG)),
+        Origin::Remove => ("-", Color::Red, Some(REMOVE_BG)),
+        Origin::Context => (" ", Color::Reset, None),
     };
-    Line::from(vec![
+
+    let mut marker_style = Style::default().fg(marker_fg);
+    if let Some(bg) = bg {
+        marker_style = marker_style.bg(bg);
+    }
+
+    let mut spans = vec![
         Span::styled(gutter, Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{marker}{}", line.content), Style::default().fg(color)),
-    ])
+        Span::styled(marker.to_string(), marker_style),
+    ];
+
+    // syntect's `highlight_line` needs a trailing newline for correct state
+    // tracking; feed it one and strip it back out of the resulting spans.
+    let mut fed = line.content.clone();
+    fed.push('\n');
+    let ranges = state.highlight_line(&fed, &hl.syntax_set).unwrap_or_default();
+    for (style, text) in ranges {
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        if text.is_empty() {
+            continue;
+        }
+        let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+        let mut span_style = Style::default().fg(fg);
+        if let Some(bg) = bg {
+            span_style = span_style.bg(bg);
+        }
+        spans.push(Span::styled(text.to_string(), span_style));
+    }
+
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -668,5 +791,47 @@ mod tests {
         // No files: selection pinned to 0.
         nav.down(0);
         assert_eq!(nav.selected, 0);
+    }
+
+    #[test]
+    fn highlighted_rs_add_line_keeps_content_and_add_background() {
+        let file = FileDiff {
+            path: "src/lib.rs".to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,2 @@".to_string(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![line(Origin::Add, None, Some(2), "    let x = 1;")],
+            }],
+        };
+
+        let rows = highlight_file_rows(highlighter(), &file);
+        // rows[0] is the hunk header; rows[1] is the add line.
+        assert_eq!(rows.len(), 2);
+        let add_line = &rows[1];
+
+        // Spans 0 and 1 are the gutter and the "+" marker; everything after
+        // that is syntect's tokenization of the content. Concatenating them
+        // back together must reproduce the original content exactly.
+        let content: String =
+            add_line.spans[2..].iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(content, "    let x = 1;");
+
+        // Every content span (foreground comes from syntect) still carries
+        // the add-line background tint.
+        for span in &add_line.spans[2..] {
+            assert_eq!(span.style.bg, Some(ADD_BG));
+        }
+        // The marker span carries it too.
+        assert_eq!(add_line.spans[1].style.bg, Some(ADD_BG));
+        // The gutter does not.
+        assert_eq!(add_line.spans[0].style.bg, None);
     }
 }
