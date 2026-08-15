@@ -36,6 +36,34 @@ One Rust binary, two modes:
 - `herdr-annotator pane` — the review TUI, declared as a herdr plugin pane
   entrypoint. Launched by herdr, never by hand.
 
+## Install
+
+Requires herdr ≥ 0.8.0.
+
+```sh
+herdr plugin install JonasBaeumer/herdr-file-annotator
+```
+
+Downloads a prebuilt binary for macOS (arm64/x86_64) and Linux (x86_64/arm64, static musl)
+matching the release, verifies its SHA-256, and falls back to building from source with cargo
+if no matching prebuilt exists.
+
+Then register the MCP server with your agent (Claude Code shown). `herdr plugin install`
+places the plugin under a herdr-managed directory (e.g.
+`~/.config/herdr/plugins/github/herdr-file-annotator-<hash>`) rather than your working
+directory, so look it up with `herdr plugin list` (or `herdr plugin list --plugin
+jonasbaeumer.file-annotator --json` for the exact `plugin_root` field), then:
+
+```sh
+claude mcp add annotator -- "<plugin_root>/bin/herdr-annotator" mcp
+```
+
+Finally, tell the agent when to ask for review — e.g. in `CLAUDE.md`:
+
+> Before marking any task complete, call the `review_changes` tool and act on
+> the returned annotations. Do not proceed on a `request_changes` or `reject`
+> verdict without addressing the feedback.
+
 ## Install (local development)
 
 Requires a Rust toolchain and herdr ≥ 0.8.0.
@@ -46,17 +74,20 @@ cd herdr-file-annotator
 ./scripts/dev-link.sh          # builds, symlinks bin/, runs `herdr plugin link`
 ```
 
-Then register the MCP server with your agent (Claude Code shown):
+`herdr plugin link` skips the `[[build]]` step (`scripts/fetch-or-build.sh`), so
+`dev-link.sh`'s own `cargo build` is what produces `bin/herdr-annotator` here.
 
-```sh
-claude mcp add annotator -- "$PWD/bin/herdr-annotator" mcp
-```
+## Configuration
 
-Finally, tell the agent when to ask for review — e.g. in `CLAUDE.md`:
+Optional `config.toml` in the plugin's config dir (find it with `herdr plugin config-dir jonasbaeumer.file-annotator`):
 
-> Before marking any task complete, call the `review_changes` tool and act on
-> the returned annotations. Do not proceed on a `request_changes` or `reject`
-> verdict without addressing the feedback.
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `placement` | `"split"` | `split` (beside the agent) or `tab` |
+| `direction` | `"right"` | Split direction: `right` or `down` |
+| `focus` | `true` | Move keyboard focus to the review pane when it opens |
+| `accept_timeout_secs` | `20` | How long the agent waits for the pane to appear |
+| `review_timeout_secs` | unset | If set, a review left open this long returns a `cancelled` verdict |
 
 ## The `review_changes` tool
 

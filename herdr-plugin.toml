@@ -12,6 +12,13 @@ min_herdr_version = "0.8.0"
 description = "Agent-summoned, blocking diff review: the agent calls an MCP tool, a review pane opens beside it, and the agent waits for your verdict and line annotations."
 platforms = ["macos", "linux"]
 
+# Installs a prebuilt binary (verified SHA-256) matching the release tagged for the
+# `version` above, falling back to `cargo build --release` from source. `herdr plugin link`
+# (local dev) skips [[build]] steps entirely — scripts/dev-link.sh builds the binary and
+# symlinks it into bin/ for that path instead.
+[[build]]
+command = ["/bin/sh", "scripts/fetch-or-build.sh"]
+
 # Launched by absolute path under the plugin root: the pane's cwd is the repo
 # under review, not the plugin root, so a relative path would not resolve.
 # scripts/dev-link.sh builds the binary and symlinks it into bin/.
