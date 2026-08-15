@@ -14,7 +14,10 @@ use std::sync::OnceLock;
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -94,7 +97,11 @@ pub fn run(request: &ReviewRequest, model: Result<DiffModel>) -> Result<Outcome>
                     return Ok(outcome);
                 }
             }
-            // Resize, mouse, release events, etc: just redraw next iteration.
+            Event::Mouse(mouse) => {
+                let size = terminal.size()?;
+                app.handle_mouse(mouse, size);
+            }
+            // Resize, release events, etc: just redraw next iteration.
             _ => {}
         }
     }
@@ -106,14 +113,14 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> Result<Self> {
         terminal::enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+        execute!(io::stdout(), EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
         Ok(TermGuard)
     }
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), cursor::Show, LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, cursor::Show, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -241,9 +248,23 @@ impl DispMap {
         self.ends.iter().filter(|&&e| e == base).count()
     }
 
-    #[cfg(test)]
     fn total(&self, base_count: usize) -> usize {
         base_count + self.ends.len()
+    }
+
+    /// Inverse mapping for mouse hits: the base row rendered at (or hanging
+    /// above) a display row — clicking an inline comment resolves to the
+    /// line it annotates. Returns the largest base row whose display index
+    /// is <= `disp_row`, clamped to the file's rows.
+    fn base_at(&self, disp_row: usize, base_count: usize) -> usize {
+        if base_count == 0 {
+            return 0;
+        }
+        let mut b = disp_row.min(base_count - 1);
+        while b > 0 && self.disp(b) > disp_row {
+            b -= 1;
+        }
+        b
     }
 }
 
@@ -446,6 +467,23 @@ fn half_page(term_size: Size) -> usize {
     (diff_viewport_rows(term_size) / 2).max(1)
 }
 
+/// Display rows a wheel/trackpad tick scrolls the diff.
+const WHEEL_STEP: usize = 3;
+
+/// The navigator/diff rects for mouse hit-testing, mirroring `draw`'s
+/// layout: header (1) + note (1) above the body, footer (1) below.
+fn body_rects(term_size: Size) -> (Rect, Rect) {
+    let body = Rect::new(0, 2, term_size.width, term_size.height.saturating_sub(3));
+    body_split(body)
+}
+
+fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
+    column >= rect.x
+        && column < rect.x + rect.width
+        && row >= rect.y
+        && row < rect.y + rect.height
+}
+
 /// Marker color, matching git status vocabulary.
 fn marker_color(status: FileStatus) -> Color {
     match status {
@@ -479,6 +517,9 @@ struct App<'a> {
     /// cursor moves. Diff-focus only; cleared by a second `v`, by `Esc`, or
     /// by opening a comment with `c`.
     visual_anchor: Option<usize>,
+    /// Base row where a left-button press landed in the diff; a subsequent
+    /// drag turns it into the visual anchor (mouse range selection).
+    drag_origin: Option<usize>,
     /// Annotations the reviewer has left so far, in creation order.
     pending: Vec<PendingAnnotation>,
     /// Fully syntax-highlighted body rows per file, keyed by index into
@@ -508,6 +549,7 @@ impl<'a> App<'a> {
             diff: DiffViewState::default(),
             input: None,
             visual_anchor: None,
+            drag_origin: None,
             pending: Vec::new(),
             row_cache,
         }
@@ -689,6 +731,127 @@ impl<'a> App<'a> {
             &map,
             diff_viewport_rows(term_size),
         );
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, term_size: Size) {
+        // While an input bar is open the keyboard owns the interaction;
+        // stray clicks/scrolls shouldn't move state under the typed comment.
+        if self.input.is_some() {
+            return;
+        }
+        let (nav_rect, diff_rect) = body_rects(term_size);
+        let in_nav = rect_contains(nav_rect, mouse.column, mouse.row);
+        let in_diff = rect_contains(diff_rect, mouse.column, mouse.row);
+
+        match mouse.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let down = matches!(mouse.kind, MouseEventKind::ScrollDown);
+                if in_nav {
+                    let len = self.files().len();
+                    let before = self.nav.selected;
+                    if down {
+                        self.nav.down(len);
+                    } else {
+                        self.nav.up();
+                    }
+                    if self.nav.selected != before {
+                        self.diff.reset();
+                    }
+                } else if in_diff {
+                    self.wheel_diff(down, term_size);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if in_nav {
+                    if let Some(idx) = self.nav_index_at(mouse.row, nav_rect) {
+                        self.focus = Focus::Navigator;
+                        if idx != self.nav.selected {
+                            self.nav.selected = idx;
+                            self.diff.reset();
+                        }
+                    }
+                } else if in_diff && !self.diff_rows().is_empty() {
+                    self.focus = Focus::Diff;
+                    // A fresh click always starts over: cursor moves, any
+                    // keyboard/mouse selection is discarded, and the pressed
+                    // row is remembered so a drag can grow a range from it.
+                    self.visual_anchor = None;
+                    let base = self.diff_base_at(mouse.row, diff_rect);
+                    self.diff.cursor = base;
+                    self.drag_origin = Some(base);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(origin) = self.drag_origin {
+                    if self.diff_rows().is_empty() {
+                        return;
+                    }
+                    let base = self.diff_base_at(mouse.row, diff_rect);
+                    if base != origin && self.visual_anchor.is_none() {
+                        self.visual_anchor = Some(origin);
+                    }
+                    self.diff.cursor = base;
+                    self.ensure_cursor_visible(term_size);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.drag_origin = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Wheel over the diff: move the viewport, and drag the cursor along
+    /// only when it would leave the visible area (editor-style), so plain
+    /// reading scrolls never disturb the cursor.
+    fn wheel_diff(&mut self, down: bool, term_size: Size) {
+        let base_count = self.diff_rows().len();
+        if base_count == 0 {
+            return;
+        }
+        let map = self.disp_map();
+        let max_scroll = map.total(base_count).saturating_sub(1);
+        self.diff.scroll = if down {
+            (self.diff.scroll + WHEEL_STEP).min(max_scroll)
+        } else {
+            self.diff.scroll.saturating_sub(WHEEL_STEP)
+        };
+        let viewport = diff_viewport_rows(term_size);
+        let cursor_disp = map.disp(self.diff.cursor);
+        if cursor_disp < self.diff.scroll {
+            self.diff.cursor = map.base_at(self.diff.scroll, base_count);
+        } else if cursor_disp >= self.diff.scroll + viewport {
+            self.diff.cursor =
+                map.base_at(self.diff.scroll + viewport.saturating_sub(1), base_count);
+        }
+    }
+
+    /// File index under a mouse row in the navigator, replicating the list's
+    /// deterministic scroll offset (a fresh ListState per frame scrolls just
+    /// enough to keep the selected row visible).
+    fn nav_index_at(&self, mouse_row: u16, nav_rect: Rect) -> Option<usize> {
+        let files = self.files();
+        let inner_y = nav_rect.y + 1;
+        let inner_h = nav_rect.height.saturating_sub(2);
+        if inner_h == 0 || mouse_row < inner_y || mouse_row >= inner_y + inner_h {
+            return None;
+        }
+        let inner_h = inner_h as usize;
+        let offset = if self.nav.selected >= inner_h { self.nav.selected + 1 - inner_h } else { 0 };
+        let idx = offset + (mouse_row - inner_y) as usize;
+        (idx < files.len()).then_some(idx)
+    }
+
+    /// Base row under a mouse row in the diff pane; rows outside the inner
+    /// area clamp to its edges so drags past the border keep selecting.
+    fn diff_base_at(&self, mouse_row: u16, diff_rect: Rect) -> usize {
+        let base_count = self.diff_rows().len();
+        let map = self.disp_map();
+        let inner_y = diff_rect.y + 1;
+        let inner_h = diff_rect.height.saturating_sub(2).max(1);
+        let row = mouse_row.clamp(inner_y, inner_y + inner_h - 1);
+        let disp_row = self.diff.scroll + (row - inner_y) as usize;
+        map.base_at(disp_row.min(map.total(base_count).saturating_sub(1)), base_count)
     }
 
     /// `c` in diff focus, input closed: open the comment prompt. Uses the
@@ -1333,6 +1496,24 @@ mod tests {
         assert_eq!(map.disp(4), 6); // shifted by the two comments under row 3
         assert_eq!(map.disp(8), 11); // shifted by all three
         assert_eq!(map.total(10), 13);
+    }
+
+    #[test]
+    fn base_at_inverts_disp_and_resolves_comment_rows_to_their_line() {
+        let map = DispMap::new(vec![7, 3, 3]);
+        // Round trip through every base row.
+        for b in 0..10 {
+            assert_eq!(map.base_at(map.disp(b), 10), b);
+        }
+        // Display rows 4 and 5 are the two comments under base row 3;
+        // clicking them selects the annotated line.
+        assert_eq!(map.base_at(4, 10), 3);
+        assert_eq!(map.base_at(5, 10), 3);
+        // Display row 10 is the comment under base row 7.
+        assert_eq!(map.base_at(10, 10), 7);
+        // Past the end clamps to the last base row; empty file clamps to 0.
+        assert_eq!(map.base_at(999, 10), 9);
+        assert_eq!(DispMap::new(vec![]).base_at(5, 0), 0);
     }
 
     #[test]
