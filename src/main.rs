@@ -1,3 +1,4 @@
+mod config;
 mod diff;
 mod herdr;
 mod mcp;

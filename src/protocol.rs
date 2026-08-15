@@ -133,12 +133,33 @@ impl Handoff {
     }
 
     /// Send the request, then block until the pane replies or hangs up.
-    pub fn exchange(mut self, request: &ReviewRequest) -> Result<ReviewResult> {
+    ///
+    /// `timeout`: `None` waits forever (the default); `Some(d)` sets a read
+    /// deadline, and a read that doesn't complete in time maps to a
+    /// `Cancelled` verdict rather than an error — a slow or silent reviewer
+    /// is not a protocol failure.
+    pub fn exchange(mut self, request: &ReviewRequest, timeout: Option<Duration>) -> Result<ReviewResult> {
         write_json_line(&mut self.stream, request)?;
+        if let Some(timeout) = timeout {
+            self.stream
+                .set_read_timeout(Some(timeout))
+                .context("setting review read timeout")?;
+        }
         let mut reader = BufReader::new(self.stream);
-        match read_json_line::<ReviewResult, _>(&mut reader)? {
-            Some(result) => Ok(result),
-            None => Ok(ReviewResult::cancelled("review pane closed without a verdict")),
+        match read_json_line::<ReviewResult, _>(&mut reader) {
+            Ok(Some(result)) => Ok(result),
+            Ok(None) => Ok(ReviewResult::cancelled("review pane closed without a verdict")),
+            Err(err) => match err.downcast_ref::<std::io::Error>() {
+                Some(io_err)
+                    if matches!(
+                        io_err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok(ReviewResult::cancelled("review timed out"))
+                }
+                _ => Err(err),
+            },
         }
     }
 }
@@ -208,12 +229,15 @@ mod tests {
 
         let handoff = Handoff::accept(listener, Duration::from_secs(5)).unwrap();
         let result = handoff
-            .exchange(&ReviewRequest {
-                version: PROTOCOL_VERSION,
-                working_dir: "/tmp/repo".into(),
-                baseline: None,
-                note: None,
-            })
+            .exchange(
+                &ReviewRequest {
+                    version: PROTOCOL_VERSION,
+                    working_dir: "/tmp/repo".into(),
+                    baseline: None,
+                    note: None,
+                },
+                None,
+            )
             .unwrap();
         pane.join().unwrap();
 
@@ -240,15 +264,57 @@ mod tests {
 
         let handoff = Handoff::accept(listener, Duration::from_secs(5)).unwrap();
         let result = handoff
-            .exchange(&ReviewRequest {
-                version: PROTOCOL_VERSION,
-                working_dir: "/".into(),
-                baseline: None,
-                note: None,
-            })
+            .exchange(
+                &ReviewRequest {
+                    version: PROTOCOL_VERSION,
+                    working_dir: "/".into(),
+                    baseline: None,
+                    note: None,
+                },
+                None,
+            )
             .unwrap();
         pane.join().unwrap();
         assert_eq!(result.verdict, Verdict::Cancelled);
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn exchange_times_out_when_pane_never_replies() {
+        let dir = std::env::temp_dir().join(format!("annot-test-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let sock_client = sock.clone();
+        let pane = std::thread::spawn(move || {
+            // Connect and read the request, but never send a verdict — hold
+            // the connection open (not EOF) so the timeout path is what
+            // has to save us, not the EOF path.
+            let mut conn = PaneConnection::connect(&sock_client).unwrap();
+            let _ = conn.receive_request().unwrap();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let handoff = Handoff::accept(listener, Duration::from_secs(5)).unwrap();
+        let result = handoff
+            .exchange(
+                &ReviewRequest {
+                    version: PROTOCOL_VERSION,
+                    working_dir: "/".into(),
+                    baseline: None,
+                    note: None,
+                },
+                Some(Duration::from_millis(200)),
+            )
+            .unwrap();
+
+        assert_eq!(result.verdict, Verdict::Cancelled);
+        assert_eq!(result.summary.as_deref(), Some("review timed out"));
+        let _ = std::fs::remove_file(&sock);
+        // Don't join `pane` — it's asleep for several seconds and we don't
+        // need it to finish to consider this test done.
+        drop(pane);
     }
 }

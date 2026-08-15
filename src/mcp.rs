@@ -13,18 +13,18 @@
 
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+use crate::config::{self, Config};
 use crate::herdr;
 use crate::protocol::{Handoff, ReviewRequest, ReviewResult, PROTOCOL_VERSION};
 
 const TOOL_NAME: &str = "review_changes";
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn run() -> Result<()> {
+    let config = config::load();
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     eprintln!("herdr-annotator mcp: ready (pid {})", std::process::id());
@@ -51,7 +51,7 @@ pub fn run() -> Result<()> {
             ("tools/list", Some(id)) => {
                 Some(result_frame(id, json!({ "tools": [tool_descriptor()] })))
             }
-            ("tools/call", Some(id)) => Some(result_frame(id, handle_tool_call(&params))),
+            ("tools/call", Some(id)) => Some(result_frame(id, handle_tool_call(&params, &config))),
             (_, Some(id)) => Some(json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -115,13 +115,13 @@ fn tool_descriptor() -> Value {
     })
 }
 
-fn handle_tool_call(params: &Value) -> Value {
+fn handle_tool_call(params: &Value, config: &Config) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
     if name != TOOL_NAME {
         return tool_error(format!("unknown tool: {name}"));
     }
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    match run_review(&args) {
+    match run_review(&args, config) {
         Ok(result) => {
             let text = serde_json::to_string_pretty(&result)
                 .unwrap_or_else(|e| format!("{{\"error\":\"serialize: {e}\"}}"));
@@ -136,7 +136,7 @@ fn tool_error(message: String) -> Value {
     json!({ "content": [{ "type": "text", "text": message }], "isError": true })
 }
 
-fn run_review(args: &Value) -> Result<ReviewResult> {
+fn run_review(args: &Value, config: &Config) -> Result<ReviewResult> {
     if !herdr::inside_herdr() {
         bail!("not running inside a herdr session (HERDR_ENV != 1); review_changes needs the agent to live in a herdr pane");
     }
@@ -171,11 +171,11 @@ fn run_review(args: &Value) -> Result<ReviewResult> {
         "herdr-annotator mcp: opening review pane (socket {})",
         socket_path.display()
     );
-    let opened = herdr::open_review_pane(&socket_path.to_string_lossy());
+    let opened = herdr::open_review_pane(&socket_path.to_string_lossy(), config);
     let outcome = opened.and_then(|()| {
-        let handoff = Handoff::accept(listener, ACCEPT_TIMEOUT)?;
+        let handoff = Handoff::accept(listener, config.accept_timeout)?;
         eprintln!("herdr-annotator mcp: pane connected, waiting for verdict…");
-        handoff.exchange(&request)
+        handoff.exchange(&request, config.review_timeout)
     });
     let _ = std::fs::remove_file(&socket_path);
     let result = outcome?;
