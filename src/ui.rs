@@ -477,6 +477,25 @@ fn body_rects(term_size: Size) -> (Rect, Rect) {
     body_split(body)
 }
 
+/// Inner (borderless) width of the diff pane — the wrap width for inline
+/// comments; must match what `draw_diff` derives from its render area.
+fn diff_inner_width(term_size: Size) -> usize {
+    let (_, diff_rect) = body_rects(term_size);
+    (diff_rect.width.saturating_sub(2)).max(1) as usize
+}
+
+/// Fit a buffer into `avail` columns keeping its END visible: long input
+/// shows `…` plus the tail (where the caret is).
+fn tail_fit(s: &str, avail: usize) -> String {
+    let len = s.chars().count();
+    if len <= avail {
+        return s.to_string();
+    }
+    let keep = avail.saturating_sub(1);
+    let tail: String = s.chars().skip(len - keep).collect();
+    format!("\u{2026}{tail}")
+}
+
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x
         && column < rect.x + rect.width
@@ -704,18 +723,21 @@ impl<'a> App<'a> {
     /// The display map for the currently selected file: saved annotations
     /// plus the live comment being typed (its preview row occupies display
     /// space too, so scrolling must account for it).
-    fn disp_map(&self) -> DispMap {
-        let mut ends: Vec<usize> = self
-            .pending
-            .iter()
-            .filter(|p| p.file_idx == self.nav.selected)
-            .map(|p| p.row_end)
-            .collect();
-        if let Some(InputMode::Comment { editing, row_end, .. }) = &self.input {
+    /// One `ends` entry per DISPLAY row a comment occupies — wrapped
+    /// comments push several — so the scroll math sees their real height.
+    /// `inner_width` is the diff pane's inner width (wrap width source).
+    fn disp_map(&self, inner_width: usize) -> DispMap {
+        let mut ends: Vec<usize> = Vec::new();
+        for p in self.pending.iter().filter(|p| p.file_idx == self.nav.selected) {
+            let h = comment_height(p.annotation.tag.as_deref(), &p.annotation.comment, inner_width);
+            ends.extend(std::iter::repeat(p.row_end).take(h));
+        }
+        if let Some(InputMode::Comment { buf, tag, editing, row_end, .. }) = &self.input {
             // An edit reuses its existing annotation's slot; a new comment
-            // adds a preview row.
+            // adds a live preview.
             if editing.is_none() {
-                ends.push(*row_end);
+                let h = comment_height(tag.as_ref().map(|t| t.label()), buf, inner_width);
+                ends.extend(std::iter::repeat(*row_end).take(h));
             }
         }
         DispMap::new(ends)
@@ -724,7 +746,7 @@ impl<'a> App<'a> {
     /// Display-space scroll follow, run after every key that can move the
     /// cursor or change which comment rows exist.
     fn ensure_cursor_visible(&mut self, term_size: Size) {
-        let map = self.disp_map();
+        let map = self.disp_map(diff_inner_width(term_size));
         self.diff.scroll = follow_display(
             self.diff.scroll,
             self.diff.cursor,
@@ -809,7 +831,7 @@ impl<'a> App<'a> {
         if base_count == 0 {
             return;
         }
-        let map = self.disp_map();
+        let map = self.disp_map(diff_inner_width(term_size));
         let max_scroll = map.total(base_count).saturating_sub(1);
         self.diff.scroll = if down {
             (self.diff.scroll + WHEEL_STEP).min(max_scroll)
@@ -846,7 +868,7 @@ impl<'a> App<'a> {
     /// area clamp to its edges so drags past the border keep selecting.
     fn diff_base_at(&self, mouse_row: u16, diff_rect: Rect) -> usize {
         let base_count = self.diff_rows().len();
-        let map = self.disp_map();
+        let map = self.disp_map((diff_rect.width.saturating_sub(2)).max(1) as usize);
         let inner_y = diff_rect.y + 1;
         let inner_h = diff_rect.height.saturating_sub(2).max(1);
         let row = mouse_row.clamp(inner_y, inner_y + inner_h - 1);
@@ -1027,10 +1049,16 @@ fn draw_note(frame: &mut Frame, area: Rect, request: &ReviewRequest, pending_cou
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     const GLOBAL_HINTS: &str = "a approve \u{b7} r request changes \u{b7} q cancel";
     let text = match &app.input {
-        Some(InputMode::Summary { buf }) => format!(" request changes \u{2014} summary: {buf}"),
+        // Input bars keep the END of a long buffer visible (that's where the
+        // caret is) by trimming from the left with an ellipsis.
+        Some(InputMode::Summary { buf }) => {
+            let label = " request changes \u{2014} summary: ";
+            format!("{label}{}", tail_fit(buf, (area.width as usize).saturating_sub(label.chars().count())))
+        }
         Some(InputMode::Comment { buf, tag, .. }) => {
             let tag_label = tag.map(|t| t.label()).unwrap_or("none");
-            format!(" comment [tag: {tag_label}]: {buf}")
+            let label = format!(" comment [tag: {tag_label}]: ");
+            format!("{label}{}", tail_fit(buf, (area.width as usize).saturating_sub(label.chars().count())))
         }
         None => match app.focus {
             Focus::Navigator => format!(
@@ -1178,9 +1206,18 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
     }
 
     // Visual selection: apply before the cursor overlay so the cursor row's
-    // background wins where the two overlap.
-    if let Some(anchor) = app.visual_anchor {
-        let (start, end) = (anchor.min(app.diff.cursor), anchor.max(app.diff.cursor));
+    // background wins where the two overlap. While the comment box is open
+    // the anchor has already been consumed into the input state, so the
+    // range being commented on is painted from there instead — otherwise the
+    // selection appears to collapse to the cursor row mid-typing.
+    let selection = match (&app.input, app.visual_anchor) {
+        (Some(InputMode::Comment { row_start, row_end, .. }), _) => Some((*row_start, *row_end)),
+        (_, Some(anchor)) => {
+            Some((anchor.min(app.diff.cursor), anchor.max(app.diff.cursor)))
+        }
+        _ => None,
+    };
+    if let Some((start, end)) = selection {
         for row in start..=end {
             if let Some(line) = lines.get_mut(row) {
                 for span in &mut line.spans {
@@ -1200,25 +1237,34 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
 
     // Inline comment rows, woven in directly under the lines they annotate
     // (GitHub-style) so feedback sits next to the code instead of living only
-    // in the bottom bar. Must run AFTER all base-row patches above — the
-    // patches index base rows, and insertion shifts everything below it.
-    // Descending insertion order keeps earlier indices valid.
-    let mut comment_rows: Vec<(usize, Line)> = app
-        .pending
-        .iter()
-        .filter(|p| p.file_idx == app.nav.selected)
-        .map(|p| (p.row_end, inline_comment_line(p.annotation.tag.as_deref(), &p.annotation.comment, false)))
-        .collect();
+    // in the bottom bar. Long comments wrap to the pane width as continuation
+    // rows. Must run AFTER all base-row patches above — the patches index
+    // base rows, and insertion shifts everything below it. Groups are
+    // inserted in descending anchor order to keep earlier indices valid.
+    let inner_width = (area.width.saturating_sub(2)).max(1) as usize;
+    let mut groups: std::collections::BTreeMap<usize, Vec<Line>> = std::collections::BTreeMap::new();
+    for p in app.pending.iter().filter(|p| p.file_idx == app.nav.selected) {
+        groups.entry(p.row_end).or_default().extend(inline_comment_lines(
+            p.annotation.tag.as_deref(),
+            &p.annotation.comment,
+            false,
+            inner_width,
+        ));
+    }
     if let Some(InputMode::Comment { buf, tag, editing, row_end, .. }) = &app.input {
         if editing.is_none() {
             // Live preview of the comment being typed.
-            comment_rows.push((*row_end, inline_comment_line(tag.as_ref().map(|t| t.label()), buf, true)));
+            groups.entry(*row_end).or_default().extend(inline_comment_lines(
+                tag.as_ref().map(|t| t.label()),
+                buf,
+                true,
+                inner_width,
+            ));
         }
     }
-    comment_rows.sort_by(|a, b| b.0.cmp(&a.0));
-    for (end, line) in comment_rows {
+    for (end, group) in groups.into_iter().rev() {
         let at = (end + 1).min(lines.len());
-        lines.insert(at, line);
+        lines.splice(at..at, group);
     }
 
     let paragraph = Paragraph::new(lines).block(block).scroll((app.diff.scroll as u16, 0));
@@ -1229,19 +1275,91 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
 /// ground and the cursor row.
 const COMMENT_BG: Color = Color::Rgb(38, 34, 28);
 
-/// Build one inline comment row: `  └ [tag] comment text`, tinted by tag.
-/// `live` marks the in-progress preview while the reviewer is still typing.
-fn inline_comment_line(tag: Option<&str>, text: &str, live: bool) -> Line<'static> {
-    let marker = format!("  \u{2514} [{}] ", tag.unwrap_or("note"));
-    let base = Style::default().bg(COMMENT_BG);
-    let mut spans = vec![
-        Span::styled(marker, base.fg(tag_color(tag)).add_modifier(Modifier::BOLD)),
-        Span::styled(text.to_string(), base.fg(Color::White).add_modifier(Modifier::ITALIC)),
-    ];
-    if live {
-        spans.push(Span::styled("\u{258f}", base.fg(Color::White))); // typing caret
+/// Greedy word wrap on character counts; a word longer than the width is
+/// hard-broken. Always yields at least one (possibly empty) chunk so an
+/// empty live preview still renders its row.
+fn wrap_comment(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+    for word in text.split(' ') {
+        let mut word: Vec<char> = word.chars().collect();
+        loop {
+            let sep = if current_len == 0 { 0 } else { 1 };
+            if current_len + sep + word.len() <= width {
+                if sep == 1 {
+                    current.push(' ');
+                }
+                current.extend(word.iter());
+                current_len += sep + word.len();
+                break;
+            }
+            if word.len() > width {
+                // Hard-break an overlong word at whatever space remains.
+                let take = (width - current_len - sep).max(1).min(word.len());
+                if current_len == 0 {
+                    current.extend(word.drain(..take.min(width)));
+                    chunks.push(std::mem::take(&mut current));
+                    current_len = 0;
+                    continue;
+                }
+            }
+            chunks.push(std::mem::take(&mut current));
+            current_len = 0;
+        }
     }
-    Line::from(spans)
+    chunks.push(current);
+    chunks
+}
+
+/// The text width available to comment content once the `  └ [tag] ` marker
+/// (and the matching indent on continuation rows) is accounted for.
+fn comment_text_width(tag: Option<&str>, inner_width: usize) -> usize {
+    let marker_len = comment_marker(tag).chars().count();
+    inner_width.saturating_sub(marker_len).max(8)
+}
+
+fn comment_marker(tag: Option<&str>) -> String {
+    format!("  \u{2514} [{}] ", tag.unwrap_or("note"))
+}
+
+/// Display rows one comment occupies at a given pane width — MUST agree with
+/// `inline_comment_lines`, and feeds the display map so scrolling accounts
+/// for wrapped comments.
+fn comment_height(tag: Option<&str>, text: &str, inner_width: usize) -> usize {
+    wrap_comment(text, comment_text_width(tag, inner_width)).len()
+}
+
+/// Build one inline comment as display rows: `  └ [tag] text…` with wrapped
+/// continuation rows indented under the text column. `live` marks the
+/// in-progress preview (typing caret on the last row).
+fn inline_comment_lines(
+    tag: Option<&str>,
+    text: &str,
+    live: bool,
+    inner_width: usize,
+) -> Vec<Line<'static>> {
+    let marker = comment_marker(tag);
+    let indent = " ".repeat(marker.chars().count());
+    let base = Style::default().bg(COMMENT_BG);
+    let chunks = wrap_comment(text, comment_text_width(tag, inner_width));
+    let last = chunks.len() - 1;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let lead = if i == 0 { marker.clone() } else { indent.clone() };
+            let mut spans = vec![
+                Span::styled(lead, base.fg(tag_color(tag)).add_modifier(Modifier::BOLD)),
+                Span::styled(chunk, base.fg(Color::White).add_modifier(Modifier::ITALIC)),
+            ];
+            if live && i == last {
+                spans.push(Span::styled("\u{258f}", base.fg(Color::White))); // typing caret
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Cursor-row background: a cool slate that reads over both the plain ground
@@ -1496,6 +1614,45 @@ mod tests {
         assert_eq!(map.disp(4), 6); // shifted by the two comments under row 3
         assert_eq!(map.disp(8), 11); // shifted by all three
         assert_eq!(map.total(10), 13);
+    }
+
+    #[test]
+    fn wrap_comment_wraps_at_words_and_hard_breaks_long_ones() {
+        assert_eq!(wrap_comment("short note", 20), vec!["short note"]);
+        assert_eq!(
+            wrap_comment("use a constant here instead of the literal", 16),
+            vec!["use a constant", "here instead of", "the literal"]
+        );
+        // A single overlong token is hard-broken, never lost.
+        let chunks = wrap_comment("abcdefghijklmnop", 5);
+        assert_eq!(chunks.concat(), "abcdefghijklmnop");
+        assert!(chunks.iter().all(|c| c.chars().count() <= 5));
+        // Empty text still occupies one row (the live preview's empty state).
+        assert_eq!(wrap_comment("", 10), vec![""]);
+    }
+
+    #[test]
+    fn comment_height_matches_rendered_line_count() {
+        let text = "a fairly long review comment that will definitely need wrapping at narrow widths";
+        for width in [20usize, 40, 80, 200] {
+            let height = comment_height(Some("fix"), text, width);
+            let lines = inline_comment_lines(Some("fix"), text, false, width);
+            assert_eq!(height, lines.len(), "width {width}");
+            // Reassembling the chunks loses only layout, not content.
+            let joined: String = lines
+                .iter()
+                .map(|l| l.spans[1].content.as_ref())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(joined.split_whitespace().collect::<Vec<_>>(), text.split_whitespace().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn tail_fit_keeps_the_end_of_long_input_visible() {
+        assert_eq!(tail_fit("short", 10), "short");
+        assert_eq!(tail_fit("abcdefghij", 6), "\u{2026}fghij");
+        assert!(tail_fit("abcdefghij", 6).chars().count() <= 6);
     }
 
     #[test]
