@@ -1503,6 +1503,33 @@ fn str_cols(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+/// The scalar count of the FIRST cluster in `chars`: the leading scalar
+/// plus everything glued to it — trailing zero-width marks, a skin-tone
+/// modifier, pictographs continuing a ZWJ chain, or (when the leading
+/// scalar is a regional indicator) its flag partner. Mirrors the same
+/// cluster rules the pan-left crossing predicate and right-clip walk-back
+/// already enforce, just scanning forward instead of backward — used to
+/// mark the pan cut on a whole cluster instead of splitting it.
+fn leading_cluster_len(chars: &[char]) -> usize {
+    let Some(&first) = chars.first() else {
+        return 0;
+    };
+    if is_regional_indicator(first) && chars.get(1).is_some_and(|&c| is_regional_indicator(c)) {
+        return 2;
+    }
+    let mut i = 1;
+    let mut prev_zwj = first == '\u{200d}';
+    while let Some(&c) = chars.get(i) {
+        if char_cols(c) == 0 || is_emoji_modifier(c) || prev_zwj {
+            prev_zwj = c == '\u{200d}';
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
 /// Pan a rendered row `hscroll` display columns to the left — keeping its
 /// first `pinned` spans (gutter + origin marker) in place — then clip it to
 /// `width` display columns. Clipped edges get dim `‹` / `…` indicators so
@@ -1568,20 +1595,24 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
             span.content = kept.into();
         }
         if dropped {
-            // Mark the left clip on the first visible CELL — the first
-            // nonzero-width char plus its trailing combining marks —
-            // preserving its display width (a wide cell becomes "‹ ").
+            // Mark the left clip on the first visible CLUSTER — not just
+            // its first scalar — preserving the cluster's total display
+            // width (a multi-column cluster becomes "‹" plus padding
+            // spaces, same convention as a single wide char). Replacing
+            // only the first scalar would split a cluster the pan logic
+            // above went out of its way to keep atomic — e.g. an RI flag
+            // pair landing right at the pan boundary: the old code
+            // replaced just the first indicator, orphaning the second
+            // ("‹🇸" instead of the whole flag).
             for span in line.spans.iter_mut().skip(pinned) {
-                if let Some(first) = span.content.chars().next() {
-                    let cell_width = char_cols(first).max(1);
-                    let rest: String = span
-                        .content
-                        .chars()
-                        .skip(1)
-                        .skip_while(|c| char_cols(*c) == 0)
-                        .collect();
-                    let marked = if cell_width >= 2 {
-                        format!("\u{2039} {rest}")
+                if !span.content.is_empty() {
+                    let chars: Vec<char> = span.content.chars().collect();
+                    let cluster_len = leading_cluster_len(&chars);
+                    let cluster_width =
+                        chars[..cluster_len].iter().map(|&c| char_cols(c)).sum::<usize>().max(1);
+                    let rest: String = chars[cluster_len..].iter().collect();
+                    let marked = if cluster_width >= 2 {
+                        format!("\u{2039}{}{rest}", " ".repeat(cluster_width - 1))
                     } else {
                         format!("\u{2039}{rest}")
                     };
@@ -2624,6 +2655,41 @@ mod tests {
         let visible = line.spans[2].content.as_ref();
         assert!(!visible.contains('\u{1f1fa}') && !visible.contains('\u{1f1f8}'));
         assert!(visible.ends_with("bcdefgh"), "got {visible:?}");
+    }
+
+    #[test]
+    fn pan_marker_replaces_the_whole_leading_cluster_not_just_its_first_scalar() {
+        // Regression (Codex P1): the pan boundary can land immediately
+        // before an intact multi-scalar cluster (not cut through it — that
+        // atomicity is handled elsewhere). The marker-replacement step
+        // itself only ever swapped the first SCALAR for "‹" (plus trailing
+        // zero-width marks), splitting a cluster the pan logic upstream
+        // deliberately kept whole. Codex's exact example: panning
+        // "abcdefgh🇺🇸xyz" by 8 lands right at the flag — the old code
+        // rendered "‹🇸xyz", orphaning the second regional indicator.
+        let mk = |content: &str| {
+            Line::from(vec![
+                Span::raw("   1    2  "),
+                Span::raw("+"),
+                Span::raw(content.to_string()),
+            ])
+        };
+        let mut line = mk("abcdefgh\u{1f1fa}\u{1f1f8}xyz");
+        pan_and_clip(&mut line, 8, 100, 2);
+        let visible = line.spans[2].content.as_ref();
+        assert_eq!(visible, "\u{2039} xyz", "must replace the WHOLE flag pair, got {visible:?}");
+        assert_eq!(str_cols(visible), 5); // marker(1) + pad(1) + xyz(3) = 5
+
+        // Clean-boundary case with a ZWJ cluster too: panning off exactly
+        // up to a family emoji must mark the whole family, not just its
+        // first pictograph.
+        let family = "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}"; // 8 cols
+        let mut line = mk(&format!("abcdefgh{family}xyz"));
+        pan_and_clip(&mut line, 8, 100, 2);
+        let visible = line.spans[2].content.as_ref();
+        assert!(!visible.contains('\u{200d}'), "no joiner may survive, got {visible:?}");
+        assert!(!visible.contains('\u{1f469}'), "no partial family may render, got {visible:?}");
+        assert!(visible.ends_with("xyz"), "trailing text intact, got {visible:?}");
     }
 
     #[test]
