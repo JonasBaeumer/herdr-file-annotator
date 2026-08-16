@@ -757,6 +757,11 @@ impl<'a> App<'a> {
             if !close {
                 self.input = Some(mode);
             }
+            // Typing can grow the editing box (more wrapped rows) or close
+            // it back down to nothing — either way the set of display rows
+            // under the cursor just changed, so re-follow it now rather than
+            // leaving the scroll offset stuck until the next nav key.
+            self.ensure_cursor_visible(term_size);
             return outcome;
         }
 
@@ -818,25 +823,42 @@ impl<'a> App<'a> {
         None
     }
 
+    /// Index into `pending` of the annotation currently being edited, if
+    /// any — the single source of truth for "which saved annotation's rows
+    /// get replaced by the editing box at the same anchor". `disp_map` and
+    /// `draw_diff` both need this to agree, or the rendered rows and the
+    /// scroll/mouse display map disagree with each other.
+    fn editing_annotation_idx(&self) -> Option<usize> {
+        match &self.input {
+            Some(InputMode::Comment { editing: Some(idx), .. }) => Some(*idx),
+            _ => None,
+        }
+    }
+
     /// The display map for the currently selected file: saved annotations
-    /// plus the live comment being typed (its preview row occupies display
-    /// space too, so scrolling must account for it).
+    /// plus the editing box while the comment prompt is open (its rows
+    /// occupy display space too, so scrolling must account for them).
     /// One `ends` entry per DISPLAY row a comment occupies — wrapped
     /// comments push several — so the scroll math sees their real height.
     /// `inner_width` is the diff pane's inner width (wrap width source).
     fn disp_map(&self, inner_width: usize) -> DispMap {
+        // While editing an existing annotation, its saved rows are replaced
+        // by the box at the same anchor — count the box, not the saved text.
+        let editing_idx = self.editing_annotation_idx();
+
         let mut ends: Vec<usize> = Vec::new();
-        for p in self.pending.iter().filter(|p| p.file_idx == self.nav.selected) {
+        for (i, p) in self.pending.iter().enumerate().filter(|(_, p)| p.file_idx == self.nav.selected)
+        {
+            if Some(i) == editing_idx {
+                continue;
+            }
             let h = comment_height(p.annotation.tag.as_deref(), &p.annotation.comment, inner_width);
             ends.extend(std::iter::repeat(p.row_end).take(h));
         }
-        if let Some(InputMode::Comment { buf, tag, editing, row_end, .. }) = &self.input {
-            // An edit reuses its existing annotation's slot; a new comment
-            // adds a live preview.
-            if editing.is_none() {
-                let h = comment_height(tag.as_ref().map(|t| t.label()), buf, inner_width);
-                ends.extend(std::iter::repeat(*row_end).take(h));
-            }
+        if let Some(InputMode::Comment { buf, row_end, .. }) = &self.input {
+            // Both a fresh comment and an edit weave the box (new AND edit).
+            let h = editing_box_height(buf, inner_width);
+            ends.extend(std::iter::repeat(*row_end).take(h));
         }
         DispMap::new(ends)
     }
@@ -1221,15 +1243,30 @@ fn draw_note(frame: &mut Frame, area: Rect, request: &ReviewRequest, pending_cou
     frame.render_widget(note, area);
 }
 
+/// Footer text for the request-changes summary bar: the label, then either
+/// the full buffer plus the `⏎ send · esc cancel` hint (when both fit `width`)
+/// or just a tail-fit buffer with the hint dropped (when they don't) — the
+/// same end-of-buffer-visible rule the comment bar below also follows.
+fn summary_footer_text(buf: &str, width: usize) -> String {
+    let label = " request changes \u{2014} summary: ";
+    let suffix = " \u{23ce} send \u{b7} esc cancel";
+    // Display columns, not chars: a CJK buffer can "fit" by char count while
+    // its real rendered width (2 columns/char) already overflows the footer
+    // once the hint suffix is appended (Codex P0).
+    let avail = width.saturating_sub(str_cols(label));
+    if str_cols(buf) + str_cols(suffix) <= avail {
+        format!("{label}{buf}{suffix}")
+    } else {
+        format!("{label}{}", tail_fit(buf, avail))
+    }
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     const GLOBAL_HINTS: &str = "a approve \u{b7} r request changes \u{b7} q cancel";
     let text = match &app.input {
         // Input bars keep the END of a long buffer visible (that's where the
         // caret is) by trimming from the left with an ellipsis.
-        Some(InputMode::Summary { buf }) => {
-            let label = " request changes \u{2014} summary: ";
-            format!("{label}{}", tail_fit(buf, (area.width as usize).saturating_sub(label.chars().count())))
-        }
+        Some(InputMode::Summary { buf }) => summary_footer_text(buf, area.width as usize),
         Some(InputMode::Comment { buf, tag, .. }) => {
             let tag_label = tag.map(|t| t.label()).unwrap_or("none");
             let label = format!(" comment [tag: {tag_label}]: ");
@@ -1436,25 +1473,27 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
     // rows. Must run AFTER all base-row patches above — the patches index
     // base rows, and insertion shifts everything below it. Groups are
     // inserted in descending anchor order to keep earlier indices valid.
+    //
+    // While the comment prompt is open (new or edit), the dashed editing box
+    // is woven at its anchor instead of a plain preview; when editing an
+    // existing annotation, that annotation's saved rows are skipped (the box
+    // replaces them at the same anchor) so they don't render stale text.
+    let editing_idx = app.editing_annotation_idx();
     let mut groups: std::collections::BTreeMap<usize, Vec<Line>> = std::collections::BTreeMap::new();
-    for p in app.pending.iter().filter(|p| p.file_idx == app.nav.selected) {
+    for (i, p) in
+        app.pending.iter().enumerate().filter(|(_, p)| p.file_idx == app.nav.selected)
+    {
+        if Some(i) == editing_idx {
+            continue;
+        }
         groups.entry(p.row_end).or_default().extend(inline_comment_lines(
             p.annotation.tag.as_deref(),
             &p.annotation.comment,
-            false,
             inner_width,
         ));
     }
-    if let Some(InputMode::Comment { buf, tag, editing, row_end, .. }) = &app.input {
-        if editing.is_none() {
-            // Live preview of the comment being typed.
-            groups.entry(*row_end).or_default().extend(inline_comment_lines(
-                tag.as_ref().map(|t| t.label()),
-                buf,
-                true,
-                inner_width,
-            ));
-        }
+    if let Some(InputMode::Comment { buf, tag, row_end, .. }) = &app.input {
+        groups.entry(*row_end).or_default().extend(editing_box_lines(buf, *tag, inner_width));
     }
     for (end, group) in groups.into_iter().rev() {
         let at = (end + 1).min(lines.len());
@@ -1573,53 +1612,218 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
 /// ground and the cursor row.
 const COMMENT_BG: Color = Color::Rgb(38, 34, 28);
 
-/// Greedy word wrap on character counts; a word longer than the width is
-/// hard-broken. Always yields at least one (possibly empty) chunk so an
-/// empty live preview still renders its row.
+/// Editing-box chrome color: rules, corners, and the vertical `┆` borders.
+const EDIT_RULE_FG: Color = Color::DarkGray;
+
+/// Wrap width for the editing box's content rows: the inner pane width minus
+/// the `┆ ` prefix, one spare column reserved for the typing caret, and the
+/// closing `┆`.
+fn editing_wrap_width(inner_width: usize) -> usize {
+    inner_width.saturating_sub(4).max(1)
+}
+
+/// Display rows the editing box occupies at a given pane width — MUST agree
+/// with `editing_box_lines` (content rows, wrapped at `editing_wrap_width`,
+/// plus the top and bottom rule rows) — feeds the display map so scroll/mouse
+/// math sees the box's real height.
+fn editing_box_height(buf: &str, inner_width: usize) -> usize {
+    wrap_comment(buf, editing_wrap_width(inner_width)).len() + 2
+}
+
+/// Build the annot-style dashed editing box: a top rule, one content row per
+/// wrapped line of `buf` (with a typing caret on the last row — an empty
+/// buffer still renders one row, just the caret), and a bottom rule carrying
+/// the commit/tag/cancel button chips.
+fn editing_box_lines(buf: &str, tag: Option<Tag>, inner_width: usize) -> Vec<Line<'static>> {
+    // NOT `.max(4)`: the box must fit the pane it's actually drawn into, not
+    // a hypothetical wider one — forcing a wider width here just moves the
+    // overflow from "rows too wide" to "box wider than the pane" (Codex P2).
+    let width = inner_width.max(1);
+    let rule_style = Style::default().fg(EDIT_RULE_FG).bg(COMMENT_BG);
+    let text_style = Style::default().fg(Color::White).bg(COMMENT_BG);
+
+    let mut lines = Vec::with_capacity(editing_box_height(buf, width));
+
+    // Top rule: ╭ + ╌…╌ + ╮, spanning the full inner width.
+    let dash_len = width.saturating_sub(2);
+    lines.push(Line::from(Span::styled(
+        format!("\u{256d}{}\u{256e}", "\u{254c}".repeat(dash_len)),
+        rule_style,
+    )));
+
+    // Content rows: ┆ <text, padded> ┆ — the caret occupies the one spare
+    // column `editing_wrap_width` reserves beyond the wrapped text.
+    let wrap_width = editing_wrap_width(width);
+    let middle_width = wrap_width + 1;
+    let chunks = wrap_comment(buf, wrap_width);
+    let last = chunks.len() - 1;
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let mut middle = chunk;
+        // Display columns, not chars: a chunk of wide (e.g. CJK) glyphes has
+        // fewer chars than the columns it renders as, so char-counting here
+        // under-pads and pushes the closing border past the box's actual
+        // width (Codex P0).
+        let mut used = str_cols(&middle);
+        if i == last {
+            middle.push('\u{258f}'); // typing caret
+            used += str_cols("\u{258f}");
+        }
+        if used < middle_width {
+            middle.push_str(&" ".repeat(middle_width - used));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("\u{2506} ", rule_style),
+            Span::styled(middle, text_style),
+            Span::styled("\u{2506}", rule_style),
+        ]));
+    }
+
+    lines.push(bottom_rule_line(tag, width));
+
+    // Belt-and-braces never-overflow: `editing_wrap_width`'s own `.max(1)`
+    // floor (content needs at least one column to make progress) means a
+    // pane narrower than the box's minimum chrome (prefix + one content
+    // column + caret + closing border, 5 columns) still renders a row wider
+    // than `width` even after the change above. Clip every row with the
+    // same column-accurate, cluster-atomic primitive diff rows already use,
+    // rather than duplicating that logic here.
+    for line in &mut lines {
+        pan_and_clip(line, 0, width, 0);
+    }
+    lines
+}
+
+/// Bottom rule of the editing box: `╰╌` then the commit/tag/cancel button
+/// chips embedded in the dashed rule, then dash fill and the closing `╯`.
+/// When the chips don't all fit, they're dropped right-to-priority (tag
+/// first, then cancel; commit is never dropped) so the rule never overflows
+/// `width`.
+fn bottom_rule_line(tag: Option<Tag>, width: usize) -> Line<'static> {
+    let width = width.max(1);
+    let tag_label = tag.map(|t| t.label()).unwrap_or("none");
+    let commit_chip = "[ commit \u{23ce} ]".to_string();
+    let tag_chip = format!("[ tag ^T: {tag_label} ]");
+    let cancel_chip = "[ cancel esc ]".to_string();
+
+    let rule_style = Style::default().fg(EDIT_RULE_FG).bg(COMMENT_BG);
+    let chip_style =
+        Style::default().fg(Color::White).bg(COMMENT_BG).add_modifier(Modifier::REVERSED);
+
+    const PREFIX: &str = "\u{2570}\u{254c}"; // ╰╌
+    const SEP: char = '\u{254c}';
+    const CORNER: char = '\u{256f}';
+
+    let attempts: [Vec<String>; 4] = [
+        vec![commit_chip.clone(), tag_chip.clone(), cancel_chip.clone()],
+        vec![commit_chip.clone(), cancel_chip.clone()],
+        vec![commit_chip.clone()],
+        Vec::new(),
+    ];
+
+    for chips in attempts {
+        let seps = chips.len().saturating_sub(1);
+        let chips_len: usize = chips.iter().map(|c| c.chars().count()).sum();
+        let used = PREFIX.chars().count() + chips_len + seps;
+        if used + 1 <= width {
+            let mut spans = vec![Span::styled(PREFIX, rule_style)];
+            for (i, chip) in chips.into_iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(SEP.to_string(), rule_style));
+                }
+                spans.push(Span::styled(chip, chip_style));
+            }
+            let fill = width - used - 1;
+            spans.push(Span::styled(SEP.to_string().repeat(fill), rule_style));
+            spans.push(Span::styled(CORNER.to_string(), rule_style));
+            return Line::from(spans);
+        }
+    }
+
+    // Even a bare `╰╌…╯` doesn't fit (pathologically narrow pane): fall back
+    // to plain dash fill, exactly `width` columns, so the invariant (never
+    // overflow) always holds.
+    Line::from(Span::styled(SEP.to_string().repeat(width), rule_style))
+}
+
+/// Greedy word wrap on display columns (`str_cols`, ratatui's own model) —
+/// the same width unit `pan_and_clip` uses, so a row of CJK text wraps at
+/// the columns it actually renders as rather than at half that many chars.
+/// A word longer than the width is hard-broken cluster-atomic (UAX #29 via
+/// `graphemes(true)`): a boundary never splits a cluster, so a straddling
+/// wide glyph moves to the next row whole rather than rendering half of it.
+/// Always yields at least one (possibly empty) chunk so an empty live
+/// preview still renders its row.
 fn wrap_comment(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut chunks = Vec::new();
     let mut current = String::new();
-    let mut current_len = 0usize;
+    let mut current_cols = 0usize;
     for word in text.split(' ') {
-        let mut word: Vec<char> = word.chars().collect();
+        let mut word: Vec<&str> = word.graphemes(true).collect();
         loop {
-            let sep = if current_len == 0 { 0 } else { 1 };
-            if current_len + sep + word.len() <= width {
+            let sep = if current_cols == 0 { 0 } else { 1 };
+            let word_cols: usize = word.iter().map(|g| str_cols(g)).sum();
+            if current_cols + sep + word_cols <= width {
                 if sep == 1 {
                     current.push(' ');
                 }
-                current.extend(word.iter());
-                current_len += sep + word.len();
+                current.extend(word.iter().copied());
+                current_cols += sep + word_cols;
                 break;
             }
-            if word.len() > width {
-                // Hard-break an overlong word at whatever space remains.
-                let take = (width - current_len - sep).max(1).min(word.len());
-                if current_len == 0 {
-                    current.extend(word.drain(..take.min(width)));
+            if word_cols > width {
+                // Hard-break an overlong word at whatever space remains,
+                // taking whole clusters until the next one wouldn't fit (but
+                // always at least one, so a single cluster wider than the
+                // whole box still makes forward progress).
+                if current_cols == 0 {
+                    let avail = width.saturating_sub(sep).max(1);
+                    let mut take_cols = 0usize;
+                    let mut take = 0usize;
+                    for g in &word {
+                        let g_cols = str_cols(g).max(1);
+                        if take > 0 && take_cols + g_cols > avail {
+                            break;
+                        }
+                        take_cols += g_cols;
+                        take += 1;
+                        if take_cols >= avail {
+                            break;
+                        }
+                    }
+                    let taken: String = word.drain(..take).collect();
+                    current.push_str(&taken);
                     chunks.push(std::mem::take(&mut current));
-                    current_len = 0;
+                    current_cols = 0;
                     continue;
                 }
             }
             chunks.push(std::mem::take(&mut current));
-            current_len = 0;
+            current_cols = 0;
         }
     }
     chunks.push(current);
     chunks
 }
 
-/// The text width available to comment content once the `  └ [tag] ` marker
+/// The text width available to comment content once the `┃ [tag] ` marker
 /// (and the matching indent on continuation rows) is accounted for.
 fn comment_text_width(tag: Option<&str>, inner_width: usize) -> usize {
     let marker_len = comment_marker(tag).chars().count();
     inner_width.saturating_sub(marker_len).max(8)
 }
 
+/// First-row lead for a saved note: a tag-colored bar, then the bracketed
+/// tag. Untagged notes show `[note]`.
 fn comment_marker(tag: Option<&str>) -> String {
-    format!("  \u{2514} [{}] ", tag.unwrap_or("note"))
+    format!("\u{2503} [{}] ", tag.unwrap_or("note"))
+}
+
+/// Continuation-row lead: the same bar, then enough spaces to line up under
+/// the first row's text column (same total width as `comment_marker`).
+fn comment_marker_continuation(tag: Option<&str>) -> String {
+    let marker_len = comment_marker(tag).chars().count();
+    format!("\u{2503} {}", " ".repeat(marker_len.saturating_sub(2)))
 }
 
 /// Display rows one comment occupies at a given pane width — MUST agree with
@@ -1629,32 +1833,24 @@ fn comment_height(tag: Option<&str>, text: &str, inner_width: usize) -> usize {
     wrap_comment(text, comment_text_width(tag, inner_width)).len()
 }
 
-/// Build one inline comment as display rows: `  └ [tag] text…` with wrapped
-/// continuation rows indented under the text column. `live` marks the
-/// in-progress preview (typing caret on the last row).
-fn inline_comment_lines(
-    tag: Option<&str>,
-    text: &str,
-    live: bool,
-    inner_width: usize,
-) -> Vec<Line<'static>> {
+/// Build one saved comment as display rows: `┃ [tag] text…` with wrapped
+/// continuation rows indented under the text column. The editing box (see
+/// `editing_box_lines`) handles the in-progress/typing case; this renders
+/// only settled, saved annotations.
+fn inline_comment_lines(tag: Option<&str>, text: &str, inner_width: usize) -> Vec<Line<'static>> {
     let marker = comment_marker(tag);
-    let indent = " ".repeat(marker.chars().count());
+    let indent = comment_marker_continuation(tag);
     let base = Style::default().bg(COMMENT_BG);
     let chunks = wrap_comment(text, comment_text_width(tag, inner_width));
-    let last = chunks.len() - 1;
     chunks
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
             let lead = if i == 0 { marker.clone() } else { indent.clone() };
-            let mut spans = vec![
+            let spans = vec![
                 Span::styled(lead, base.fg(tag_color(tag)).add_modifier(Modifier::BOLD)),
                 Span::styled(chunk, base.fg(Color::White).add_modifier(Modifier::ITALIC)),
             ];
-            if live && i == last {
-                spans.push(Span::styled("\u{258f}", base.fg(Color::White))); // typing caret
-            }
             Line::from(spans)
         })
         .collect()
@@ -1945,7 +2141,7 @@ mod tests {
         let text = "a fairly long review comment that will definitely need wrapping at narrow widths";
         for width in [20usize, 40, 80, 200] {
             let height = comment_height(Some("fix"), text, width);
-            let lines = inline_comment_lines(Some("fix"), text, false, width);
+            let lines = inline_comment_lines(Some("fix"), text, width);
             assert_eq!(height, lines.len(), "width {width}");
             // Reassembling the chunks loses only layout, not content.
             let joined: String = lines
@@ -1958,10 +2154,95 @@ mod tests {
     }
 
     #[test]
+    fn inline_comment_continuation_rows_align_under_the_first_row_marker() {
+        // Regression (Codex P1): `comment_height_matches_rendered_line_count`
+        // only reads spans[1] (the wrapped text), never spans[0] (the lead),
+        // so a regression in the `┃ [tag] ` marker or its continuation
+        // indent would still pass. Pin the lead on both the first row and
+        // continuation rows, and that they render at equal display width so
+        // continuation text visually lines up under the first row's text.
+        let tag = Some("fix");
+        let text = "a fairly long review comment that will definitely need wrapping at a narrow width";
+        let width = 30;
+        let lines = inline_comment_lines(tag, text, width);
+        assert!(lines.len() >= 2, "expected wrapping at width {width}, got {} row(s)", lines.len());
+
+        let marker = comment_marker(tag);
+        let continuation = comment_marker_continuation(tag);
+        assert_eq!(lines[0].spans[0].content.as_ref(), marker, "first row must carry the tag marker");
+        assert_eq!(
+            str_cols(&marker),
+            str_cols(&continuation),
+            "marker and continuation lead must render at the same display width"
+        );
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            assert_eq!(
+                line.spans[0].content.as_ref(),
+                continuation,
+                "continuation row {i} must carry the aligned indent, not the marker"
+            );
+        }
+    }
+
+    #[test]
     fn tail_fit_keeps_the_end_of_long_input_visible() {
         assert_eq!(tail_fit("short", 10), "short");
         assert_eq!(tail_fit("abcdefghij", 6), "\u{2026}fghij");
         assert!(tail_fit("abcdefghij", 6).chars().count() <= 6);
+    }
+
+    #[test]
+    fn summary_footer_shows_the_hint_only_when_it_fits() {
+        // Regression (Codex P1): the width-dependent `<=` boundary that
+        // decides whether the "⏎ send · esc cancel" hint shows at all had
+        // no test coverage — pin both sides of it.
+        let label = " request changes \u{2014} summary: ";
+        let suffix = " \u{23ce} send \u{b7} esc cancel";
+        let buf = "short summary";
+
+        // Exactly enough room for label + buf + suffix: the fitting path,
+        // hint shown, full buffer visible.
+        let exact_width = label.chars().count() + buf.chars().count() + suffix.chars().count();
+        assert_eq!(summary_footer_text(buf, exact_width), format!("{label}{buf}{suffix}"));
+
+        // One column short of that: the `<=` boundary tips over to the
+        // non-fitting path — hint dropped, buffer tail-fit instead (and
+        // since there's still ample room for the buffer alone, unchanged).
+        let text = summary_footer_text(buf, exact_width - 1);
+        assert_eq!(text, format!("{label}{buf}"));
+        assert!(!text.contains("send"), "hint must be dropped once it no longer fits: {text:?}");
+
+        // Too narrow even for the buffer: hint stays dropped, and the tail
+        // of the buffer (where the caret is) is what tail_fit keeps —
+        // exercised directly by `tail_fit_keeps_the_end_of_long_input_visible`.
+        let long = "a much longer summary than the bar can show";
+        let text = summary_footer_text(long, exact_width - 1);
+        assert!(!text.contains("send"));
+        assert_eq!(text, format!("{label}{}", tail_fit(long, exact_width - 1 - label.chars().count())));
+    }
+
+    #[test]
+    fn summary_footer_measures_the_fit_in_display_columns_not_chars() {
+        // Regression (Codex P0): the fit decision compared
+        // `buf.chars().count()` to the available width, so a CJK buffer (2
+        // display columns per char) could "fit" by char count while its
+        // real rendered width already overflowed the footer once the hint
+        // suffix was appended.
+        let label = " request changes \u{2014} summary: ";
+        let suffix = " \u{23ce} send \u{b7} esc cancel";
+        let cjk: String = "\u{56fd}".repeat(10); // 10 chars, 20 display columns
+
+        // Sized so the OLD char-count check (10 + suffix_chars <= avail)
+        // would pass, but the real column width (20 + suffix_chars) does
+        // not — the exact mismatch the finding describes.
+        let avail_chars = cjk.chars().count() + suffix.chars().count() + 5;
+        let width = label.chars().count() + avail_chars;
+
+        let text = summary_footer_text(&cjk, width);
+        assert!(
+            !text.contains("send"),
+            "hint must be dropped once the CJK buffer's real column width no longer fits: {text:?}"
+        );
     }
 
     #[test]
@@ -1991,6 +2272,50 @@ mod tests {
         assert_eq!(follow_display(0, 9, &map, 10), 1);
         // Without the comment, no scroll needed.
         assert_eq!(follow_display(0, 9, &DispMap::new(vec![]), 10), 0);
+    }
+
+    #[test]
+    fn typing_in_the_comment_box_re_follows_the_caret_as_it_grows() {
+        // Regression (Codex P0): the active-input arm of `handle_key`
+        // returned before `ensure_cursor_visible` ran, so growing the
+        // editing box past the viewport bottom while typing left the scroll
+        // offset stuck — the caret and bottom controls slid off-screen
+        // instead of staying visible like every other row-count change does.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        // Narrow + short terminal: a small diff viewport and a narrow wrap
+        // width so a modest amount of typed text wraps into several rows.
+        let size = Size::new(30, 12);
+        let viewport = diff_viewport_rows(size, app.show_navigator);
+
+        // Move the cursor to the LAST row (sample_file flattens to 8 rows:
+        // 0..=7) so the comment box opens right at the viewport's bottom.
+        for _ in 0..7 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        }
+        assert_eq!(app.diff.cursor, 7);
+        assert!(app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size)
+            .is_none());
+
+        // Type enough text to wrap across several rows at this narrow width.
+        let long = "this comment is long enough to wrap across several rows at this narrow width";
+        for ch in long.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+
+        // The box's bottom row must stay inside the viewport — the same
+        // invariant `ensure_cursor_visible` maintains after every other key.
+        let map = app.disp_map(diff_inner_width(size, app.show_navigator));
+        let dc = map.disp(app.diff.cursor);
+        let tail = dc + map.extra_at(app.diff.cursor);
+        assert!(
+            tail < app.diff.scroll + viewport,
+            "box bottom (tail={tail}) must stay within the viewport (scroll={}, viewport={viewport})",
+            app.diff.scroll
+        );
     }
 
     #[test]
@@ -2930,5 +3255,189 @@ mod tests {
             .expect("q cancels");
         assert_eq!(outcome.verdict, Verdict::Cancelled);
         assert!(outcome.annotations.is_empty());
+    }
+
+    #[test]
+    fn editing_box_height_matches_woven_row_count() {
+        let long = "a fairly long note that will wrap across several lines at a narrow width";
+        let cases: [(&str, usize); 6] = [
+            ("", 10),
+            ("", 40),
+            ("short", 40),
+            ("short", 6),
+            (long, 20),
+            (long, 60),
+        ];
+        for (buf, width) in cases {
+            let height = editing_box_height(buf, width);
+            let lines = editing_box_lines(buf, Some(Tag::Fix), width);
+            assert_eq!(height, lines.len(), "buf={buf:?} width={width}");
+            // Always at least the two rules plus one content row (even for
+            // an empty buffer, which still renders a caret-only row).
+            assert!(height >= 3);
+        }
+    }
+
+    #[test]
+    fn editing_box_pads_by_display_columns_not_chars_for_wide_glyphs() {
+        // Regression (Codex P0): content-row padding measured
+        // `chars().count()` instead of display columns, so a row of CJK
+        // text (2 display columns per glyph, 1 char) was padded as if every
+        // glyph were 1 column wide — undercounting the row's real rendered
+        // width and pushing the closing `┆` border past the box's actual
+        // width despite the documented never-overflow invariant.
+        let cjk: String = "\u{56fd}".repeat(20); // 20x '国', 2 display columns each
+        let width = 40;
+        for (i, line) in editing_box_lines(&cjk, Some(Tag::Fix), width).into_iter().enumerate() {
+            let cols: usize = line.spans.iter().map(|s| str_cols(&s.content)).sum();
+            assert_eq!(cols, width, "row {i} must render at exactly the box width, got {cols}");
+        }
+    }
+
+    #[test]
+    fn editing_box_never_exceeds_a_pathologically_narrow_pane() {
+        // Regression (Codex P2): forcing the box to a minimum width of 4
+        // rendered it wider than panes with fewer inner columns, and even
+        // at exactly 4 the forced one-column wrap width plus prefix, caret,
+        // and closing border made each content row 5 columns wide — both
+        // violate the documented never-overflow invariant.
+        for width in 1..=6usize {
+            for buf in ["", "hi", "a longer note than the pane can hold"] {
+                for (i, line) in editing_box_lines(buf, Some(Tag::Fix), width).into_iter().enumerate() {
+                    let cols: usize = line.spans.iter().map(|s| str_cols(&s.content)).sum();
+                    assert!(
+                        cols <= width,
+                        "width={width} buf={buf:?} row={i}: rendered {cols} cols, wider than the pane"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn editing_annotation_idx_matches_the_comment_input_mode() {
+        // Regression (Codex P1): "which pending annotation is being edited"
+        // was implemented twice, verbatim, in App::disp_map and draw_diff —
+        // centralized into one method so the rendered rows and the
+        // scroll/mouse display map can't drift apart from each other.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+
+        assert_eq!(app.editing_annotation_idx(), None, "no input open: nothing is being edited");
+
+        app.input = Some(InputMode::Comment {
+            buf: String::new(),
+            tag: None,
+            editing: None,
+            row_start: 0,
+            row_end: 0,
+        });
+        assert_eq!(
+            app.editing_annotation_idx(),
+            None,
+            "a fresh comment (editing: None) isn't editing a saved annotation"
+        );
+
+        app.input = Some(InputMode::Comment {
+            buf: String::new(),
+            tag: None,
+            editing: Some(2),
+            row_start: 0,
+            row_end: 0,
+        });
+        assert_eq!(app.editing_annotation_idx(), Some(2));
+
+        app.input = Some(InputMode::Summary { buf: String::new() });
+        assert_eq!(app.editing_annotation_idx(), None, "the summary bar is a different input mode entirely");
+    }
+
+    #[test]
+    fn disp_map_skips_edited_annotation_and_counts_the_box_instead() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.pending.push(PendingAnnotation {
+            file_idx: 0,
+            row_start: 1,
+            row_end: 1,
+            annotation: Annotation {
+                file: "src/lib.rs".to_string(),
+                lines: LineRange { start: 2, end: 2 },
+                side: Side::New,
+                tag: Some("fix".to_string()),
+                comment: "a saved note".to_string(),
+            },
+        });
+
+        let inner_width = 40;
+
+        // Not editing: disp_map counts the saved annotation's own rows.
+        let saved_h = comment_height(Some("fix"), "a saved note", inner_width);
+        let map = app.disp_map(inner_width);
+        assert_eq!(map.extra_at(1), saved_h);
+
+        // Open edit mode on that same annotation (row_start == row_end == 1).
+        app.input = Some(InputMode::Comment {
+            buf: "editing now, with a much longer replacement comment".to_string(),
+            tag: Some(Tag::Fix),
+            editing: Some(0),
+            row_start: 1,
+            row_end: 1,
+        });
+
+        // The saved annotation's rows are gone from the map; only the
+        // editing box's rows remain at the same anchor.
+        let box_h = editing_box_height(
+            "editing now, with a much longer replacement comment",
+            inner_width,
+        );
+        let map = app.disp_map(inner_width);
+        assert_eq!(map.extra_at(1), box_h);
+        assert_eq!(map.total(app.diff_rows().len()), app.diff_rows().len() + box_h);
+    }
+
+    #[test]
+    fn bottom_rule_shows_chips_when_roomy_and_never_overflows_when_narrow() {
+        let wide = bottom_rule_line(Some(Tag::Fix), 80);
+        let text: String = wide.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("commit"), "expected a commit chip, got {text:?}");
+        assert!(text.contains("esc"), "expected a cancel chip, got {text:?}");
+        let rendered: usize = wide.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(rendered, 80);
+
+        for w in [1usize, 3, 6, 10, 15, 24] {
+            let line = bottom_rule_line(None, w);
+            let rendered: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(rendered <= w, "width {rendered} exceeds available {w}");
+        }
+    }
+
+    #[test]
+    fn bottom_rule_drops_the_tag_chip_before_the_cancel_chip() {
+        // Pins the precedence `bottom_rule_line`'s own docstring states:
+        // chips drop right-to-priority as the pane narrows (tag first, then
+        // cancel, commit never), so a medium-width pane keeps commit+cancel
+        // and drops the only visible `Ctrl-T` discoverability. Covers the
+        // constrained-width case in between the "everything fits" and
+        // "nothing fits" ends `bottom_rule_shows_chips_when_roomy_and_never_overflows_when_narrow`
+        // already exercises.
+        let contains = |w: usize, needle: &str| {
+            let line = bottom_rule_line(Some(Tag::Fix), w);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            text.contains(needle)
+        };
+        let first_width_with =
+            |needle: &str| (1..=100).find(|&w| contains(w, needle)).expect("must fit by width 100");
+        let cancel_at = first_width_with("esc"); // only in the cancel chip
+        let tag_at = first_width_with("^T"); // only in the tag chip
+        assert!(
+            cancel_at < tag_at,
+            "cancel (first fits at {cancel_at}) must become visible at a narrower width than \
+             tag (first fits at {tag_at}) — cancel is the higher-priority chip"
+        );
+        // And once the pane is wide enough for the tag chip, cancel is
+        // still there — commit+cancel is never traded away for tag.
+        assert!(contains(tag_at, "esc"));
     }
 }
