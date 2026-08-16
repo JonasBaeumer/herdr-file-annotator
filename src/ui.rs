@@ -564,9 +564,11 @@ struct App<'a> {
     /// on demand. Never invalidated — the model is immutable for the life
     /// of the UI.
     row_cache: HashMap<usize, Vec<Line<'static>>>,
-    /// Per file: the widest row's pannable display columns (everything past
-    /// the pinned gutter/marker). Horizontal panning clamps against this so
-    /// arbitrarily long lines stay fully reachable, without a magic cap.
+    /// Per file: the maximum horizontal pan (`pan_cap`'s value), precomputed
+    /// once from the widest row's pannable width minus just enough reserve —
+    /// the `‹` marker plus THAT row's own trailing glyph width — to keep its
+    /// final character reachable without over-reserving for a hypothetical
+    /// double-width glyph that isn't actually there.
     pan_limit: HashMap<usize, usize>,
 }
 
@@ -589,6 +591,44 @@ fn pannable_cols(line: &Line) -> usize {
         .sum()
 }
 
+/// The display width of a row's final "cell" in its pannable (unpinned)
+/// content — its last nonzero-width scalar, ignoring any zero-width marks
+/// trailing it. 1 or 2 columns, matching whatever `char_cols` reports for
+/// that scalar (rows with no pannable content default to 1: there is
+/// nothing to protect, so no need to reserve for a wide glyph that isn't
+/// there).
+fn trailing_cell_width(line: &Line) -> usize {
+    line.spans
+        .iter()
+        .skip(pinned_spans(line))
+        .flat_map(|s| s.content.chars())
+        .filter(|c| char_cols(*c) > 0)
+        .last()
+        .map(char_cols)
+        .unwrap_or(1)
+}
+
+/// The largest horizontal pan that still leaves the widest row's own final
+/// character genuinely inspectable: enough short of that row's pannable
+/// width for the `‹` clip marker (1 col) plus its actual trailing glyph
+/// width (1 or 2 cols, not a flat worst-case 2) — otherwise the marker
+/// replaces the last visible character, and on narrow panes a wasted
+/// reserve column can put the true final character permanently out of
+/// reach (Codex P1: a flat -3 reservation cost narrow panes exactly the
+/// one column a single-width trailing glyph didn't need reserved).
+/// When several rows tie for the widest, reserves for whichever of THEM
+/// has the widest trailing glyph, so panning to this cap is safe for all.
+fn pan_cap_for_rows(rows: &[Line]) -> usize {
+    let max_cols = rows.iter().map(pannable_cols).max().unwrap_or(0);
+    let reserve = rows
+        .iter()
+        .filter(|r| pannable_cols(r) == max_cols)
+        .map(|r| 1 + trailing_cell_width(r))
+        .max()
+        .unwrap_or(3);
+    max_cols.saturating_sub(reserve)
+}
+
 impl<'a> App<'a> {
     fn new(request: &'a ReviewRequest, model: &'a Result<DiffModel>) -> Self {
         let mut row_cache = HashMap::new();
@@ -597,7 +637,7 @@ impl<'a> App<'a> {
             let hl = highlighter();
             for (i, file) in m.files.iter().enumerate() {
                 let rows = highlight_file_rows(hl, file);
-                pan_limit.insert(i, rows.iter().map(pannable_cols).max().unwrap_or(0));
+                pan_limit.insert(i, pan_cap_for_rows(&rows));
                 row_cache.insert(i, rows);
             }
         }
@@ -803,14 +843,10 @@ impl<'a> App<'a> {
         DispMap::new(ends)
     }
 
-    /// Largest useful horizontal pan for the selected file: three columns
-    /// short of its widest row's pannable width, leaving room for the `‹`
-    /// clip marker (1 col) plus the final glyph even when it is double-width
-    /// (2 cols) — otherwise, at maximum pan the marker replaces the last
-    /// visible character and the 8-col step granularity can make the
-    /// intermediate offsets that would reveal it unreachable.
+    /// Largest useful horizontal pan for the selected file — see
+    /// `pan_cap_for_rows`, precomputed once per file in `App::new`.
     fn pan_cap(&self) -> usize {
-        self.pan_limit.get(&self.nav.selected).copied().unwrap_or(0).saturating_sub(3)
+        self.pan_limit.get(&self.nav.selected).copied().unwrap_or(0)
     }
 
     /// Display-space scroll follow, run after every key that can move the
@@ -2072,16 +2108,17 @@ mod tests {
         let mut app = App::new(&request, &model);
         app.focus = Focus::Diff;
 
-        // Widest pannable row minus three: the ‹ marker (1 col) plus a
-        // possibly double-width final glyph (2 cols) stay visible at max pan.
-        assert_eq!(app.pan_cap(), 1497);
+        // Widest pannable row minus two: the ‹ marker (1 col) plus this
+        // row's actual trailing glyph width (1 col — plain ASCII 'x', not
+        // the worst-case double-width reservation) stay visible at max pan.
+        assert_eq!(app.pan_cap(), 1498);
 
         let term = Size { width: 120, height: 30 };
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         for _ in 0..500 {
             app.handle_key(right, term);
         }
-        assert_eq!(app.diff.hscroll, 1497, "pan must reach the line's end, past 1000");
+        assert_eq!(app.diff.hscroll, 1498, "pan must reach the line's end, past 1000");
 
         // At maximum pan the final character is genuinely inspectable: the
         // marker lands before it, not on it.
@@ -2089,7 +2126,62 @@ mod tests {
         pan_and_clip(&mut row, app.diff.hscroll, 120, 2);
         let tail: String =
             row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
-        assert!(tail.ends_with("xx"), "final glyph visible past the ‹ marker, got {tail:?}");
+        assert_eq!(tail, "\u{2039}x", "final glyph visible past the ‹ marker, got {tail:?}");
+    }
+
+    #[test]
+    fn narrow_panes_can_still_reach_the_final_ascii_character() {
+        // Regression (Codex P1): pan_cap reserved a flat 3 columns (marker +
+        // a HYPOTHETICAL double-width final glyph) even when the actual
+        // trailing glyph is single-width, wasting a column of pan reach that
+        // narrow panes cannot spare. A short ASCII line in a pane with only
+        // two content columns after the pinned gutter could reach pan_cap
+        // and still have its final character swallowed by the right-clip's
+        // "…" marker — permanently unreachable, not just off by one frame.
+        let short = "abcde".to_string();
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                // Shorter than the content line so IT (not the header)
+                // determines pan_limit — the scenario under test.
+                header: "@@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![line(Origin::Add, None, Some(1), &short)],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+
+        let term = Size { width: 16, height: 30 };
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        for _ in 0..10 {
+            app.handle_key(right, term);
+        }
+
+        // 11 pinned gutter/marker columns in a 13-column pane leaves 2
+        // content columns — exactly the narrow case from the report.
+        let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+        pan_and_clip(&mut row, app.diff.hscroll, 13, 2);
+        let tail: String = row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+        assert!(
+            tail.contains('e'),
+            "final character 'e' must be reachable even in a narrow pane, got {tail:?}"
+        );
     }
 
     #[test]
