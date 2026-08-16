@@ -143,7 +143,7 @@ enum Focus {
 /// file's post-change source. Global rather than per-file — `t` switches the
 /// whole review's reading mode, and carrying it per file would make the same
 /// key mean different things on different rows of the navigator.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ViewMode {
     Diff,
     Source,
@@ -670,12 +670,13 @@ struct App<'a> {
     /// be wasted I/O for a mode most reviews never enter, and `draw` borrows
     /// `App` immutably so it can never populate a cache itself.
     source_cache: HashMap<usize, Result<SourceFile, String>>,
-    /// Per file: the maximum horizontal pan (`pan_cap`'s value), precomputed
-    /// once from the widest row's pannable width minus just enough reserve —
-    /// the `‹` marker plus THAT row's own trailing glyph width — to keep its
-    /// final character reachable without over-reserving for a hypothetical
-    /// double-width glyph that isn't actually there.
-    pan_limit: HashMap<usize, usize>,
+    /// Per file, per view: the maximum horizontal pan (`pan_cap`'s value).
+    /// The diff-view cap is precomputed once in `App::new` from the diff
+    /// rows; the source-view cap is computed lazily in
+    /// `ensure_source_loaded`, from that file's source rows, the first time
+    /// its source view is entered — diff and source rows can differ wildly
+    /// in width, so one cap per file isn't enough once a second view exists.
+    pan_limit: HashMap<(usize, ViewMode), usize>,
 }
 
 /// One file's source view: its highlighted rows and how many lines it has
@@ -744,7 +745,7 @@ impl<'a> App<'a> {
             let hl = highlighter();
             for (i, file) in m.files.iter().enumerate() {
                 let rows = highlight_file_rows(hl, file);
-                pan_limit.insert(i, pan_cap_for_rows(&rows));
+                pan_limit.insert((i, ViewMode::Diff), pan_cap_for_rows(&rows));
                 row_cache.insert(i, rows);
             }
         }
@@ -881,10 +882,11 @@ impl<'a> App<'a> {
             Err("binary file".to_string())
         } else {
             match load_source(&self.request.working_dir, &path) {
-                Ok(lines) => Ok(SourceFile {
-                    lines: highlight_source_rows(highlighter(), &path, &lines),
-                    count: lines.len(),
-                }),
+                Ok(lines) => {
+                    let rows = highlight_source_rows(highlighter(), &path, &lines);
+                    self.pan_limit.insert((idx, ViewMode::Source), pan_cap_for_rows(&rows));
+                    Ok(SourceFile { lines: rows, count: lines.len() })
+                }
                 Err(err) => Err(err.root_cause().to_string()),
             }
         };
@@ -1144,10 +1146,14 @@ impl<'a> App<'a> {
         DispMap::new(ends)
     }
 
-    /// Largest useful horizontal pan for the selected file — see
-    /// `pan_cap_for_rows`, precomputed once per file in `App::new`.
+    /// Largest useful horizontal pan for the selected file IN THE CURRENT
+    /// VIEW — see `pan_cap_for_rows`. The diff-view cap is precomputed once
+    /// per file in `App::new`; the source-view cap is computed lazily in
+    /// `ensure_source_loaded` from that file's own (much wider or narrower)
+    /// source rows, since a diff row's width says nothing about a source
+    /// row's width.
     fn pan_cap(&self) -> usize {
-        self.pan_limit.get(&self.nav.selected).copied().unwrap_or(0)
+        self.pan_limit.get(&(self.nav.selected, self.view)).copied().unwrap_or(0)
     }
 
     /// The horizontal-pan offset a single rightward step should land on: a
@@ -3921,6 +3927,63 @@ mod tests {
         assert!(app.view == ViewMode::Diff);
         assert_eq!(app.pending_anchor(0), Some((3, 3)));
         assert_eq!(app.diff.cursor, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_view_pan_cap_is_computed_from_source_rows_not_diff_rows() {
+        // The diff's widest row is a short one-liner (see `sample_file`), but
+        // the file on disk has a much longer line — a change elsewhere in
+        // the same file that never shows up in the diff's hunks. Source
+        // view's pan cap must reflect ITS OWN widest row, not the diff's.
+        let dir = std::env::temp_dir()
+            .join(format!("herdr-annotator-source-pan-cap-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).expect("temp dir");
+        let long_line = "x".repeat(300);
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            format!("fn main() {{\n    setup();\n    {long_line}\n}}\n"),
+        )
+        .expect("write source");
+
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: dir.to_string_lossy().into_owned(),
+            baseline: None,
+            note: None,
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+
+        // Diff view: the cap comes from the diff's own (short) rows,
+        // precomputed once in `App::new`.
+        let diff_cap = app.pan_cap();
+        let diff_rows = app.row_cache.get(&0).cloned().unwrap_or_default();
+        assert_eq!(diff_cap, pan_cap_for_rows(&diff_rows));
+
+        // `t`: load the source and compute ITS OWN cap, lazily.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert!(app.view == ViewMode::Source);
+        let source_rows = match app.source_cache.get(&0) {
+            Some(Ok(source)) => source.lines.clone(),
+            _ => panic!("expected the source to load"),
+        };
+        let source_cap = app.pan_cap();
+        assert_eq!(source_cap, pan_cap_for_rows(&source_rows));
+        assert!(
+            source_cap > diff_cap,
+            "the long line on disk must widen the source cap past the diff cap \
+             ({source_cap} vs {diff_cap})"
+        );
+
+        // Back to diff view: the ORIGINAL diff cap returns, not the source
+        // one left over from the view we just left.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert!(app.view == ViewMode::Diff);
+        assert_eq!(app.pan_cap(), diff_cap);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
