@@ -997,27 +997,48 @@ impl<'a> App<'a> {
                     KeyCode::Enter => {
                         let text = buf.trim().to_string();
                         if !text.is_empty() {
-                            // The comment's rows are rows of the CURRENT
-                            // view, so each view resolves them its own way.
-                            let resolved = match self.view {
-                                ViewMode::Diff => self
-                                    .files()
-                                    .get(self.nav.selected)
-                                    .map(|file| (file, flatten_rows(file)))
-                                    .and_then(|(file, rows)| {
-                                        resolve_annotation(
-                                            file, &rows, *row_start, *row_end, *tag, text,
-                                        )
-                                    }),
-                                ViewMode::Source => self
-                                    .resolve_source_annotation(*row_start, *row_end, *tag, text),
-                            };
-                            if let Some(annotation) = resolved {
-                                let item =
-                                    PendingAnnotation { file_idx: self.nav.selected, annotation };
-                                match *editing {
-                                    Some(idx) => self.pending[idx] = item,
-                                    None => self.pending.push(item),
+                            match *editing {
+                                // Editing keeps the original file/range/side
+                                // — only the comment and tag change. Rebuilding
+                                // the range from `row_start`/`row_end` here
+                                // would re-derive it from whatever the CURRENT
+                                // view's row span happens to be, which silently
+                                // narrows or shifts it whenever the annotation
+                                // was saved from a different view: a source
+                                // selection can cover lines the diff never
+                                // shows at all (far context, outside every
+                                // hunk), so re-resolving from diff rows alone
+                                // loses everything the diff doesn't display.
+                                Some(idx) => {
+                                    if let Some(p) = self.pending.get_mut(idx) {
+                                        p.annotation.tag = tag.map(|t| t.label().to_string());
+                                        p.annotation.comment = text;
+                                    }
+                                }
+                                None => {
+                                    // The comment's rows are rows of the
+                                    // CURRENT view, so each view resolves
+                                    // them its own way.
+                                    let resolved = match self.view {
+                                        ViewMode::Diff => self
+                                            .files()
+                                            .get(self.nav.selected)
+                                            .map(|file| (file, flatten_rows(file)))
+                                            .and_then(|(file, rows)| {
+                                                resolve_annotation(
+                                                    file, &rows, *row_start, *row_end, *tag, text,
+                                                )
+                                            }),
+                                        ViewMode::Source => self.resolve_source_annotation(
+                                            *row_start, *row_end, *tag, text,
+                                        ),
+                                    };
+                                    if let Some(annotation) = resolved {
+                                        self.pending.push(PendingAnnotation {
+                                            file_idx: self.nav.selected,
+                                            annotation,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -4029,6 +4050,108 @@ mod tests {
         assert!(app.view == ViewMode::Diff);
         assert_eq!(app.pending_anchor(0), Some((3, 3)));
         assert_eq!(app.diff.cursor, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editing_across_views_keeps_the_original_range_not_the_current_views_anchor() {
+        // Regression (Codex P1): saving an edit re-derived the annotation's
+        // protocol range from the CURRENT view's row span instead of keeping
+        // the one it was originally saved with. An annotation created in
+        // source view can cover lines that are only PARTLY present in the
+        // diff (most of the file isn't in any hunk); editing it from diff
+        // view then narrowed lines 4..=10 down to whatever subset of that
+        // range the diff actually shows — silently corrupting the range
+        // even when the edit changes nothing but hits Enter.
+        let dir = std::env::temp_dir()
+            .join(format!("herdr-annotator-cross-view-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // 10 lines on disk so a source-view selection can span lines 4..=10.
+        let source = (1..=10).map(|n| format!("line{n}")).collect::<Vec<_>>().join("\n") + "\n";
+        std::fs::write(dir.join("a.txt"), source).expect("write source");
+
+        // The diff only shows new-side lines 5 and 6 — everything else in
+        // the file (including most of the 4..=10 range below) is far
+        // context, outside every hunk.
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            adds: 2,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -5,2 +5,2 @@".to_string(),
+                old_start: 5,
+                old_count: 2,
+                new_start: 5,
+                new_count: 2,
+                lines: vec![
+                    line(Origin::Add, None, Some(5), "line5"),
+                    line(Origin::Add, None, Some(6), "line6"),
+                ],
+            }],
+        };
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: dir.to_string_lossy().into_owned(),
+            baseline: None,
+            note: None,
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+
+        // Switch to source view and select source rows 3..=9 (lines 4..=10).
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert!(app.view == ViewMode::Source);
+        app.diff.cursor = 3;
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), size);
+        for _ in 0..6 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        }
+        assert_eq!(app.diff.cursor, 9);
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        for ch in "note".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+
+        assert_eq!(app.pending.len(), 1);
+        let original = (app.pending[0].annotation.lines.start, app.pending[0].annotation.lines.end);
+        assert_eq!(original, (4, 10), "source selection must save as the full line range");
+
+        // Back to diff view: this annotation only anchors to rows 1..=2
+        // there (lines 5 and 6 are all the diff shows).
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert!(app.view == ViewMode::Diff);
+        assert_eq!(app.pending_anchor(0), Some((1, 2)), "diff view only shows part of the range");
+
+        // Reopen the SAME annotation for editing from diff view and save
+        // again with NO changes to the text — the range alone must survive.
+        app.diff.cursor = 1;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        match &app.input {
+            Some(InputMode::Comment { editing, buf, .. }) => {
+                assert_eq!(*editing, Some(0));
+                assert_eq!(buf, "note");
+            }
+            other => panic!(
+                "expected comment input in edit mode, got a different state (variant present: {})",
+                other.is_some()
+            ),
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+
+        assert_eq!(app.pending.len(), 1, "editing must not duplicate the annotation");
+        let after_edit =
+            (app.pending[0].annotation.lines.start, app.pending[0].annotation.lines.end);
+        assert_eq!(
+            after_edit, original,
+            "editing from a different view must not change the saved range"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
