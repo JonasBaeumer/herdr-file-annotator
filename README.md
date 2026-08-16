@@ -89,6 +89,19 @@ Optional `config.toml` in the plugin's config dir (find it with `herdr plugin co
 | `accept_timeout_secs` | `20` | How long the agent waits for the pane to appear |
 | `review_timeout_secs` | unset | If set, a review left open this long returns a `cancelled` verdict |
 
+## Controls
+
+| Where | Keys | Mouse |
+|---|---|---|
+| File list | `j`/`k` move · `g`/`G` ends · `l`/`Enter`/`Tab` → diff | wheel moves selection, click opens a file |
+| Diff | `j`/`k` cursor · `←`/`→` (or `H`/`L`) pan wide lines, `0` resets · `d`/`u` half page · `n`/`p` hunks · `g`/`G` ends · `h`/`Tab` → files | wheel scrolls, horizontal wheel pans, click places the cursor, drag selects a range |
+| Annotate | `v` select range · `c` comment (Ctrl-T cycles tag, `Enter` saves, `Esc` backs out) · `c` on an annotated line edits · `x` deletes | drag then `c` |
+| Layout | `b` hide/show the file list · `z` zoom the pane full-screen | — |
+| Finish | `a` approve · `r` request changes + summary · `q` cancel | — |
+
+Long lines clip with `‹`/`…` markers; pan to see the rest. Annotations ride
+back to the agent on both `a` and `r` verdicts.
+
 ## The `review_changes` tool
 
 | Argument      | Type   | Meaning                                                            |
