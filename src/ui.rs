@@ -30,6 +30,8 @@ use ratatui::{
     Frame, Terminal,
 };
 use syntect::easy::HighlightLines;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
@@ -101,7 +103,12 @@ pub fn run(request: &ReviewRequest, model: Result<DiffModel>) -> Result<Outcome>
                 let size = terminal.size()?;
                 app.handle_mouse(mouse, size);
             }
-            // Resize, release events, etc: just redraw next iteration.
+            Event::Resize(width, height) => {
+                // Same reflow need as the navigator toggle: a smaller
+                // viewport must not strand the cursor off-screen.
+                app.ensure_cursor_visible(Size { width, height });
+            }
+            // Release events, etc: just redraw next iteration.
             _ => {}
         }
     }
@@ -170,11 +177,15 @@ struct DiffViewState {
     /// The addressed row — what j/k move, what gets highlighted, and what a
     /// future annotation anchors to.
     cursor: usize,
+    /// Horizontal pan (columns of code shifted off the left edge); the
+    /// line-number gutter and origin marker stay pinned.
+    hscroll: usize,
 }
 
 impl DiffViewState {
     fn reset(&mut self) {
         self.scroll = 0;
+        self.hscroll = 0;
         self.cursor = 0;
     }
 
@@ -456,31 +467,38 @@ fn resolve_annotation(
 /// logic as the real layout (header + note + footer chrome, then body_split,
 /// then the diff pane's top/bottom border) — so cursor-following stays
 /// correct in both the side-by-side and stacked layouts.
-fn diff_viewport_rows(term_size: Size) -> usize {
+fn diff_viewport_rows(term_size: Size, show_navigator: bool) -> usize {
     let body = Rect::new(0, 0, term_size.width, term_size.height.saturating_sub(3));
-    let (_, diff_area) = body_split(body);
+    let (_, diff_area) = body_split(body, show_navigator);
     (diff_area.height.saturating_sub(2) as usize).max(1)
 }
 
 /// Half a screen's worth of diff rows.
-fn half_page(term_size: Size) -> usize {
-    (diff_viewport_rows(term_size) / 2).max(1)
+fn half_page(term_size: Size, show_navigator: bool) -> usize {
+    (diff_viewport_rows(term_size, show_navigator) / 2).max(1)
 }
 
 /// Display rows a wheel/trackpad tick scrolls the diff.
 const WHEEL_STEP: usize = 3;
 
+/// Columns one horizontal pan step shifts the code.
+const HSCROLL_STEP: usize = 8;
+
+/// Columns of the pinned lead on line rows: the 11-col line-number gutter
+/// plus the 1-col origin marker (see `highlight_diff_line`'s format).
+const GUTTER_AND_MARKER_COLS: usize = 12;
+
 /// The navigator/diff rects for mouse hit-testing, mirroring `draw`'s
 /// layout: header (1) + note (1) above the body, footer (1) below.
-fn body_rects(term_size: Size) -> (Rect, Rect) {
+fn body_rects(term_size: Size, show_navigator: bool) -> (Rect, Rect) {
     let body = Rect::new(0, 2, term_size.width, term_size.height.saturating_sub(3));
-    body_split(body)
+    body_split(body, show_navigator)
 }
 
 /// Inner (borderless) width of the diff pane — the wrap width for inline
 /// comments; must match what `draw_diff` derives from its render area.
-fn diff_inner_width(term_size: Size) -> usize {
-    let (_, diff_rect) = body_rects(term_size);
+fn diff_inner_width(term_size: Size, show_navigator: bool) -> usize {
+    let (_, diff_rect) = body_rects(term_size, show_navigator);
     (diff_rect.width.saturating_sub(2)).max(1) as usize
 }
 
@@ -539,6 +557,8 @@ struct App<'a> {
     /// Base row where a left-button press landed in the diff; a subsequent
     /// drag turns it into the visual anchor (mouse range selection).
     drag_origin: Option<usize>,
+    /// `b` collapses the file navigator to give the diff the full width.
+    show_navigator: bool,
     /// Annotations the reviewer has left so far, in creation order.
     pending: Vec<PendingAnnotation>,
     /// Fully syntax-highlighted body rows per file, keyed by index into
@@ -549,15 +569,74 @@ struct App<'a> {
     /// on demand. Never invalidated — the model is immutable for the life
     /// of the UI.
     row_cache: HashMap<usize, Vec<Line<'static>>>,
+    /// Per file: the maximum horizontal pan (`pan_cap`'s value), precomputed
+    /// once from the widest row's pannable width minus just enough reserve —
+    /// the `‹` marker plus THAT row's own trailing glyph width — to keep its
+    /// final character reachable without over-reserving for a hypothetical
+    /// double-width glyph that isn't actually there.
+    pan_limit: HashMap<usize, usize>,
+}
+
+/// The pinned-span count `pan_and_clip` uses for a row (gutter + origin
+/// marker on line rows; nothing on single-span header/placeholder rows).
+fn pinned_spans(line: &Line) -> usize {
+    if line.spans.len() >= 3 {
+        2
+    } else {
+        0
+    }
+}
+
+/// A row's pannable display columns: its total width minus the pinned lead.
+fn pannable_cols(line: &Line) -> usize {
+    line.spans
+        .iter()
+        .skip(pinned_spans(line))
+        .map(|s| str_cols(&s.content))
+        .sum()
+}
+
+/// The display width of a row's final grapheme cluster in its pannable
+/// (unpinned) content — scalar-sum width per the render model, so a
+/// trailing family emoji reserves its full rendered footprint. Rows with
+/// no pannable content default to 1 (nothing to protect).
+fn trailing_cell_width(line: &Line) -> usize {
+    let content: String =
+        line.spans.iter().skip(pinned_spans(line)).map(|s| s.content.as_ref()).collect();
+    content.graphemes(true).next_back().map(|g| str_cols(g).max(1)).unwrap_or(1)
+}
+
+/// The largest horizontal pan that still leaves the widest row's own final
+/// character genuinely inspectable: enough short of that row's pannable
+/// width for the `‹` clip marker (1 col) plus its actual trailing glyph
+/// width (1 or 2 cols, not a flat worst-case 2) — otherwise the marker
+/// replaces the last visible character, and on narrow panes a wasted
+/// reserve column can put the true final character permanently out of
+/// reach (Codex P1: a flat -3 reservation cost narrow panes exactly the
+/// one column a single-width trailing glyph didn't need reserved).
+/// When several rows tie for the widest, reserves for whichever of THEM
+/// has the widest trailing glyph, so panning to this cap is safe for all.
+fn pan_cap_for_rows(rows: &[Line]) -> usize {
+    let max_cols = rows.iter().map(pannable_cols).max().unwrap_or(0);
+    let reserve = rows
+        .iter()
+        .filter(|r| pannable_cols(r) == max_cols)
+        .map(|r| 1 + trailing_cell_width(r))
+        .max()
+        .unwrap_or(3);
+    max_cols.saturating_sub(reserve)
 }
 
 impl<'a> App<'a> {
     fn new(request: &'a ReviewRequest, model: &'a Result<DiffModel>) -> Self {
         let mut row_cache = HashMap::new();
+        let mut pan_limit = HashMap::new();
         if let Ok(m) = model {
             let hl = highlighter();
             for (i, file) in m.files.iter().enumerate() {
-                row_cache.insert(i, highlight_file_rows(hl, file));
+                let rows = highlight_file_rows(hl, file);
+                pan_limit.insert(i, pan_cap_for_rows(&rows));
+                row_cache.insert(i, rows);
             }
         }
         App {
@@ -569,8 +648,10 @@ impl<'a> App<'a> {
             input: None,
             visual_anchor: None,
             drag_origin: None,
+            show_navigator: true,
             pending: Vec::new(),
             row_cache,
+            pan_limit,
         }
     }
 
@@ -712,6 +793,23 @@ impl<'a> App<'a> {
                 self.input = Some(InputMode::Summary { buf: String::new() });
                 return None;
             }
+            KeyCode::Char('b') => {
+                self.show_navigator = !self.show_navigator;
+                if !self.show_navigator && self.focus == Focus::Navigator {
+                    self.focus = Focus::Diff;
+                }
+                // The toggle changes the diff viewport (height in stacked
+                // layout, wrap width everywhere): reflow immediately or the
+                // cursor can sit outside the new viewport until the next key.
+                self.ensure_cursor_visible(term_size);
+                return None;
+            }
+            KeyCode::Char('z') => {
+                if let Err(err) = crate::herdr::zoom_toggle_current() {
+                    eprintln!("herdr-annotator pane: {err:#}");
+                }
+                return None;
+            }
             _ => {}
         }
 
@@ -743,15 +841,65 @@ impl<'a> App<'a> {
         DispMap::new(ends)
     }
 
+    /// Largest useful horizontal pan for the selected file — see
+    /// `pan_cap_for_rows`, precomputed once per file in `App::new`.
+    fn pan_cap(&self) -> usize {
+        self.pan_limit.get(&self.nav.selected).copied().unwrap_or(0)
+    }
+
+    /// The horizontal-pan offset a single rightward step should land on: a
+    /// full `HSCROLL_STEP` jump, UNLESS some row's pannable width sits
+    /// strictly inside that jump. A short row would otherwise vanish from
+    /// "showing its first few columns" straight to "fully panned off,
+    /// empty" in one step — with a much longer row elsewhere in the same
+    /// file supplying a big enough `pan_cap`, every offset that would have
+    /// revealed the short row's remaining content becomes permanently
+    /// unreachable (Right/Left only ever move in whole `HSCROLL_STEP`s).
+    /// Stepping by a single column instead whenever that would happen keeps
+    /// every row's content reachable, while long lines with no such
+    /// short-row conflict still jump the full step.
+    /// One pan step in columns: the full `HSCROLL_STEP` on normal panes,
+    /// but never more than half the visible CODE columns — in a pane
+    /// narrower than the step, whole-step jumps skip offsets that were
+    /// never on screen (middle of short rows, tails at the cap), so narrow
+    /// panes fine-step down to single columns.
+    fn pan_step(&self, term_size: Size) -> usize {
+        let code_cols = diff_inner_width(term_size, self.show_navigator)
+            .saturating_sub(GUTTER_AND_MARKER_COLS);
+        HSCROLL_STEP.min((code_cols / 2).max(1))
+    }
+
+    fn next_pan_stop(&self, current: usize, step: usize) -> usize {
+        let target = current + step;
+        // <= target, not < target: a row whose pannable width lands EXACTLY
+        // on the step boundary is just as skipped-over as one strictly
+        // inside it — landing there means every offset that would have
+        // revealed that row's middle/tail (current+1..target-1) was never
+        // visited, and `target` itself is already "fully panned off, empty"
+        // for that row.
+        let overshoots_a_row = self
+            .row_cache
+            .get(&self.nav.selected)
+            .into_iter()
+            .flatten()
+            .map(pannable_cols)
+            .any(|cols| cols > current && cols <= target);
+        if overshoots_a_row {
+            current + 1
+        } else {
+            target
+        }
+    }
+
     /// Display-space scroll follow, run after every key that can move the
     /// cursor or change which comment rows exist.
     fn ensure_cursor_visible(&mut self, term_size: Size) {
-        let map = self.disp_map(diff_inner_width(term_size));
+        let map = self.disp_map(diff_inner_width(term_size, self.show_navigator));
         self.diff.scroll = follow_display(
             self.diff.scroll,
             self.diff.cursor,
             &map,
-            diff_viewport_rows(term_size),
+            diff_viewport_rows(term_size, self.show_navigator),
         );
     }
 
@@ -761,7 +909,7 @@ impl<'a> App<'a> {
         if self.input.is_some() {
             return;
         }
-        let (nav_rect, diff_rect) = body_rects(term_size);
+        let (nav_rect, diff_rect) = body_rects(term_size, self.show_navigator);
         let in_nav = rect_contains(nav_rect, mouse.column, mouse.row);
         let in_diff = rect_contains(diff_rect, mouse.column, mouse.row);
 
@@ -819,6 +967,18 @@ impl<'a> App<'a> {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_origin = None;
             }
+            MouseEventKind::ScrollRight => {
+                if in_diff {
+                    self.diff.hscroll = self
+                        .next_pan_stop(self.diff.hscroll, self.pan_step(term_size))
+                        .min(self.pan_cap());
+                }
+            }
+            MouseEventKind::ScrollLeft => {
+                if in_diff {
+                    self.diff.hscroll = self.diff.hscroll.saturating_sub(self.pan_step(term_size));
+                }
+            }
             _ => {}
         }
     }
@@ -831,14 +991,14 @@ impl<'a> App<'a> {
         if base_count == 0 {
             return;
         }
-        let map = self.disp_map(diff_inner_width(term_size));
+        let map = self.disp_map(diff_inner_width(term_size, self.show_navigator));
         let max_scroll = map.total(base_count).saturating_sub(1);
         self.diff.scroll = if down {
             (self.diff.scroll + WHEEL_STEP).min(max_scroll)
         } else {
             self.diff.scroll.saturating_sub(WHEEL_STEP)
         };
-        let viewport = diff_viewport_rows(term_size);
+        let viewport = diff_viewport_rows(term_size, self.show_navigator);
         let cursor_disp = map.disp(self.diff.cursor);
         if cursor_disp < self.diff.scroll {
             self.diff.cursor = map.base_at(self.diff.scroll, base_count);
@@ -959,10 +1119,10 @@ impl<'a> App<'a> {
                     KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count),
                     KeyCode::Char('k') | KeyCode::Up => self.diff.up(),
                     KeyCode::Char('d') | KeyCode::PageDown => {
-                        self.diff.page_down(half_page(term_size), row_count)
+                        self.diff.page_down(half_page(term_size, self.show_navigator), row_count)
                     }
                     KeyCode::Char('u') | KeyCode::PageUp => {
-                        self.diff.page_up(half_page(term_size))
+                        self.diff.page_up(half_page(term_size, self.show_navigator))
                     }
                     KeyCode::Char('n') => {
                         self.diff.next_hunk(&hunk_row_indices(&self.diff_rows()))
@@ -972,7 +1132,22 @@ impl<'a> App<'a> {
                     }
                     KeyCode::Char('g') => self.diff.top(),
                     KeyCode::Char('G') => self.diff.bottom(row_count),
-                    KeyCode::Char('h') | KeyCode::Tab => self.focus = Focus::Navigator,
+                    KeyCode::Right | KeyCode::Char('L') => {
+                        self.diff.hscroll =
+                            self.next_pan_stop(self.diff.hscroll, self.pan_step(term_size))
+                                .min(self.pan_cap())
+                    }
+                    KeyCode::Left | KeyCode::Char('H') => {
+                        self.diff.hscroll = self.diff.hscroll.saturating_sub(self.pan_step(term_size))
+                    }
+                    KeyCode::Char('0') => self.diff.hscroll = 0,
+                    KeyCode::Char('h') | KeyCode::Tab => {
+                        // Focusing an invisible pane strands the keyboard
+                        // (j/k would switch files with no visible feedback):
+                        // going "to the files" while collapsed reveals them.
+                        self.show_navigator = true;
+                        self.focus = Focus::Navigator;
+                    }
                     KeyCode::Char('v') => {
                         self.visual_anchor = match self.visual_anchor {
                             Some(_) => None,
@@ -1062,14 +1237,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
         None => match app.focus {
             Focus::Navigator => format!(
-                " j/k move \u{b7} g/G first/last \u{b7} l/enter/tab focus diff \u{b7} {GLOBAL_HINTS}"
+                " j/k move \u{b7} g/G first/last \u{b7} l/enter/tab focus diff \u{b7} b hide \u{b7} z zoom \u{b7} {GLOBAL_HINTS}"
             ),
             Focus::Diff => {
                 // Position first: when the footer clips in a narrow pane,
                 // "where am I" survives and only the key hints get cut.
                 let pos = app.cursor_position().unwrap_or_default();
                 format!(
-                    " {pos} \u{b7} j/k move \u{b7} d/u half page \u{b7} n/p hunk \u{b7} g/G top/bottom \u{b7} h/tab navigator \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} {GLOBAL_HINTS}"
+                    " {pos} \u{b7} j/k move \u{b7} \u{2190}/\u{2192} pan \u{b7} d/u half page \u{b7} n/p hunk \u{b7} b files \u{b7} z zoom \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} h/tab navigator \u{b7} {GLOBAL_HINTS}"
                 )
             }
         },
@@ -1100,7 +1275,11 @@ fn draw_empty_message(frame: &mut Frame, area: Rect) {
 /// stack: navigator strip on top, diff below.
 const STACK_THRESHOLD: u16 = 64;
 
-fn body_split(area: Rect) -> (Rect, Rect) {
+fn body_split(area: Rect, show_navigator: bool) -> (Rect, Rect) {
+    if !show_navigator {
+        // Navigator collapsed (`b`): the diff gets the whole body.
+        return (Rect::new(area.x, area.y, 0, 0), area);
+    }
     if area.width < STACK_THRESHOLD {
         let nav_height = ((area.height as u32 * 30 / 100) as u16).clamp(4, 10).min(area.height);
         let rows = Layout::default()
@@ -1128,14 +1307,18 @@ fn pane_block(title: impl std::fmt::Display, focused: bool) -> Block<'static> {
 }
 
 fn draw_panes(frame: &mut Frame, area: Rect, app: &App, files: &[FileDiff]) {
-    let (nav_area, diff_area) = body_split(area);
-    draw_navigator(frame, nav_area, app, files);
+    let (nav_area, diff_area) = body_split(area, app.show_navigator);
+    if app.show_navigator {
+        draw_navigator(frame, nav_area, app, files);
+    }
     draw_diff(frame, diff_area, app, files.get(app.nav.selected));
 }
 
 fn draw_panes_with_error(frame: &mut Frame, area: Rect, app: &App, err: &anyhow::Error) {
-    let (nav_area, diff_area) = body_split(area);
-    draw_navigator(frame, nav_area, app, &[]);
+    let (nav_area, diff_area) = body_split(area, app.show_navigator);
+    if app.show_navigator {
+        draw_navigator(frame, nav_area, app, &[]);
+    }
 
     let block = pane_block("diff", app.focus == Focus::Diff);
     let text = Paragraph::new(format!("{err:#}"))
@@ -1235,13 +1418,24 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
         }
     }
 
+    let inner_width = (area.width.saturating_sub(2)).max(1) as usize;
+
+    // Horizontal pan + clip indicators for code rows. Gutter and origin
+    // marker (the first two spans of a line row) stay pinned; hunk headers
+    // and placeholders (single-span rows) pan whole. Runs after the style
+    // patches (they only touch styles/first gutter char) and before comment
+    // weaving (comments wrap instead of panning).
+    for line in &mut lines {
+        let pinned = if line.spans.len() >= 3 { 2 } else { 0 };
+        pan_and_clip(line, app.diff.hscroll, inner_width, pinned);
+    }
+
     // Inline comment rows, woven in directly under the lines they annotate
     // (GitHub-style) so feedback sits next to the code instead of living only
     // in the bottom bar. Long comments wrap to the pane width as continuation
     // rows. Must run AFTER all base-row patches above — the patches index
     // base rows, and insertion shifts everything below it. Groups are
     // inserted in descending anchor order to keep earlier indices valid.
-    let inner_width = (area.width.saturating_sub(2)).max(1) as usize;
     let mut groups: std::collections::BTreeMap<usize, Vec<Line>> = std::collections::BTreeMap::new();
     for p in app.pending.iter().filter(|p| p.file_idx == app.nav.selected) {
         groups.entry(p.row_end).or_default().extend(inline_comment_lines(
@@ -1269,6 +1463,110 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
 
     let paragraph = Paragraph::new(lines).block(block).scroll((app.diff.scroll as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+fn str_cols(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Pan a rendered row `hscroll` display columns to the left — keeping its
+/// first `pinned` spans (gutter + origin marker) in place — then clip it to
+/// `width` display columns. Clipped edges get dim `‹` / `…` indicators so
+/// the reviewer can tell content continues off-screen.
+///
+/// Two invariants, deliberately separate:
+/// - WIDTHS are unicode-width 0.2 string widths per grapheme — the exact
+///   crate+version pair ratatui 0.29 pins for its own rendering, so a ZWJ
+///   family emoji counts whatever ratatui will actually draw it as.
+///   Diverging from the render layer's math would misalign every row.
+/// - ATOMICITY is by extended grapheme cluster (UAX #29 via
+///   unicode-segmentation): a boundary never splits a cluster — no half
+///   families, orphaned flag halves, or bare Indic conjunct pieces. A
+///   cluster straddling the pan boundary drops whole with pad spaces so
+///   columns stay aligned; one straddling the clip budget drops whole under
+///   the … marker. Earlier hand-rolled ZWJ/flag/modifier heuristics kept
+///   missing scripts (viramas were next); UAX #29 is the single primitive
+///   that ends that series. Segmentation runs per span — syntect splits on
+///   token boundaries, which do not land inside grapheme clusters.
+fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: usize) {
+    let pinned = pinned.min(line.spans.len());
+
+    if hscroll > 0 {
+        let mut col = 0usize; // columns consumed from the unpinned content
+        let mut dropped = false;
+        let mut pad_cols = 0usize; // columns dropped past the boundary, refilled as spaces
+        for span in line.spans.iter_mut().skip(pinned) {
+            if col >= hscroll && pad_cols == 0 {
+                break;
+            }
+            let mut kept = String::new();
+            for g in span.content.graphemes(true) {
+                let w = str_cols(g);
+                if col < hscroll {
+                    // Still panning: the cluster drops WHOLE; if it straddles
+                    // the boundary the overshoot comes back as pad spaces.
+                    col += w;
+                    dropped = true;
+                    if col > hscroll {
+                        pad_cols += col - hscroll;
+                    }
+                } else {
+                    if pad_cols > 0 {
+                        kept.extend(std::iter::repeat(' ').take(pad_cols));
+                        pad_cols = 0;
+                    }
+                    kept.push_str(g);
+                }
+            }
+            span.content = kept.into();
+        }
+        if dropped {
+            // Mark the left clip on the first visible cluster, preserving
+            // its full display width ("‹" plus pad spaces for wide clusters)
+            // so columns stay aligned with unpanned rows.
+            for span in line.spans.iter_mut().skip(pinned) {
+                if !span.content.is_empty() {
+                    let mut graphemes = span.content.graphemes(true);
+                    let first = graphemes.next().unwrap_or_default();
+                    let cluster_width = str_cols(first).max(1);
+                    let rest: String = graphemes.collect();
+                    span.content =
+                        format!("\u{2039}{}{rest}", " ".repeat(cluster_width - 1)).into();
+                    break;
+                }
+            }
+        }
+    }
+
+    let total: usize = line.spans.iter().map(|s| str_cols(&s.content)).sum();
+    if total > width {
+        let keep = width.saturating_sub(1);
+        let mut used = 0usize;
+        for span in line.spans.iter_mut() {
+            let cols = str_cols(&span.content);
+            if used + cols <= keep {
+                used += cols;
+                continue;
+            }
+            let mut kept = String::new();
+            for g in span.content.graphemes(true) {
+                let w = str_cols(g);
+                if used + w > keep {
+                    // The straddling cluster drops whole: rendering a
+                    // truncated prefix would show a DIFFERENT glyph (a
+                    // family cut to a couple, half a flag, a bare conjunct).
+                    break;
+                }
+                kept.push_str(g);
+                used += w;
+            }
+            span.content = kept.into();
+            // Force every following span to truncate to empty (a dropped
+            // straddler leaves at most a small gap before the marker).
+            used = keep;
+        }
+        line.spans.push(Span::styled("\u{2026}", Style::default().fg(Color::DarkGray)));
+    }
 }
 
 /// Comment-row background: a warm dark slate distinct from both the code
@@ -1460,6 +1758,17 @@ fn highlight_diff_line(
         spans.push(Span::styled(text.to_string(), span_style));
     }
 
+    // Always emit a content span, even for blank lines: pan/clip pins the
+    // gutter+marker only on rows with 3+ spans, so a 2-span blank changed
+    // line would have its line numbers consumed by horizontal panning.
+    if spans.len() == 2 {
+        let mut span_style = Style::default();
+        if let Some(bg) = bg {
+            span_style = span_style.bg(bg);
+        }
+        spans.push(Span::styled(String::new(), span_style));
+    }
+
     Line::from(spans)
 }
 
@@ -1541,7 +1850,7 @@ mod tests {
     #[test]
     fn next_and_prev_hunk_jump_to_neighboring_headers() {
         let hunks = vec![0usize, 4];
-        let mut state = DiffViewState { scroll: 0, cursor: 0 };
+        let mut state = DiffViewState { scroll: 0, cursor: 0, hscroll: 0 };
 
         // From the first header, next jumps the CURSOR to the second header;
         // a further next is a no-op.
@@ -1563,7 +1872,7 @@ mod tests {
 
     #[test]
     fn diff_view_cursor_clamps_at_both_ends() {
-        let mut state = DiffViewState { scroll: 0, cursor: 0 };
+        let mut state = DiffViewState { scroll: 0, cursor: 0, hscroll: 0 };
         state.up(); // already at 0, saturating
         assert_eq!(state.cursor, 0);
 
@@ -1706,6 +2015,664 @@ mod tests {
     }
 
     #[test]
+    fn blank_changed_lines_keep_their_gutter_under_panning() {
+        // Regression (Codex P1): an empty added line rendered only gutter +
+        // marker spans, so the "3+ spans → pin 2" rule failed and panning
+        // consumed the line numbers.
+        let file = FileDiff {
+            path: "src/lib.rs".to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,2 @@".to_string(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![line(Origin::Add, None, Some(2), "")],
+            }],
+        };
+        let rows = highlight_file_rows(highlighter(), &file);
+        let blank = &rows[1];
+        assert!(blank.spans.len() >= 3, "blank line must still carry a content span");
+
+        let mut panned = blank.clone();
+        pan_and_clip(&mut panned, 16, 100, 2);
+        assert_eq!(panned.spans[0].content.as_ref(), "        2 ");
+        assert_eq!(panned.spans[1].content.as_ref(), "+");
+    }
+
+    #[test]
+    fn panning_reaches_the_end_of_very_long_lines() {
+        // Regression (Codex P1): a literal .min(1000) ceiling made columns
+        // past ~1000 permanently unreachable on generated/minified files.
+        let long = "x".repeat(1500);
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "min.js".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,1 @@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![line(Origin::Add, None, Some(1), &long)],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+
+        // Widest pannable row minus two: the ‹ marker (1 col) plus this
+        // row's actual trailing glyph width (1 col — plain ASCII 'x', not
+        // the worst-case double-width reservation) stay visible at max pan.
+        assert_eq!(app.pan_cap(), 1498);
+
+        let term = Size { width: 120, height: 30 };
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        for _ in 0..500 {
+            app.handle_key(right, term);
+        }
+        assert_eq!(app.diff.hscroll, 1498, "pan must reach the line's end, past 1000");
+
+        // At maximum pan the final character is genuinely inspectable: the
+        // marker lands before it, not on it.
+        let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+        pan_and_clip(&mut row, app.diff.hscroll, 120, 2);
+        let tail: String =
+            row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+        assert_eq!(tail, "\u{2039}x", "final glyph visible past the ‹ marker, got {tail:?}");
+    }
+
+    #[test]
+    fn narrow_panes_can_still_reach_the_final_ascii_character() {
+        // Regression (Codex P1): pan_cap reserved a flat 3 columns (marker +
+        // a HYPOTHETICAL double-width final glyph) even when the actual
+        // trailing glyph is single-width, wasting a column of pan reach that
+        // narrow panes cannot spare. A short ASCII line in a pane with only
+        // two content columns after the pinned gutter could reach pan_cap
+        // and still have its final character swallowed by the right-clip's
+        // "…" marker — permanently unreachable, not just off by one frame.
+        let short = "abcde".to_string();
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                // Shorter than the content line so IT (not the header)
+                // determines pan_limit — the scenario under test.
+                header: "@@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![line(Origin::Add, None, Some(1), &short)],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+
+        let term = Size { width: 16, height: 30 };
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        for _ in 0..10 {
+            app.handle_key(right, term);
+        }
+
+        // 11 pinned gutter/marker columns in a 13-column pane leaves 2
+        // content columns — exactly the narrow case from the report.
+        let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+        pan_and_clip(&mut row, app.diff.hscroll, 13, 2);
+        let tail: String = row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+        assert!(
+            tail.contains('e'),
+            "final character 'e' must be reachable even in a narrow pane, got {tail:?}"
+        );
+    }
+
+    #[test]
+    fn short_rows_stay_reachable_when_a_longer_row_sets_a_big_pan_cap() {
+        // Regression (Codex P1): the fixed 8-column HSCROLL_STEP could jump
+        // straight past a short row's entire remaining content in one press
+        // when a much longer row (elsewhere in the same file) supplied a
+        // big file-wide pan_cap. A 6-char row's middle/final characters
+        // became permanently unreachable: Right skipped from "showing the
+        // first couple of chars" to "fully panned off, empty" without ever
+        // passing through the offsets that would reveal the rest, and Left
+        // only ever returns to 0 (same fixed step).
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 2,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@".to_string(), // shorter than either content line
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![
+                    line(Origin::Add, None, Some(1), "abcdef"),
+                    line(Origin::Add, None, Some(2), &"y".repeat(200)),
+                ],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        assert!(
+            app.pan_cap() > HSCROLL_STEP,
+            "the long row must set a cap well past a single step"
+        );
+
+        let term = Size { width: 16, height: 30 };
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+
+        // 11 pinned gutter/marker columns in a 14-column pane leaves 2
+        // content columns — the narrow case from the report. Every one of
+        // the short row's characters must surface in some frame as we step.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            app.handle_key(right, term);
+            let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+            pan_and_clip(&mut row, app.diff.hscroll, 14, 2);
+            let tail: String = row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+            seen.extend(tail.chars());
+        }
+        for c in "cdef".chars() {
+            assert!(seen.contains(&c), "{c:?} never became visible while panning, saw {seen:?}");
+        }
+
+        // Fine-stepping past the short row must not cripple navigation on
+        // the long row: Right still reaches the file's real pan cap.
+        for _ in 0..300 {
+            app.handle_key(right, term);
+        }
+        assert_eq!(app.diff.hscroll, app.pan_cap(), "must still reach the file-wide pan cap");
+    }
+
+    #[test]
+    fn short_rows_stay_reachable_at_an_exact_step_boundary() {
+        // Regression (Codex P1): `next_pan_stop`'s overshoot check used a
+        // strict `cols < target`, excluding a row whose pannable width
+        // lands EXACTLY on the step boundary (an 8-char row against the
+        // default HSCROLL_STEP=8). The first Right press still jumped
+        // straight from offset 0 to offset 8 — where that row is already
+        // fully panned off, empty — skipping every offset that would have
+        // revealed its middle/tail characters.
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 2,
+            dels: 0,
+            hunks: vec![Hunk {
+                // Empty: a nonempty header (even a short one) would itself
+                // fall strictly inside (0, 8) and trigger fine-stepping on
+                // its own, masking the exact-8 boundary this test isolates.
+                header: String::new(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![
+                    line(Origin::Add, None, Some(1), "abcdefgh"), // exactly HSCROLL_STEP cols
+                    line(Origin::Add, None, Some(2), &"y".repeat(200)),
+                ],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+
+        let term = Size { width: 16, height: 30 };
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            app.handle_key(right, term);
+            let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+            pan_and_clip(&mut row, app.diff.hscroll, 14, 2);
+            let tail: String = row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+            seen.extend(tail.chars());
+        }
+        for c in "cdefgh".chars() {
+            assert!(seen.contains(&c), "{c:?} never became visible while panning, saw {seen:?}");
+        }
+    }
+
+    #[test]
+    fn pan_cap_protects_a_trailing_flag_pair_whole() {
+        // Regression (Codex P1, thread 3792439091): trailing_cell_width
+        // sized the reserve from only the row's LAST scalar. For a row
+        // ending in a regional-indicator flag, that scalar is one RI (1
+        // col) — but a flag is an atomic 2-scalar pair (fixed elsewhere in
+        // this file). Reserving for only the last scalar let pan_cap land
+        // the boundary cleanly BEFORE the flag, where the marker-
+        // replacement step (which only ever protects trailing zero-width
+        // marks on the char it overwrites, not a whole second cluster
+        // scalar) ate the flag's first RI and left the second standing
+        // alone.
+        let content = "abcdef\u{1f1fa}\u{1f1f8}"; // 6 letters + US flag (2 RI scalars)
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![line(Origin::Add, None, Some(1), content)],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let app = App::new(&request, &model);
+
+        // 8 pannable cols total (6 letters + 2 RI scalars); the reserve
+        // must protect the whole 2-col pair, not just its last scalar.
+        assert_eq!(app.pan_cap(), 5, "reserve must be 1 (marker) + 2 (whole flag pair)");
+
+        let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+        pan_and_clip(&mut row, app.pan_cap(), 100, 2);
+        let visible = row.spans[2].content.as_ref();
+        assert!(
+            visible.contains('\u{1f1fa}') && visible.contains('\u{1f1f8}'),
+            "the whole flag must survive together at max pan, got {visible:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_panes_pan_by_fine_steps() {
+        // Regression (Codex P1, thread 3792516905): in a pane exposing only
+        // a couple of code columns, whole 8-column jumps skip offsets that
+        // were never on screen, hiding short rows' middles forever. The
+        // step now caps at half the visible code columns (min 1).
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let rows = vec![
+            line(Origin::Add, None, Some(1), "abcdefghi"), // 9 cols
+            line(Origin::Add, None, Some(2), &"x".repeat(120)),
+        ];
+        let file = FileDiff {
+            path: "a.py".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 2,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,2 @@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                lines: rows,
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.show_navigator = false;
+
+        // Stacked/narrow: 16-wide terminal → 14 inner → 2 code columns.
+        let narrow = Size { width: 16, height: 24 };
+        assert_eq!(app.pan_step(narrow), 1);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        app.handle_key(right, narrow);
+        assert_eq!(app.diff.hscroll, 1, "narrow panes advance one column at a time");
+
+        // Wide terminal: full step (modulo the short-row fine-step rule).
+        let wide = Size { width: 120, height: 30 };
+        assert_eq!(app.pan_step(wide), HSCROLL_STEP);
+    }
+
+    #[test]
+    fn focusing_files_from_a_collapsed_navigator_reveals_it() {
+        // Regression (Codex P2): h/Tab focused the hidden navigator, so j/k
+        // switched files invisibly and diff keys went dead.
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.py".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,1 @@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![line(Origin::Add, None, Some(1), "x")],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.show_navigator = false;
+
+        let term = Size { width: 120, height: 30 };
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), term);
+        assert!(app.show_navigator, "focusing the files must reveal them");
+        assert!(matches!(app.focus, Focus::Navigator));
+    }
+
+    #[test]
+    fn pan_and_clip_counts_display_columns_not_chars() {
+        // Regression (Codex P1): chars().count() made CJK/emoji content pan
+        // double the columns and evade right-clipping.
+        let mk = |content: &str| {
+            Line::from(vec![
+                Span::raw("   1    2  "),
+                Span::raw("+"),
+                Span::raw(content.to_string()),
+            ])
+        };
+
+        // "你好世界" = 4 chars but 8 display columns.
+        // Pan 2 columns: exactly the first wide char goes; the ‹ marker
+        // replaces the next wide char's cell as "‹ " to keep alignment.
+        let mut line = mk("\u{4f60}\u{597d}\u{4e16}\u{754c}");
+        pan_and_clip(&mut line, 2, 100, 2);
+        assert_eq!(line.spans[2].content.as_ref(), "\u{2039} \u{4e16}\u{754c}");
+        assert_eq!(str_cols(line.spans[2].content.as_ref()), 6); // 8 - 2
+
+        // Pan 1 column: the first wide char straddles the boundary — it is
+        // dropped whole and a pad keeps columns aligned; marker takes the pad.
+        let mut line = mk("\u{4f60}\u{597d}\u{4e16}\u{754c}");
+        pan_and_clip(&mut line, 1, 100, 2);
+        assert_eq!(str_cols(line.spans[2].content.as_ref()), 7); // 8 - 1
+        assert!(line.spans[2].content.starts_with('\u{2039}'));
+
+        // Right clip in columns: gutter+marker (12) + "abc你好" (7) = 19
+        // display columns; width 16 keeps 15 columns + the … marker, and a
+        // wide char never straddles past the budget.
+        let mut line = mk("abc\u{4f60}\u{597d}");
+        pan_and_clip(&mut line, 0, 16, 2);
+        let total: usize = line.spans.iter().map(|s| str_cols(s.content.as_ref())).sum();
+        assert!(total <= 16, "rendered {total} cols > width 16");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // Decomposed text: "a" + combining acute + "b" renders as 2 cells.
+        // Panning one column drops the accented cell WITH its mark (no
+        // orphaned combining char attaching to the marker), and the ‹
+        // replaces the b cell: exactly 1 column remains.
+        let mut line = mk("a\u{301}b");
+        pan_and_clip(&mut line, 1, 100, 2);
+        assert_eq!(line.spans[2].content.as_ref(), "\u{2039}");
+        assert_eq!(str_cols(line.spans[2].content.as_ref()), 1);
+
+        // Marker replaces a whole cell even when the surviving first cell
+        // carries its own combining mark.
+        let mut line = mk("a\u{301}e\u{301}b");
+        pan_and_clip(&mut line, 1, 100, 2);
+        assert_eq!(line.spans[2].content.as_ref(), "\u{2039}b");
+
+        // ZWJ emoji sequence (family): ONE grapheme cluster, whose width is
+        // whatever unicode-width 0.2 says ratatui will render it as. A pan
+        // boundary can only ever drop it whole — no partial family, no
+        // dangling joiner — and the remaining columns follow exactly.
+        let family = "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        let content = format!("{family}abcdefgh");
+        let total_before = str_cols(&content);
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 4, 100, 2);
+        let visible = line.spans[2].content.as_ref();
+        assert!(!visible.contains('\u{200d}'), "no joiner may survive a pan");
+        assert!(
+            visible.contains(family) || !visible.contains('\u{1f469}'),
+            "family must be whole or gone, never partial: {visible:?}"
+        );
+        assert_eq!(str_cols(visible), total_before - 4);
+
+        // Right clip that lands after a ZWJ trims the dangling joiner.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 0, 15, 2); // 12 pinned + 3 → cuts inside the cluster
+        let visible: String = line.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+        assert!(!visible.trim_end_matches('\u{2026}').ends_with('\u{200d}'));
+
+        // Regression (Codex P1, thread 3792159813): a right clip must never
+        // render a partial family (a COUPLE is a genuinely different emoji).
+        // Under the render model the whole family is one narrow cluster, so
+        // it either fits entirely or drops entirely — assert exactly that
+        // invariant at a budget that cuts within the following text, and at
+        // one too small for the cluster at all.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 0, 17, 2);
+        let visible = line.spans[2].content.as_ref().to_string();
+        assert!(
+            visible.contains(family) || !visible.contains('\u{1f469}'),
+            "family must be whole or gone, never a couple: {visible:?}"
+        );
+        let total: usize = line.spans.iter().map(|s| str_cols(s.content.as_ref())).sum();
+        assert!(total <= 17, "rendered {total} cols > width 17");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // Budget of a single column cannot hold the 2-col family cluster:
+        // it drops whole, no couple, no dangling joiner.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 0, 14, 2); // 12 pinned + 1 col budget
+        let visible = line.spans[2].content.as_ref();
+        assert!(visible.is_empty(), "cluster over budget must drop whole, got {visible:?}");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // Regression (Codex P1, thread 3792495132): Indic conjuncts. KA +
+        // virama + SSA is ONE cluster (UAX #29 GB9c); the old zero-width
+        // heuristics dropped the virama but kept SSA, rendering "‹ष" — a
+        // bare consonant instead of the source conjunct. The marker must
+        // consume the conjunct whole.
+        let conjunct = "\u{915}\u{94d}\u{937}"; // क्ष
+        let mut line = mk(&format!("a{conjunct}b"));
+        pan_and_clip(&mut line, 1, 100, 2); // pan off the 'a'
+        let visible = line.spans[2].content.as_ref();
+        assert!(
+            visible.contains(conjunct) || !visible.contains('\u{937}'),
+            "conjunct must be whole or gone, never a bare piece: {visible:?}"
+        );
+        assert!(visible.starts_with('\u{2039}'));
+    }
+
+    #[test]
+    fn pan_and_clip_keeps_regional_indicator_flags_atomic() {
+        // Regression (Codex P1, thread 3792368958): a flag is exactly two
+        // regional-indicator scalars with NO joiner between them (unlike
+        // every other cluster this file protects) — pairing is purely
+        // positional. A pan or clip boundary landing between the two used
+        // to drop only one, leaving the other to render alone as an
+        // orphaned boxed letter instead of the source flag.
+        let mk = |content: &str| {
+            Line::from(vec![
+                Span::raw("   1    2  "), // 11-col mock gutter (pinned)
+                Span::raw("+"),           // 1-col mock marker (pinned)
+                Span::raw(content.to_string()),
+            ])
+        };
+        let flag = "\u{1f1fa}\u{1f1f8}"; // US flag: 2 RI scalars, 1 col each
+        let content = format!("{flag}abcdefgh");
+
+        // Pan boundary lands inside the cluster ahead of the flag (a CJK
+        // char carrying a trailing ZWJ — per UAX #29 the ZWJ does NOT glue
+        // it to the following flag, matching how terminals render it). The
+        // CJK cluster drops whole with a pad; the flag must survive INTACT:
+        // the invariant is that a flag never splits, wherever the boundary
+        // lands.
+        let bridged = format!("\u{4f60}\u{200d}{content}"); // CJK+ZWJ cluster, then flag + text
+        let mut line = mk(&bridged);
+        pan_and_clip(&mut line, 1, 100, 2);
+        let visible = line.spans[2].content.as_ref();
+        let intact = visible.contains(flag);
+        let absent = !visible.contains('\u{1f1fa}') && !visible.contains('\u{1f1f8}');
+        assert!(intact || absent, "flag must be whole or gone, never split: {visible:?}");
+        assert!(intact, "flag is a separate cluster and must survive this pan: {visible:?}");
+        assert!(visible.ends_with("abcdefgh"), "trailing text intact, got {visible:?}");
+
+        // Right clip lands between the two RI scalars (first kept, second
+        // dropped by the budget): the walk-back must drop the retained
+        // first RI too, not leave it standing alone.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 0, 14, 2); // 12 pinned + 1 → cuts inside the flag
+        let visible = line.spans[2].content.as_ref();
+        assert!(visible.is_empty(), "no lone RI from the cut flag may survive, got {visible:?}");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // A clean cut exactly AT the flag boundary (not inside it) is
+        // unaffected: the whole flag pans off normally, nothing orphaned.
+        // The ‹ marker replaces the first surviving cell ('a'), as usual.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 2, 100, 2);
+        let visible = line.spans[2].content.as_ref();
+        assert!(!visible.contains('\u{1f1fa}') && !visible.contains('\u{1f1f8}'));
+        assert!(visible.ends_with("bcdefgh"), "got {visible:?}");
+    }
+
+    #[test]
+    fn pan_marker_replaces_the_whole_leading_cluster_not_just_its_first_scalar() {
+        // Regression (Codex P1): the pan boundary can land immediately
+        // before an intact multi-scalar cluster (not cut through it — that
+        // atomicity is handled elsewhere). The marker-replacement step
+        // itself only ever swapped the first SCALAR for "‹" (plus trailing
+        // zero-width marks), splitting a cluster the pan logic upstream
+        // deliberately kept whole. Codex's exact example: panning
+        // "abcdefgh🇺🇸xyz" by 8 lands right at the flag — the old code
+        // rendered "‹🇸xyz", orphaning the second regional indicator.
+        let mk = |content: &str| {
+            Line::from(vec![
+                Span::raw("   1    2  "),
+                Span::raw("+"),
+                Span::raw(content.to_string()),
+            ])
+        };
+        let mut line = mk("abcdefgh\u{1f1fa}\u{1f1f8}xyz");
+        pan_and_clip(&mut line, 8, 100, 2);
+        let visible = line.spans[2].content.as_ref();
+        assert_eq!(visible, "\u{2039} xyz", "must replace the WHOLE flag pair, got {visible:?}");
+        assert_eq!(str_cols(visible), 5); // marker(1) + pad(1) + xyz(3) = 5
+
+        // Clean-boundary case with a ZWJ cluster too: panning off exactly
+        // up to a family emoji must mark the whole family, not just its
+        // first pictograph.
+        let family = "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}"; // 8 cols
+        let mut line = mk(&format!("abcdefgh{family}xyz"));
+        pan_and_clip(&mut line, 8, 100, 2);
+        let visible = line.spans[2].content.as_ref();
+        assert!(!visible.contains('\u{200d}'), "no joiner may survive, got {visible:?}");
+        assert!(!visible.contains('\u{1f469}'), "no partial family may render, got {visible:?}");
+        assert!(visible.ends_with("xyz"), "trailing text intact, got {visible:?}");
+    }
+
+    #[test]
+    fn navigator_toggle_reflows_the_viewport() {
+        // Regression (Codex P1): 'b' early-returned without
+        // ensure_cursor_visible, so re-showing the navigator in a stacked
+        // (narrow) layout could shrink the diff viewport and strand the
+        // cursor off-screen until the next navigation key.
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let rows: Vec<DiffLine> =
+            (1..=40).map(|i| line(Origin::Add, None, Some(i), "x")).collect();
+        let file = FileDiff {
+            path: "a.py".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 40,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,40 @@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 40,
+                lines: rows,
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.show_navigator = false;
+
+        // 40 cols → stacked layout once the navigator returns.
+        let term = Size { width: 40, height: 24 };
+        app.diff.cursor = 30;
+        app.ensure_cursor_visible(term);
+
+        let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(app.handle_key(key, term).is_none());
+        assert!(app.show_navigator);
+
+        let map = app.disp_map(diff_inner_width(term, true));
+        let viewport = diff_viewport_rows(term, true);
+        let cursor_disp = map.disp(app.diff.cursor);
+        assert!(
+            cursor_disp >= app.diff.scroll && cursor_disp < app.diff.scroll + viewport,
+            "cursor display row {cursor_disp} outside viewport [{}, {})",
+            app.diff.scroll,
+            app.diff.scroll + viewport
+        );
+    }
+
+    #[test]
     fn highlighted_rs_add_line_keeps_content_and_add_background() {
         let file = FileDiff {
             path: "src/lib.rs".to_string(),
@@ -1767,17 +2734,62 @@ mod tests {
     fn narrow_body_stacks_navigator_above_diff() {
         // 40 cols (the width the e2e run hit): side-by-side leaves no room
         // for code, so the split must go vertical.
-        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30));
+        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30), true);
         assert_eq!(nav.width, 40);
         assert_eq!(diff.width, 40);
         assert!(nav.height >= 4 && nav.height <= 10);
         assert_eq!(nav.y + nav.height, diff.y);
 
         // Wide pane keeps the horizontal split with the 24-col floor.
-        let (nav, diff) = body_split(Rect::new(0, 0, 120, 30));
+        let (nav, diff) = body_split(Rect::new(0, 0, 120, 30), true);
         assert_eq!(nav.height, 30);
         assert_eq!(nav.width, 36);
         assert_eq!(nav.x + nav.width, diff.x);
+
+        // Collapsed navigator: the diff takes the whole body at any width.
+        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30), false);
+        assert_eq!(nav.width, 0);
+        assert_eq!(diff, Rect::new(0, 0, 40, 30));
+    }
+
+    #[test]
+    fn pan_and_clip_pins_gutter_and_marks_both_edges() {
+        let mk = || {
+            Line::from(vec![
+                Span::raw("   1    2  "),        // gutter (pinned)
+                Span::raw("+"),                  // marker (pinned)
+                Span::raw("let alpha = "),       // content…
+                Span::raw("beta + gamma;"),
+            ])
+        };
+
+        // Pan 4: gutter+marker intact, first 4 content chars gone, and the
+        // ‹ marker REPLACES the first visible char (keeping column widths).
+        let mut line = mk();
+        pan_and_clip(&mut line, 4, 100, 2);
+        assert_eq!(line.spans[0].content.as_ref(), "   1    2  ");
+        assert_eq!(line.spans[1].content.as_ref(), "+");
+        assert_eq!(line.spans[2].content.as_ref(), "\u{2039}lpha = ");
+        assert_eq!(line.spans[3].content.as_ref(), "beta + gamma;");
+
+        // No pan, narrow width: right edge clipped with a … marker and the
+        // rendered width never exceeds the pane.
+        let mut line = mk();
+        pan_and_clip(&mut line, 0, 20, 2);
+        let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, 20);
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // Fits: untouched, no markers.
+        let mut line = mk();
+        pan_and_clip(&mut line, 0, 100, 2);
+        assert_eq!(line.spans.len(), 4);
+        assert_eq!(line.spans[2].content.as_ref(), "let alpha = ");
+
+        // Pan past the end of content: everything unpinned empties, no panic.
+        let mut line = mk();
+        pan_and_clip(&mut line, 500, 100, 2);
+        assert!(line.spans[2].content.is_empty() && line.spans[3].content.is_empty());
     }
 
     // --- M3 annotation flow ------------------------------------------
