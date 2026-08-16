@@ -1234,21 +1234,27 @@ fn draw_note(frame: &mut Frame, area: Rect, request: &ReviewRequest, pending_cou
     frame.render_widget(note, area);
 }
 
+/// Footer text for the request-changes summary bar: the label, then either
+/// the full buffer plus the `⏎ send · esc cancel` hint (when both fit `width`)
+/// or just a tail-fit buffer with the hint dropped (when they don't) — the
+/// same end-of-buffer-visible rule the comment bar below also follows.
+fn summary_footer_text(buf: &str, width: usize) -> String {
+    let label = " request changes \u{2014} summary: ";
+    let suffix = " \u{23ce} send \u{b7} esc cancel";
+    let avail = width.saturating_sub(label.chars().count());
+    if buf.chars().count() + suffix.chars().count() <= avail {
+        format!("{label}{buf}{suffix}")
+    } else {
+        format!("{label}{}", tail_fit(buf, avail))
+    }
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     const GLOBAL_HINTS: &str = "a approve \u{b7} r request changes \u{b7} q cancel";
     let text = match &app.input {
         // Input bars keep the END of a long buffer visible (that's where the
         // caret is) by trimming from the left with an ellipsis.
-        Some(InputMode::Summary { buf }) => {
-            let label = " request changes \u{2014} summary: ";
-            let suffix = " \u{23ce} send \u{b7} esc cancel";
-            let avail = (area.width as usize).saturating_sub(label.chars().count());
-            if buf.chars().count() + suffix.chars().count() <= avail {
-                format!("{label}{buf}{suffix}")
-            } else {
-                format!("{label}{}", tail_fit(buf, avail))
-            }
-        }
+        Some(InputMode::Summary { buf }) => summary_footer_text(buf, area.width as usize),
         Some(InputMode::Comment { buf, tag, .. }) => {
             let tag_label = tag.map(|t| t.label()).unwrap_or("none");
             let label = format!(" comment [tag: {tag_label}]: ");
@@ -2129,6 +2135,36 @@ mod tests {
         assert_eq!(tail_fit("short", 10), "short");
         assert_eq!(tail_fit("abcdefghij", 6), "\u{2026}fghij");
         assert!(tail_fit("abcdefghij", 6).chars().count() <= 6);
+    }
+
+    #[test]
+    fn summary_footer_shows_the_hint_only_when_it_fits() {
+        // Regression (Codex P1): the width-dependent `<=` boundary that
+        // decides whether the "⏎ send · esc cancel" hint shows at all had
+        // no test coverage — pin both sides of it.
+        let label = " request changes \u{2014} summary: ";
+        let suffix = " \u{23ce} send \u{b7} esc cancel";
+        let buf = "short summary";
+
+        // Exactly enough room for label + buf + suffix: the fitting path,
+        // hint shown, full buffer visible.
+        let exact_width = label.chars().count() + buf.chars().count() + suffix.chars().count();
+        assert_eq!(summary_footer_text(buf, exact_width), format!("{label}{buf}{suffix}"));
+
+        // One column short of that: the `<=` boundary tips over to the
+        // non-fitting path — hint dropped, buffer tail-fit instead (and
+        // since there's still ample room for the buffer alone, unchanged).
+        let text = summary_footer_text(buf, exact_width - 1);
+        assert_eq!(text, format!("{label}{buf}"));
+        assert!(!text.contains("send"), "hint must be dropped once it no longer fits: {text:?}");
+
+        // Too narrow even for the buffer: hint stays dropped, and the tail
+        // of the buffer (where the caret is) is what tail_fit keeps —
+        // exercised directly by `tail_fit_keeps_the_end_of_long_input_visible`.
+        let long = "a much longer summary than the bar can show";
+        let text = summary_footer_text(long, exact_width - 1);
+        assert!(!text.contains("send"));
+        assert_eq!(text, format!("{label}{}", tail_fit(long, exact_width - 1 - label.chars().count())));
     }
 
     #[test]
