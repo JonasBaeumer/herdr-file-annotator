@@ -89,6 +89,19 @@ Optional `config.toml` in the plugin's config dir (find it with `herdr plugin co
 | `accept_timeout_secs` | `20` | How long the agent waits for the pane to appear |
 | `review_timeout_secs` | unset | If set, a review left open this long returns a `cancelled` verdict |
 
+## Controls
+
+| Where | Keys | Mouse |
+|---|---|---|
+| File list | `j`/`k` move · `g`/`G` ends · `l`/`Enter`/`Tab` → diff | wheel moves selection, click opens a file |
+| Diff | `j`/`k` cursor · `←`/`→` (or `H`/`L`) pan wide lines, `0` resets · `d`/`u` half page · `n`/`p` hunks · `g`/`G` ends · `h`/`Tab` → files | wheel scrolls, horizontal wheel pans, click places the cursor, drag selects a range |
+| Annotate | `v` select range · `c` comment (Ctrl-T cycles tag, `Enter` saves, `Esc` backs out) · `c` on an annotated line edits · `x` deletes | drag then `c` |
+| Layout | `b` hide/show the file list · `z` zoom the pane full-screen | — |
+| Finish | `a` approve · `r` request changes + summary · `q` cancel | — |
+
+Long lines clip with `‹`/`…` markers; pan to see the rest. Annotations ride
+back to the agent on both `a` and `r` verdicts.
+
 ## The `review_changes` tool
 
 | Argument      | Type   | Meaning                                                            |
@@ -113,11 +126,14 @@ Result (JSON in the tool response):
 
 ## Status
 
-**M1 (walking skeleton)** — the full blocking loop works end-to-end: colored
-scrollable diff (including untracked files), verdict keys, optional one-line
-summary on `request_changes`. Line-anchored annotations (`v` select, `c`
-comment, tags) are next; see the roadmap in the project plan. Release packaging
-for `herdr plugin install` comes after that.
+Released and feature-complete for the core loop: agent-summoned blocking
+review, two-pane syntax-highlighted diff viewer with full mouse support,
+line-anchored annotations (range select, tags, inline comments), a config
+file, and prebuilt, checksum-verified binaries for macOS and Linux via
+`herdr plugin install`. Listed on the herdr marketplace.
+
+See the [releases](https://github.com/JonasBaeumer/herdr-file-annotator/releases)
+for per-version changes; ongoing work happens in pull requests.
 
 ## License
 

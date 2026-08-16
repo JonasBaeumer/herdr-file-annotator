@@ -18,6 +18,10 @@ crossterm = "0.28"
 ratatui = "0.29"
 # fancy-regex backend: pure Rust, no oniguruma C dependency
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# display columns (unicode-width, ratatui's own model) + UAX #29 cluster
+# atomicity (unicode-segmentation); both pure Rust
+unicode-segmentation = "1"
+unicode-width = "0.2"
 toml = "0.8"
 
 [profile.release]
