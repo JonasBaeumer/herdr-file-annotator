@@ -564,15 +564,41 @@ struct App<'a> {
     /// on demand. Never invalidated — the model is immutable for the life
     /// of the UI.
     row_cache: HashMap<usize, Vec<Line<'static>>>,
+    /// Per file: the widest row's pannable display columns (everything past
+    /// the pinned gutter/marker). Horizontal panning clamps against this so
+    /// arbitrarily long lines stay fully reachable, without a magic cap.
+    pan_limit: HashMap<usize, usize>,
+}
+
+/// The pinned-span count `pan_and_clip` uses for a row (gutter + origin
+/// marker on line rows; nothing on single-span header/placeholder rows).
+fn pinned_spans(line: &Line) -> usize {
+    if line.spans.len() >= 3 {
+        2
+    } else {
+        0
+    }
+}
+
+/// A row's pannable display columns: its total width minus the pinned lead.
+fn pannable_cols(line: &Line) -> usize {
+    line.spans
+        .iter()
+        .skip(pinned_spans(line))
+        .map(|s| str_cols(&s.content))
+        .sum()
 }
 
 impl<'a> App<'a> {
     fn new(request: &'a ReviewRequest, model: &'a Result<DiffModel>) -> Self {
         let mut row_cache = HashMap::new();
+        let mut pan_limit = HashMap::new();
         if let Ok(m) = model {
             let hl = highlighter();
             for (i, file) in m.files.iter().enumerate() {
-                row_cache.insert(i, highlight_file_rows(hl, file));
+                let rows = highlight_file_rows(hl, file);
+                pan_limit.insert(i, rows.iter().map(pannable_cols).max().unwrap_or(0));
+                row_cache.insert(i, rows);
             }
         }
         App {
@@ -587,6 +613,7 @@ impl<'a> App<'a> {
             show_navigator: true,
             pending: Vec::new(),
             row_cache,
+            pan_limit,
         }
     }
 
@@ -776,6 +803,13 @@ impl<'a> App<'a> {
         DispMap::new(ends)
     }
 
+    /// Largest useful horizontal pan for the selected file: one column short
+    /// of its widest row's pannable width, so the tail of every line —
+    /// including generated/minified ones — stays reachable with no magic cap.
+    fn pan_cap(&self) -> usize {
+        self.pan_limit.get(&self.nav.selected).copied().unwrap_or(0).saturating_sub(1)
+    }
+
     /// Display-space scroll follow, run after every key that can move the
     /// cursor or change which comment rows exist.
     fn ensure_cursor_visible(&mut self, term_size: Size) {
@@ -854,7 +888,7 @@ impl<'a> App<'a> {
             }
             MouseEventKind::ScrollRight => {
                 if in_diff {
-                    self.diff.hscroll = (self.diff.hscroll + HSCROLL_STEP).min(1000);
+                    self.diff.hscroll = (self.diff.hscroll + HSCROLL_STEP).min(self.pan_cap());
                 }
             }
             MouseEventKind::ScrollLeft => {
@@ -1016,7 +1050,7 @@ impl<'a> App<'a> {
                     KeyCode::Char('g') => self.diff.top(),
                     KeyCode::Char('G') => self.diff.bottom(row_count),
                     KeyCode::Right | KeyCode::Char('L') => {
-                        self.diff.hscroll = (self.diff.hscroll + HSCROLL_STEP).min(1000)
+                        self.diff.hscroll = (self.diff.hscroll + HSCROLL_STEP).min(self.pan_cap())
                     }
                     KeyCode::Left | KeyCode::Char('H') => {
                         self.diff.hscroll = self.diff.hscroll.saturating_sub(HSCROLL_STEP)
@@ -1907,6 +1941,47 @@ mod tests {
         pan_and_clip(&mut panned, 16, 100, 2);
         assert_eq!(panned.spans[0].content.as_ref(), "        2 ");
         assert_eq!(panned.spans[1].content.as_ref(), "+");
+    }
+
+    #[test]
+    fn panning_reaches_the_end_of_very_long_lines() {
+        // Regression (Codex P1): a literal .min(1000) ceiling made columns
+        // past ~1000 permanently unreachable on generated/minified files.
+        let long = "x".repeat(1500);
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "min.js".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,1 @@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![line(Origin::Add, None, Some(1), &long)],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+
+        assert_eq!(app.pan_cap(), 1499); // widest pannable row minus one
+
+        let term = Size { width: 120, height: 30 };
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        for _ in 0..500 {
+            app.handle_key(right, term);
+        }
+        assert_eq!(app.diff.hscroll, 1499, "pan must reach the line's end, past 1000");
     }
 
     #[test]
