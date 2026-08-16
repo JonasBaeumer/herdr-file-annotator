@@ -3415,13 +3415,13 @@ mod tests {
 
     #[test]
     fn bottom_rule_drops_the_tag_chip_before_the_cancel_chip() {
-        // Codex P1 (confirm intended): bottom_rule_line's own docstring
-        // states the chips drop right-to-priority as the pane narrows — tag
-        // first, then cancel, commit never — so a medium-width pane keeps
-        // commit+cancel and loses the only visible `Ctrl-T` discoverability.
-        // That precedence is deliberate (the docstring predates this
-        // finding); pin it with a constrained-width case rather than only
-        // the "everything fits" / "nothing fits" ends already covered.
+        // Pins the precedence `bottom_rule_line`'s own docstring states:
+        // chips drop right-to-priority as the pane narrows (tag first, then
+        // cancel, commit never), so a medium-width pane keeps commit+cancel
+        // and drops the only visible `Ctrl-T` discoverability. Covers the
+        // constrained-width case in between the "everything fits" and
+        // "nothing fits" ends `bottom_rule_shows_chips_when_roomy_and_never_overflows_when_narrow`
+        // already exercises.
         let contains = |w: usize, needle: &str| {
             let line = bottom_rule_line(Some(Tag::Fix), w);
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
