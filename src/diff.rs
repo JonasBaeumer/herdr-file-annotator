@@ -162,8 +162,21 @@ pub fn load(working_dir: &str, baseline: Option<&str>) -> Result<DiffModel> {
 /// `Side::New` line numbers refer to. Binary files (`read_to_string` rejects
 /// non-UTF-8), deleted files, and unreadable ones come back as `Err`; the UI
 /// turns that into a placeholder row rather than failing the review.
+///
+/// Symlinks are refused rather than followed: git's diff for a symlink shows
+/// the link's target STRING as the file's one-line content, but
+/// `read_to_string` would dereference the link and render whatever it points
+/// at instead — including files well outside the repo (`/etc/passwd`, an SSH
+/// key) if a reviewed change plants a symlink pointing there. Checking
+/// `symlink_metadata` (which does not follow the link) before ever opening
+/// the target keeps that content out of the pane.
 pub fn load_source(working_dir: &str, path: &str) -> Result<Vec<String>> {
     let full = Path::new(working_dir).join(path);
+    let meta = std::fs::symlink_metadata(&full)
+        .with_context(|| format!("reading {}", full.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("{} is a symlink; source view does not follow worktree symlinks", full.display());
+    }
     let text = std::fs::read_to_string(&full)
         .with_context(|| format!("reading {}", full.display()))?;
     Ok(text.lines().map(|line| line.to_string()).collect())
@@ -864,5 +877,32 @@ index 1111111..2222222 100644
                 assert_eq!(line.origin, Origin::Add);
             }
         }
+    }
+
+    #[test]
+    fn load_source_refuses_a_symlink_instead_of_following_it_outside_the_repo() {
+        // Regression (Codex P0): read_to_string follows symlinks. A reviewed
+        // change that plants a symlink pointing outside the repo — a secret
+        // file, an SSH key — must not have its target's content rendered in
+        // source view just because the reviewer pressed `t`.
+        let repo = TempRepo::new("symlink_source");
+
+        let secret_dir = std::env::temp_dir()
+            .join(format!("herdr_diff_test_secret_{}", std::process::id()));
+        std::fs::create_dir_all(&secret_dir).expect("create secret dir");
+        let secret_path = secret_dir.join("secret.txt");
+        std::fs::write(&secret_path, "TOP SECRET, outside the repo\n").expect("write secret");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret_path, repo.path.join("link.txt"))
+            .expect("create symlink");
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let result = load_source(&wd, "link.txt");
+        assert!(result.is_err(), "a symlink must be refused, not dereferenced: {result:?}");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("symlink"), "error should name the reason, got {msg:?}");
+
+        let _ = std::fs::remove_dir_all(&secret_dir);
     }
 }
