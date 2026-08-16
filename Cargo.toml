@@ -18,6 +18,8 @@ crossterm = "0.28"
 ratatui = "0.29"
 # fancy-regex backend: pure Rust, no oniguruma C dependency
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# terminal display columns (CJK/emoji are 2 cols); pure Rust
+unicode-width = "0.2"
 toml = "0.8"
 
 [profile.release]

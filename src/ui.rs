@@ -30,6 +30,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use syntect::easy::HighlightLines;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
@@ -1339,55 +1340,93 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
     frame.render_widget(paragraph, area);
 }
 
-/// Pan a rendered row `hscroll` columns to the left — keeping its first
-/// `pinned` spans (gutter + origin marker) in place — then clip it to
-/// `width` columns. Clipped edges get dim `‹` / `…` indicators so the
-/// reviewer can tell content continues off-screen.
+/// A char's rendered terminal width (CJK/emoji are 2 columns, combining
+/// marks 0) — `chars().count()` is NOT this, and using it here made pans
+/// move double the columns and clipping miss on wide-character content.
+fn char_cols(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+fn str_cols(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Pan a rendered row `hscroll` display columns to the left — keeping its
+/// first `pinned` spans (gutter + origin marker) in place — then clip it to
+/// `width` display columns. Clipped edges get dim `‹` / `…` indicators so
+/// the reviewer can tell content continues off-screen. All arithmetic is in
+/// terminal columns, not chars: a wide char straddling the pan boundary is
+/// dropped whole and replaced by a pad space so columns stay aligned across
+/// rows.
 fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: usize) {
     let pinned = pinned.min(line.spans.len());
 
     if hscroll > 0 {
-        let mut remaining = hscroll;
-        let mut dropped = 0usize;
+        let mut col = 0usize; // columns consumed from the unpinned content
+        let mut dropped = false;
+        let mut pad_next = false; // wide char straddled the boundary
         for span in line.spans.iter_mut().skip(pinned) {
-            if remaining == 0 {
+            if col >= hscroll && !pad_next {
                 break;
             }
-            let len = span.content.chars().count();
-            let take = len.min(remaining);
-            if take > 0 {
-                let s: String = span.content.chars().skip(take).collect();
-                span.content = s.into();
-                remaining -= take;
-                dropped += take;
+            let mut kept = String::new();
+            for c in span.content.chars() {
+                if col < hscroll {
+                    col += char_cols(c);
+                    dropped = true;
+                    if col > hscroll {
+                        pad_next = true;
+                    }
+                } else {
+                    if pad_next {
+                        kept.push(' ');
+                        pad_next = false;
+                    }
+                    kept.push(c);
+                }
             }
+            span.content = kept.into();
         }
-        if dropped > 0 {
-            // Mark the left clip on the first visible content char.
+        if dropped {
+            // Mark the left clip on the first visible cell, preserving its
+            // display width (a wide char's cell becomes "‹ ").
             for span in line.spans.iter_mut().skip(pinned) {
-                if !span.content.is_empty() {
-                    let mut chars: Vec<char> = span.content.chars().collect();
-                    chars[0] = '\u{2039}'; // ‹
-                    span.content = chars.into_iter().collect::<String>().into();
+                if let Some(first) = span.content.chars().next() {
+                    let rest: String = span.content.chars().skip(1).collect();
+                    let marked = if char_cols(first) >= 2 {
+                        format!("\u{2039} {rest}")
+                    } else {
+                        format!("\u{2039}{rest}")
+                    };
+                    span.content = marked.into();
                     break;
                 }
             }
         }
     }
 
-    let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let total: usize = line.spans.iter().map(|s| str_cols(&s.content)).sum();
     if total > width {
         let keep = width.saturating_sub(1);
         let mut used = 0usize;
         for span in line.spans.iter_mut() {
-            let len = span.content.chars().count();
-            if used + len <= keep {
-                used += len;
+            let cols = str_cols(&span.content);
+            if used + cols <= keep {
+                used += cols;
                 continue;
             }
-            let take = keep - used;
-            let s: String = span.content.chars().take(take).collect();
-            span.content = s.into();
+            let mut kept = String::new();
+            for c in span.content.chars() {
+                let w = char_cols(c);
+                if used + w > keep {
+                    break;
+                }
+                kept.push(c);
+                used += w;
+            }
+            span.content = kept.into();
+            // Force every following span to truncate to empty (a wide char
+            // stopping short of `keep` leaves at most a one-column gap).
             used = keep;
         }
         line.spans.push(Span::styled("\u{2026}", Style::default().fg(Color::DarkGray)));
@@ -1868,6 +1907,43 @@ mod tests {
         pan_and_clip(&mut panned, 16, 100, 2);
         assert_eq!(panned.spans[0].content.as_ref(), "        2 ");
         assert_eq!(panned.spans[1].content.as_ref(), "+");
+    }
+
+    #[test]
+    fn pan_and_clip_counts_display_columns_not_chars() {
+        // Regression (Codex P1): chars().count() made CJK/emoji content pan
+        // double the columns and evade right-clipping.
+        let mk = |content: &str| {
+            Line::from(vec![
+                Span::raw("   1    2  "),
+                Span::raw("+"),
+                Span::raw(content.to_string()),
+            ])
+        };
+
+        // "你好世界" = 4 chars but 8 display columns.
+        // Pan 2 columns: exactly the first wide char goes; the ‹ marker
+        // replaces the next wide char's cell as "‹ " to keep alignment.
+        let mut line = mk("\u{4f60}\u{597d}\u{4e16}\u{754c}");
+        pan_and_clip(&mut line, 2, 100, 2);
+        assert_eq!(line.spans[2].content.as_ref(), "\u{2039} \u{4e16}\u{754c}");
+        assert_eq!(str_cols(line.spans[2].content.as_ref()), 6); // 8 - 2
+
+        // Pan 1 column: the first wide char straddles the boundary — it is
+        // dropped whole and a pad keeps columns aligned; marker takes the pad.
+        let mut line = mk("\u{4f60}\u{597d}\u{4e16}\u{754c}");
+        pan_and_clip(&mut line, 1, 100, 2);
+        assert_eq!(str_cols(line.spans[2].content.as_ref()), 7); // 8 - 1
+        assert!(line.spans[2].content.starts_with('\u{2039}'));
+
+        // Right clip in columns: gutter+marker (12) + "abc你好" (7) = 19
+        // display columns; width 16 keeps 15 columns + the … marker, and a
+        // wide char never straddles past the budget.
+        let mut line = mk("abc\u{4f60}\u{597d}");
+        pan_and_clip(&mut line, 0, 16, 2);
+        let total: usize = line.spans.iter().map(|s| str_cols(s.content.as_ref())).sum();
+        assert!(total <= 16, "rendered {total} cols > width 16");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
     }
 
     #[test]
