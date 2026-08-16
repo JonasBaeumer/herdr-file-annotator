@@ -677,6 +677,26 @@ struct App<'a> {
     /// its source view is entered — diff and source rows can differ wildly
     /// in width, so one cap per file isn't enough once a second view exists.
     pan_limit: HashMap<(usize, ViewMode), usize>,
+    /// Each file's on-disk modification time when the review began,
+    /// captured in `new` right after `diff::load` produced the model. The
+    /// diff itself is a snapshot of that moment; source view instead reads
+    /// the worktree fresh the first time `t` is pressed, which can be much
+    /// later. If something touches the file in between, the two views
+    /// would silently show different revisions and a source-view
+    /// annotation's line numbers would no longer describe the diff the
+    /// agent receives — `ensure_source_loaded` checks the current mtime
+    /// against this baseline before trusting a lazy read. Absent entries
+    /// (the initial stat failed) mean there's nothing to compare against,
+    /// not that drift is impossible.
+    source_baseline_mtime: HashMap<usize, std::time::SystemTime>,
+}
+
+/// The file's current modification time, or `None` if it can't be stat'd
+/// (missing, permission error) — treated as "no signal" rather than an
+/// error, matching how deleted/unreadable files are already handled
+/// elsewhere in source view.
+fn file_mtime(working_dir: &str, path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(Path::new(working_dir).join(path)).ok()?.modified().ok()
 }
 
 /// One file's source view: its highlighted rows and how many lines it has
@@ -741,12 +761,16 @@ impl<'a> App<'a> {
     fn new(request: &'a ReviewRequest, model: &'a Result<DiffModel>) -> Self {
         let mut row_cache = HashMap::new();
         let mut pan_limit = HashMap::new();
+        let mut source_baseline_mtime = HashMap::new();
         if let Ok(m) = model {
             let hl = highlighter();
             for (i, file) in m.files.iter().enumerate() {
                 let rows = highlight_file_rows(hl, file);
                 pan_limit.insert((i, ViewMode::Diff), pan_cap_for_rows(&rows));
                 row_cache.insert(i, rows);
+                if let Some(mtime) = file_mtime(&request.working_dir, &file.path) {
+                    source_baseline_mtime.insert(i, mtime);
+                }
             }
         }
         App {
@@ -764,6 +788,7 @@ impl<'a> App<'a> {
             view: ViewMode::Diff,
             source_cache: HashMap::new(),
             pan_limit,
+            source_baseline_mtime,
         }
     }
 
@@ -880,6 +905,8 @@ impl<'a> App<'a> {
             Err("file deleted".to_string())
         } else if binary {
             Err("binary file".to_string())
+        } else if self.drifted(idx, &path) {
+            Err("file changed since the review started".to_string())
         } else {
             match load_source(&self.request.working_dir, &path) {
                 Ok(lines) => {
@@ -891,6 +918,17 @@ impl<'a> App<'a> {
             }
         };
         self.source_cache.insert(idx, entry);
+    }
+
+    /// Whether file `idx`'s on-disk mtime no longer matches the baseline
+    /// captured in `new` when the review began. `false` when there's no
+    /// baseline to compare against (the initial stat failed) — that's a
+    /// separate, unrelated failure mode, not evidence of drift.
+    fn drifted(&self, idx: usize, path: &str) -> bool {
+        match self.source_baseline_mtime.get(&idx) {
+            Some(&baseline) => file_mtime(&self.request.working_dir, path) != Some(baseline),
+            None => false,
+        }
     }
 
     /// After the navigator selection changes: reset the pane and, in source
@@ -4277,6 +4315,60 @@ mod tests {
         }
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
         assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn source_view_refuses_a_file_that_changed_since_the_review_started() {
+        // Regression (Codex P1): the diff is a snapshot of the moment the
+        // review began, but source view reads the worktree fresh the first
+        // time `t` is pressed — which can be much later. If something
+        // touches the file in between, the two views could silently show
+        // different revisions, and a source-view annotation's line numbers
+        // would no longer describe the diff the agent receives.
+        let dir = std::env::temp_dir()
+            .join(format!("herdr-annotator-source-drift-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let full = dir.join("a.txt");
+        std::fs::write(&full, "original\n").expect("write source");
+
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: dir.to_string_lossy().into_owned(),
+            baseline: None,
+            note: None,
+        };
+        let mut file = sample_file();
+        file.path = "a.txt".to_string();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        // `App::new` stats the file NOW — this is the review-start baseline.
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+
+        // Simulate something touching the file after the review started:
+        // set its mtime an hour back, deterministically (no reliance on
+        // filesystem mtime resolution or wall-clock sleeps).
+        let file = std::fs::OpenOptions::new().write(true).open(&full).expect("reopen");
+        let drifted = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        file.set_modified(drifted).expect("backdate mtime");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert!(app.view == ViewMode::Source);
+        let text: String = app.view_lines()[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("changed"), "expected a drift placeholder, got {text:?}");
+
+        // An UNTOUCHED file still loads normally — this isn't refusing
+        // every file, only ones that actually drifted.
+        std::fs::write(dir.join("b.txt"), "steady\n").expect("write steady file");
+        let mut steady_file = sample_file();
+        steady_file.path = "b.txt".to_string();
+        let model2: Result<DiffModel> = Ok(DiffModel { files: vec![steady_file] });
+        let mut app2 = App::new(&request, &model2);
+        app2.focus = Focus::Diff;
+        app2.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert_eq!(app2.source_line_count(), 1, "an untouched file must still load");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
