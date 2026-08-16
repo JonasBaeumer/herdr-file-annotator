@@ -823,6 +823,18 @@ impl<'a> App<'a> {
         None
     }
 
+    /// Index into `pending` of the annotation currently being edited, if
+    /// any — the single source of truth for "which saved annotation's rows
+    /// get replaced by the editing box at the same anchor". `disp_map` and
+    /// `draw_diff` both need this to agree, or the rendered rows and the
+    /// scroll/mouse display map disagree with each other.
+    fn editing_annotation_idx(&self) -> Option<usize> {
+        match &self.input {
+            Some(InputMode::Comment { editing: Some(idx), .. }) => Some(*idx),
+            _ => None,
+        }
+    }
+
     /// The display map for the currently selected file: saved annotations
     /// plus the editing box while the comment prompt is open (its rows
     /// occupy display space too, so scrolling must account for them).
@@ -832,10 +844,7 @@ impl<'a> App<'a> {
     fn disp_map(&self, inner_width: usize) -> DispMap {
         // While editing an existing annotation, its saved rows are replaced
         // by the box at the same anchor — count the box, not the saved text.
-        let editing_idx = match &self.input {
-            Some(InputMode::Comment { editing: Some(idx), .. }) => Some(*idx),
-            _ => None,
-        };
+        let editing_idx = self.editing_annotation_idx();
 
         let mut ends: Vec<usize> = Vec::new();
         for (i, p) in self.pending.iter().enumerate().filter(|(_, p)| p.file_idx == self.nav.selected)
@@ -1469,10 +1478,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
     // is woven at its anchor instead of a plain preview; when editing an
     // existing annotation, that annotation's saved rows are skipped (the box
     // replaces them at the same anchor) so they don't render stale text.
-    let editing_idx = match &app.input {
-        Some(InputMode::Comment { editing: Some(idx), .. }) => Some(*idx),
-        _ => None,
-    };
+    let editing_idx = app.editing_annotation_idx();
     let mut groups: std::collections::BTreeMap<usize, Vec<Line>> = std::collections::BTreeMap::new();
     for (i, p) in
         app.pending.iter().enumerate().filter(|(_, p)| p.file_idx == app.nav.selected)
@@ -3275,6 +3281,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn editing_annotation_idx_matches_the_comment_input_mode() {
+        // Regression (Codex P1): "which pending annotation is being edited"
+        // was implemented twice, verbatim, in App::disp_map and draw_diff —
+        // centralized into one method so the rendered rows and the
+        // scroll/mouse display map can't drift apart from each other.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+
+        assert_eq!(app.editing_annotation_idx(), None, "no input open: nothing is being edited");
+
+        app.input = Some(InputMode::Comment {
+            buf: String::new(),
+            tag: None,
+            editing: None,
+            row_start: 0,
+            row_end: 0,
+        });
+        assert_eq!(
+            app.editing_annotation_idx(),
+            None,
+            "a fresh comment (editing: None) isn't editing a saved annotation"
+        );
+
+        app.input = Some(InputMode::Comment {
+            buf: String::new(),
+            tag: None,
+            editing: Some(2),
+            row_start: 0,
+            row_end: 0,
+        });
+        assert_eq!(app.editing_annotation_idx(), Some(2));
+
+        app.input = Some(InputMode::Summary { buf: String::new() });
+        assert_eq!(app.editing_annotation_idx(), None, "the summary bar is a different input mode entirely");
     }
 
     #[test]
