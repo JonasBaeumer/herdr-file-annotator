@@ -3153,8 +3153,6 @@ mod tests {
         assert!(outcome.annotations.is_empty());
     }
 
-    // --- editing box ----------------------------------------------------
-
     #[test]
     fn editing_box_height_matches_woven_row_count() {
         let long = "a fairly long note that will wrap across several lines at a narrow width";
