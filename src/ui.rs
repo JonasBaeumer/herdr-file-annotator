@@ -101,7 +101,12 @@ pub fn run(request: &ReviewRequest, model: Result<DiffModel>) -> Result<Outcome>
                 let size = terminal.size()?;
                 app.handle_mouse(mouse, size);
             }
-            // Resize, release events, etc: just redraw next iteration.
+            Event::Resize(width, height) => {
+                // Same reflow need as the navigator toggle: a smaller
+                // viewport must not strand the cursor off-screen.
+                app.ensure_cursor_visible(Size { width, height });
+            }
+            // Release events, etc: just redraw next iteration.
             _ => {}
         }
     }
@@ -727,6 +732,10 @@ impl<'a> App<'a> {
                 if !self.show_navigator && self.focus == Focus::Navigator {
                     self.focus = Focus::Diff;
                 }
+                // The toggle changes the diff viewport (height in stacked
+                // layout, wrap width everywhere): reflow immediately or the
+                // cursor can sit outside the new viewport until the next key.
+                self.ensure_cursor_visible(term_size);
                 return None;
             }
             KeyCode::Char('z') => {
@@ -1859,6 +1868,61 @@ mod tests {
         pan_and_clip(&mut panned, 16, 100, 2);
         assert_eq!(panned.spans[0].content.as_ref(), "        2 ");
         assert_eq!(panned.spans[1].content.as_ref(), "+");
+    }
+
+    #[test]
+    fn navigator_toggle_reflows_the_viewport() {
+        // Regression (Codex P1): 'b' early-returned without
+        // ensure_cursor_visible, so re-showing the navigator in a stacked
+        // (narrow) layout could shrink the diff viewport and strand the
+        // cursor off-screen until the next navigation key.
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let rows: Vec<DiffLine> =
+            (1..=40).map(|i| line(Origin::Add, None, Some(i), "x")).collect();
+        let file = FileDiff {
+            path: "a.py".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 40,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,40 @@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 40,
+                lines: rows,
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.show_navigator = false;
+
+        // 40 cols → stacked layout once the navigator returns.
+        let term = Size { width: 40, height: 24 };
+        app.diff.cursor = 30;
+        app.ensure_cursor_visible(term);
+
+        let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(app.handle_key(key, term).is_none());
+        assert!(app.show_navigator);
+
+        let map = app.disp_map(diff_inner_width(term, true));
+        let viewport = diff_viewport_rows(term, true);
+        let cursor_disp = map.disp(app.diff.cursor);
+        assert!(
+            cursor_disp >= app.diff.scroll && cursor_disp < app.diff.scroll + viewport,
+            "cursor display row {cursor_disp} outside viewport [{}, {})",
+            app.diff.scroll,
+            app.diff.scroll + viewport
+        );
     }
 
     #[test]
