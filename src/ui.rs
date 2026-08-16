@@ -1582,8 +1582,22 @@ fn summary_footer_text(buf: &str, width: usize) -> String {
     }
 }
 
+/// Shared by every footer state: the verdict keys that always apply.
+const GLOBAL_HINTS: &str = "a approve \u{b7} r request changes \u{b7} q cancel";
+
+/// The diff-focus footer's key hints, for the current position and view.
+/// The `n/p hunk` hint is diff-view-only: `handle_nav_key` makes `n`/`p`
+/// no-ops in source view (hunk jumps don't mean anything there), so
+/// advertising them in a mode where they do nothing would be stale,
+/// misleading help text — precisely in the newly added mode.
+fn diff_focus_footer(view: ViewMode, pos: &str) -> String {
+    let hunk_hint = if view == ViewMode::Diff { "n/p hunk \u{b7} " } else { "" };
+    format!(
+        " {pos} \u{b7} j/k move \u{b7} \u{2190}/\u{2192} pan \u{b7} d/u half page \u{b7} {hunk_hint}t view \u{b7} b files \u{b7} z zoom \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} h/tab navigator \u{b7} {GLOBAL_HINTS}"
+    )
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    const GLOBAL_HINTS: &str = "a approve \u{b7} r request changes \u{b7} q cancel";
     let text = match &app.input {
         // Input bars keep the END of a long buffer visible (that's where the
         // caret is) by trimming from the left with an ellipsis.
@@ -1601,9 +1615,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 // Position first: when the footer clips in a narrow pane,
                 // "where am I" survives and only the key hints get cut.
                 let pos = app.cursor_position().unwrap_or_default();
-                format!(
-                    " {pos} \u{b7} j/k move \u{b7} \u{2190}/\u{2192} pan \u{b7} d/u half page \u{b7} n/p hunk \u{b7} t view \u{b7} b files \u{b7} z zoom \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} h/tab navigator \u{b7} {GLOBAL_HINTS}"
-                )
+                diff_focus_footer(app.view, &pos)
             }
         },
     };
@@ -2585,6 +2597,25 @@ mod tests {
         assert_eq!(tail_fit("short", 10), "short");
         assert_eq!(tail_fit("abcdefghij", 6), "\u{2026}fghij");
         assert!(tail_fit("abcdefghij", 6).chars().count() <= 6);
+    }
+
+    #[test]
+    fn diff_focus_footer_hides_the_hunk_hint_outside_diff_view() {
+        // Regression (Codex P1): the footer kept advertising `n/p hunk` in
+        // source view even though handle_nav_key makes both keys no-ops
+        // there (hunk jumps only mean something in the diff) — stale,
+        // misleading key help in the newly added mode.
+        let diff = diff_focus_footer(ViewMode::Diff, "a.txt:1");
+        assert!(diff.contains("n/p hunk"), "diff view must still advertise the hunk hint");
+
+        let source = diff_focus_footer(ViewMode::Source, "a.txt:1");
+        assert!(!source.contains("n/p hunk"), "source view must not advertise a disabled shortcut");
+
+        // Everything else stays present in both views.
+        for hint in ["j/k move", "t view", "v select", "c comment", "x delete", "a approve"] {
+            assert!(diff.contains(hint), "diff footer missing {hint:?}");
+            assert!(source.contains(hint), "source footer missing {hint:?}");
+        }
     }
 
     #[test]
