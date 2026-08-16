@@ -1642,10 +1642,14 @@ fn editing_box_lines(buf: &str, tag: Option<Tag>, inner_width: usize) -> Vec<Lin
     let last = chunks.len() - 1;
     for (i, chunk) in chunks.into_iter().enumerate() {
         let mut middle = chunk;
-        let mut used = middle.chars().count();
+        // Display columns, not chars: a chunk of wide (e.g. CJK) glyphes has
+        // fewer chars than the columns it renders as, so char-counting here
+        // under-pads and pushes the closing border past the box's actual
+        // width (Codex P0).
+        let mut used = str_cols(&middle);
         if i == last {
             middle.push('\u{258f}'); // typing caret
-            used += 1;
+            used += str_cols("\u{258f}");
         }
         if used < middle_width {
             middle.push_str(&" ".repeat(middle_width - used));
@@ -1713,38 +1717,61 @@ fn bottom_rule_line(tag: Option<Tag>, width: usize) -> Line<'static> {
     Line::from(Span::styled(SEP.to_string().repeat(width), rule_style))
 }
 
-/// Greedy word wrap on character counts; a word longer than the width is
-/// hard-broken. Always yields at least one (possibly empty) chunk so an
-/// empty live preview still renders its row.
+/// Greedy word wrap on display columns (`str_cols`, ratatui's own model) —
+/// the same width unit `pan_and_clip` uses, so a row of CJK text wraps at
+/// the columns it actually renders as rather than at half that many chars.
+/// A word longer than the width is hard-broken cluster-atomic (UAX #29 via
+/// `graphemes(true)`): a boundary never splits a cluster, so a straddling
+/// wide glyph moves to the next row whole rather than rendering half of it.
+/// Always yields at least one (possibly empty) chunk so an empty live
+/// preview still renders its row.
 fn wrap_comment(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut chunks = Vec::new();
     let mut current = String::new();
-    let mut current_len = 0usize;
+    let mut current_cols = 0usize;
     for word in text.split(' ') {
-        let mut word: Vec<char> = word.chars().collect();
+        let mut word: Vec<&str> = word.graphemes(true).collect();
         loop {
-            let sep = if current_len == 0 { 0 } else { 1 };
-            if current_len + sep + word.len() <= width {
+            let sep = if current_cols == 0 { 0 } else { 1 };
+            let word_cols: usize = word.iter().map(|g| str_cols(g)).sum();
+            if current_cols + sep + word_cols <= width {
                 if sep == 1 {
                     current.push(' ');
                 }
-                current.extend(word.iter());
-                current_len += sep + word.len();
+                current.extend(word.iter().copied());
+                current_cols += sep + word_cols;
                 break;
             }
-            if word.len() > width {
-                // Hard-break an overlong word at whatever space remains.
-                let take = (width - current_len - sep).max(1).min(word.len());
-                if current_len == 0 {
-                    current.extend(word.drain(..take.min(width)));
+            if word_cols > width {
+                // Hard-break an overlong word at whatever space remains,
+                // taking whole clusters until the next one wouldn't fit (but
+                // always at least one, so a single cluster wider than the
+                // whole box still makes forward progress).
+                if current_cols == 0 {
+                    let avail = width.saturating_sub(sep).max(1);
+                    let mut take_cols = 0usize;
+                    let mut take = 0usize;
+                    for g in &word {
+                        let g_cols = str_cols(g).max(1);
+                        if take > 0 && take_cols + g_cols > avail {
+                            break;
+                        }
+                        take_cols += g_cols;
+                        take += 1;
+                        if take_cols >= avail {
+                            break;
+                        }
+                    }
+                    let taken: String = word.drain(..take).collect();
+                    current.push_str(&taken);
                     chunks.push(std::mem::take(&mut current));
-                    current_len = 0;
+                    current_cols = 0;
                     continue;
                 }
             }
             chunks.push(std::mem::take(&mut current));
-            current_len = 0;
+            current_cols = 0;
         }
     }
     chunks.push(current);
@@ -3146,6 +3173,22 @@ mod tests {
             // Always at least the two rules plus one content row (even for
             // an empty buffer, which still renders a caret-only row).
             assert!(height >= 3);
+        }
+    }
+
+    #[test]
+    fn editing_box_pads_by_display_columns_not_chars_for_wide_glyphs() {
+        // Regression (Codex P0): content-row padding measured
+        // `chars().count()` instead of display columns, so a row of CJK
+        // text (2 display columns per glyph, 1 char) was padded as if every
+        // glyph were 1 column wide — undercounting the row's real rendered
+        // width and pushing the closing `┆` border past the box's actual
+        // width despite the documented never-overflow invariant.
+        let cjk: String = "\u{56fd}".repeat(20); // 20x '国', 2 display columns each
+        let width = 40;
+        for (i, line) in editing_box_lines(&cjk, Some(Tag::Fix), width).into_iter().enumerate() {
+            let cols: usize = line.spans.iter().map(|s| str_cols(&s.content)).sum();
+            assert_eq!(cols, width, "row {i} must render at exactly the box width, got {cols}");
         }
     }
 
