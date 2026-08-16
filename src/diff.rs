@@ -5,6 +5,7 @@
 //! lines 112–118 of src/portal.rs") can be derived directly from the cursor
 //! position without re-parsing anything.
 
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -152,6 +153,20 @@ pub fn load(working_dir: &str, baseline: Option<&str>) -> Result<DiffModel> {
     }
 
     Ok(DiffModel { files })
+}
+
+/// Read a file's post-change contents as lines, for the UI's source view.
+///
+/// No git plumbing needed regardless of baseline: the worktree IS the new
+/// side of the diff, so the file on disk is exactly what the annotations'
+/// `Side::New` line numbers refer to. Binary files (`read_to_string` rejects
+/// non-UTF-8), deleted files, and unreadable ones come back as `Err`; the UI
+/// turns that into a placeholder row rather than failing the review.
+pub fn load_source(working_dir: &str, path: &str) -> Result<Vec<String>> {
+    let full = Path::new(working_dir).join(path);
+    let text = std::fs::read_to_string(&full)
+        .with_context(|| format!("reading {}", full.display()))?;
+    Ok(text.lines().map(|line| line.to_string()).collect())
 }
 
 /// Parse `git diff --no-color` unified output into file diffs.

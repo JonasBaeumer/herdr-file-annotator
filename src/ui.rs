@@ -33,7 +33,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
-use crate::diff::{DiffLine, DiffModel, FileDiff, FileStatus, Origin};
+use crate::diff::{load_source, DiffLine, DiffModel, FileDiff, FileStatus, Origin};
 use crate::protocol::{Annotation, LineRange, ReviewRequest, Side, Verdict};
 
 /// What the reviewer decided, handed back to `pane.rs`.
@@ -130,6 +130,16 @@ impl Drop for TermGuard {
 enum Focus {
     Navigator,
     Diff,
+}
+
+/// What the right-hand pane renders: the unified diff, or the selected
+/// file's post-change source. Global rather than per-file — `t` switches the
+/// whole review's reading mode, and carrying it per file would make the same
+/// key mean different things on different rows of the navigator.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Diff,
+    Source,
 }
 
 /// File-list selection, decoupled from rendering so it's plain and testable.
@@ -398,13 +408,16 @@ enum InputMode {
 }
 
 /// An annotation the reviewer has left but not yet submitted with a verdict.
-/// `row_start`/`row_end` are flattened-row indices (inclusive) into
-/// `files[file_idx]`'s rows — used for gutter markers and for finding the
-/// annotation under the cursor to edit or delete.
+///
+/// The protocol annotation's file/line range is the ONLY anchor stored: it is
+/// what crosses the wire, and it is view-independent. Display anchors (which
+/// rows to dot, where to weave the note) are derived per view on demand by
+/// `App::pending_anchor`, so one annotation lands in the right place in both
+/// the diff and the source view — and an annotation with no place in the
+/// current view (an old-side one in source view, say) simply doesn't draw,
+/// while still counting and still going back to the agent.
 struct PendingAnnotation {
     file_idx: usize,
-    row_start: usize,
-    row_end: usize,
     annotation: Annotation,
 }
 
@@ -454,6 +467,84 @@ fn resolve_annotation(
         tag: tag.map(|t| t.label().to_string()),
         comment,
     })
+}
+
+/// The inverse of `resolve_annotation` for the DIFF view: which flattened
+/// rows an annotation covers. A row counts when it's a `DiffRow::Line` whose
+/// number on the annotation's own side falls inside its line range; the
+/// result is the (min, max) of those row indices. `None` means the
+/// annotation has no place in this view at all — its lines aren't part of
+/// any hunk (context far from the change, or the wrong side of a rename).
+fn annotation_rows(annotation: &Annotation, rows: &[DiffRow]) -> Option<(usize, usize)> {
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+    for (idx, row) in rows.iter().enumerate() {
+        let DiffRow::Line(line) = row else { continue };
+        let side_no = match annotation.side {
+            Side::New => line.new_no,
+            Side::Old => line.old_no,
+        };
+        let Some(no) = side_no else { continue };
+        if no >= annotation.lines.start && no <= annotation.lines.end {
+            first.get_or_insert(idx);
+            last = Some(idx);
+        }
+    }
+    Some((first?, last?))
+}
+
+/// The same mapping for the SOURCE view, where it's pure arithmetic: row `i`
+/// is line `i + 1` of the file on disk. Old-side annotations have no place
+/// here (the source IS the new side), and neither does anything at all when
+/// the file has no source view (`line_count == 0`). Ranges reaching past the
+/// end of the file clamp to its last row rather than vanishing.
+fn source_annotation_rows(annotation: &Annotation, line_count: usize) -> Option<(usize, usize)> {
+    if annotation.side != Side::New || line_count == 0 {
+        return None;
+    }
+    let last = line_count - 1;
+    let start = (annotation.lines.start.max(1) as usize - 1).min(last);
+    let end = (annotation.lines.end.max(1) as usize - 1).min(last).max(start);
+    Some((start, end))
+}
+
+/// Per-view context for turning annotations into display anchors: the
+/// flattened rows in diff view, the source file's line count in source view.
+/// Built once per pass so a file full of annotations doesn't re-flatten the
+/// diff once per annotation.
+enum ViewAnchors<'a> {
+    Diff(Vec<DiffRow<'a>>),
+    Source(usize),
+}
+
+impl ViewAnchors<'_> {
+    fn anchor(&self, annotation: &Annotation) -> Option<(usize, usize)> {
+        match self {
+            ViewAnchors::Diff(rows) => annotation_rows(annotation, rows),
+            ViewAnchors::Source(line_count) => source_annotation_rows(annotation, *line_count),
+        }
+    }
+}
+
+/// Cursor remap, diff → source: the source row showing the same line. Rows
+/// with no new-side line (removed lines, hunk headers, placeholders) have no
+/// counterpart, so the cursor goes to the top of the file.
+fn diff_row_to_source_row(rows: &[DiffRow], cursor: usize) -> usize {
+    match rows.get(cursor) {
+        Some(DiffRow::Line(line)) => {
+            line.new_no.map(|n| n.saturating_sub(1) as usize).unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+/// Cursor remap, source → diff: the first diff row showing that line. A line
+/// outside every hunk isn't in the diff at all, so the cursor goes to the top.
+fn source_row_to_diff_row(rows: &[DiffRow], cursor: usize) -> usize {
+    let target = cursor as u32 + 1;
+    rows.iter()
+        .position(|row| matches!(row, DiffRow::Line(line) if line.new_no == Some(target)))
+        .unwrap_or(0)
 }
 
 /// Visible diff rows, derived from the terminal size via the SAME split
@@ -558,6 +649,24 @@ struct App<'a> {
     /// on demand. Never invalidated — the model is immutable for the life
     /// of the UI.
     row_cache: HashMap<usize, Vec<Line<'static>>>,
+    /// Diff or source in the right-hand pane; `t` toggles.
+    view: ViewMode,
+    /// Highlighted source rows per file, keyed by index into `model.files`.
+    /// `Err(reason)` for files that have no source view (deleted, binary,
+    /// unreadable) — the reason is what the placeholder row shows. Unlike
+    /// `row_cache` this is filled LAZILY, from key/mouse handlers only
+    /// (`ensure_source_loaded`): reading every file off disk up front would
+    /// be wasted I/O for a mode most reviews never enter, and `draw` borrows
+    /// `App` immutably so it can never populate a cache itself.
+    source_cache: HashMap<usize, Result<SourceFile, String>>,
+}
+
+/// One file's source view: its highlighted rows and how many lines it has
+/// (the same number, kept alongside so row-count queries don't depend on the
+/// rendered rows).
+struct SourceFile {
+    lines: Vec<Line<'static>>,
+    count: usize,
 }
 
 impl<'a> App<'a> {
@@ -581,6 +690,8 @@ impl<'a> App<'a> {
             show_navigator: true,
             pending: Vec::new(),
             row_cache,
+            view: ViewMode::Diff,
+            source_cache: HashMap::new(),
         }
     }
 
@@ -599,9 +710,171 @@ impl<'a> App<'a> {
         self.selected_file().map(flatten_rows).unwrap_or_default()
     }
 
+    /// Rows the pane currently addresses — what the cursor moves over and
+    /// what mouse hits clamp to. Diff rows or source lines depending on the
+    /// view; the `(no source view: …)` placeholder counts as one row.
+    fn view_row_count(&self) -> usize {
+        match self.view {
+            ViewMode::Diff => self.diff_rows().len(),
+            ViewMode::Source => self.source_row_count(),
+        }
+    }
+
+    /// Lines in the selected file's source, or 0 when it has no source view
+    /// (no file selected, deleted, binary, unreadable, or not yet loaded) —
+    /// which is exactly the condition that makes source annotations inert.
+    fn source_line_count(&self) -> usize {
+        match self.source_cache.get(&self.nav.selected) {
+            Some(Ok(source)) => source.count,
+            _ => 0,
+        }
+    }
+
+    fn source_row_count(&self) -> usize {
+        if self.selected_file().is_none() {
+            return 0;
+        }
+        match self.source_cache.get(&self.nav.selected) {
+            Some(Ok(source)) => source.count,
+            // No source view: the placeholder row still occupies one row.
+            _ => 1,
+        }
+    }
+
+    /// The pane's display rows for the current view, owned and ready to
+    /// patch (gutter dots, selection, cursor) before rendering.
+    fn view_lines(&self) -> Vec<Line<'static>> {
+        match self.view {
+            ViewMode::Diff => self.row_cache.get(&self.nav.selected).cloned().unwrap_or_default(),
+            ViewMode::Source => match self.source_cache.get(&self.nav.selected) {
+                Some(Ok(source)) => source.lines.clone(),
+                Some(Err(reason)) => vec![source_placeholder_line(reason)],
+                // Only reachable if a draw beats the handler that loads;
+                // still renders something rather than an empty pane.
+                None => vec![source_placeholder_line("not loaded")],
+            },
+        }
+    }
+
+    /// Context for resolving annotations to display rows in the current view.
+    fn view_anchors(&self) -> ViewAnchors<'_> {
+        match self.view {
+            ViewMode::Diff => ViewAnchors::Diff(self.diff_rows()),
+            ViewMode::Source => ViewAnchors::Source(self.source_line_count()),
+        }
+    }
+
+    /// Display rows `pending[idx]` covers in the CURRENT view, or `None` when
+    /// it belongs to another file or isn't representable here. The single
+    /// place the view dispatch happens: gutter dots, note weaving, the
+    /// display map, edit-under-cursor and delete all go through it.
+    fn pending_anchor(&self, idx: usize) -> Option<(usize, usize)> {
+        let pending = self.pending.get(idx)?;
+        if pending.file_idx != self.nav.selected {
+            return None;
+        }
+        self.view_anchors().anchor(&pending.annotation)
+    }
+
+    /// Index of the pending annotation covering `row` in the current view.
+    fn pending_at_row(&self, row: usize) -> Option<usize> {
+        let anchors = self.view_anchors();
+        self.pending.iter().position(|p| {
+            p.file_idx == self.nav.selected
+                && matches!(anchors.anchor(&p.annotation), Some((start, end)) if start <= row && row <= end)
+        })
+    }
+
     /// All pending annotations, in creation order, cloned for handoff.
     fn pending_annotations(&self) -> Vec<Annotation> {
         self.pending.iter().map(|p| p.annotation.clone()).collect()
+    }
+
+    /// Load (once) the selected file's source rows into the cache. Called
+    /// from handlers only — never from `draw`.
+    fn ensure_source_loaded(&mut self) {
+        let idx = self.nav.selected;
+        if self.source_cache.contains_key(&idx) {
+            return;
+        }
+        // Copied out so the immutable borrow of the model ends before the
+        // cache insert below.
+        let Some((path, status, binary)) =
+            self.files().get(idx).map(|f| (f.path.clone(), f.status, f.binary))
+        else {
+            return;
+        };
+        let entry = if status == FileStatus::Deleted {
+            Err("file deleted".to_string())
+        } else if binary {
+            Err("binary file".to_string())
+        } else {
+            match load_source(&self.request.working_dir, &path) {
+                Ok(lines) => Ok(SourceFile {
+                    lines: highlight_source_rows(highlighter(), &path, &lines),
+                    count: lines.len(),
+                }),
+                Err(err) => Err(err.root_cause().to_string()),
+            }
+        };
+        self.source_cache.insert(idx, entry);
+    }
+
+    /// After the navigator selection changes: reset the pane and, in source
+    /// view, make sure the newly selected file's source is in the cache.
+    fn file_changed(&mut self) {
+        self.diff.reset();
+        if self.view == ViewMode::Source {
+            self.ensure_source_loaded();
+        }
+    }
+
+    /// `t` in diff focus: switch views, carrying the cursor to the row
+    /// showing the same line of code, and starting the new view unpanned.
+    fn toggle_view(&mut self, term_size: Size) {
+        match self.view {
+            ViewMode::Diff => {
+                let target = diff_row_to_source_row(&self.diff_rows(), self.diff.cursor);
+                self.view = ViewMode::Source;
+                self.ensure_source_loaded();
+                self.diff.cursor = target.min(self.source_row_count().saturating_sub(1));
+            }
+            ViewMode::Source => {
+                self.view = ViewMode::Diff;
+                self.diff.cursor = source_row_to_diff_row(&self.diff_rows(), self.diff.cursor);
+            }
+        }
+        // A live `v` selection is anchored in the OLD view's row space, so
+        // it would paint an unrelated range here: drop it with the view.
+        self.visual_anchor = None;
+        self.diff.hscroll = 0;
+        self.diff.scroll = 0;
+        self.ensure_cursor_visible(term_size);
+    }
+
+    /// Source-view counterpart to `resolve_annotation`: no row scan needed,
+    /// since source row `i` simply IS new-side line `i + 1`.
+    fn resolve_source_annotation(
+        &self,
+        row_start: usize,
+        row_end: usize,
+        tag: Option<Tag>,
+        comment: String,
+    ) -> Option<Annotation> {
+        let file = self.selected_file()?;
+        let count = self.source_line_count();
+        if count == 0 {
+            return None;
+        }
+        let start = row_start.min(count - 1);
+        let end = row_end.min(count - 1).max(start);
+        Some(Annotation {
+            file: file.path.clone(),
+            lines: LineRange { start: start as u32 + 1, end: end as u32 + 1 },
+            side: Side::New,
+            tag: tag.map(|t| t.label().to_string()),
+            comment,
+        })
     }
 
     /// Handle one key event. Returns `Some(outcome)` once the reviewer has
@@ -651,20 +924,24 @@ impl<'a> App<'a> {
                     KeyCode::Enter => {
                         let text = buf.trim().to_string();
                         if !text.is_empty() {
-                            let resolved = self
-                                .files()
-                                .get(self.nav.selected)
-                                .map(|file| (file, flatten_rows(file)))
-                                .and_then(|(file, rows)| {
-                                    resolve_annotation(file, &rows, *row_start, *row_end, *tag, text)
-                                });
+                            // The comment's rows are rows of the CURRENT
+                            // view, so each view resolves them its own way.
+                            let resolved = match self.view {
+                                ViewMode::Diff => self
+                                    .files()
+                                    .get(self.nav.selected)
+                                    .map(|file| (file, flatten_rows(file)))
+                                    .and_then(|(file, rows)| {
+                                        resolve_annotation(
+                                            file, &rows, *row_start, *row_end, *tag, text,
+                                        )
+                                    }),
+                                ViewMode::Source => self
+                                    .resolve_source_annotation(*row_start, *row_end, *tag, text),
+                            };
                             if let Some(annotation) = resolved {
-                                let item = PendingAnnotation {
-                                    file_idx: self.nav.selected,
-                                    row_start: *row_start,
-                                    row_end: *row_end,
-                                    annotation,
-                                };
+                                let item =
+                                    PendingAnnotation { file_idx: self.nav.selected, annotation };
                                 match *editing {
                                     Some(idx) => self.pending[idx] = item,
                                     None => self.pending.push(item),
@@ -757,14 +1034,18 @@ impl<'a> App<'a> {
             _ => None,
         };
 
+        let anchors = self.view_anchors();
         let mut ends: Vec<usize> = Vec::new();
         for (i, p) in self.pending.iter().enumerate().filter(|(_, p)| p.file_idx == self.nav.selected)
         {
             if Some(i) == editing_idx {
                 continue;
             }
+            // Annotations with no anchor in this view aren't drawn, so they
+            // occupy no display rows either.
+            let Some((_, row_end)) = anchors.anchor(&p.annotation) else { continue };
             let h = comment_height(p.annotation.tag.as_deref(), &p.annotation.comment, inner_width);
-            ends.extend(std::iter::repeat(p.row_end).take(h));
+            ends.extend(std::iter::repeat(row_end).take(h));
         }
         if let Some(InputMode::Comment { buf, row_end, .. }) = &self.input {
             // Both a fresh comment and an edit weave the box (new AND edit).
@@ -808,7 +1089,7 @@ impl<'a> App<'a> {
                         self.nav.up();
                     }
                     if self.nav.selected != before {
-                        self.diff.reset();
+                        self.file_changed();
                     }
                 } else if in_diff {
                     self.wheel_diff(down, term_size);
@@ -820,10 +1101,10 @@ impl<'a> App<'a> {
                         self.focus = Focus::Navigator;
                         if idx != self.nav.selected {
                             self.nav.selected = idx;
-                            self.diff.reset();
+                            self.file_changed();
                         }
                     }
-                } else if in_diff && !self.diff_rows().is_empty() {
+                } else if in_diff && self.view_row_count() > 0 {
                     self.focus = Focus::Diff;
                     // A fresh click always starts over: cursor moves, any
                     // keyboard/mouse selection is discarded, and the pressed
@@ -836,7 +1117,7 @@ impl<'a> App<'a> {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some(origin) = self.drag_origin {
-                    if self.diff_rows().is_empty() {
+                    if self.view_row_count() == 0 {
                         return;
                     }
                     let base = self.diff_base_at(mouse.row, diff_rect);
@@ -868,7 +1149,7 @@ impl<'a> App<'a> {
     /// only when it would leave the visible area (editor-style), so plain
     /// reading scrolls never disturb the cursor.
     fn wheel_diff(&mut self, down: bool, term_size: Size) {
-        let base_count = self.diff_rows().len();
+        let base_count = self.view_row_count();
         if base_count == 0 {
             return;
         }
@@ -908,7 +1189,7 @@ impl<'a> App<'a> {
     /// Base row under a mouse row in the diff pane; rows outside the inner
     /// area clamp to its edges so drags past the border keep selecting.
     fn diff_base_at(&self, mouse_row: u16, diff_rect: Rect) -> usize {
-        let base_count = self.diff_rows().len();
+        let base_count = self.view_row_count();
         let map = self.disp_map((diff_rect.width.saturating_sub(2)).max(1) as usize);
         let inner_y = diff_rect.y + 1;
         let inner_h = diff_rect.height.saturating_sub(2).max(1);
@@ -935,19 +1216,17 @@ impl<'a> App<'a> {
             return;
         }
 
-        let selected = self.nav.selected;
-        if let Some(idx) = self
-            .pending
-            .iter()
-            .position(|p| p.file_idx == selected && p.row_start <= cursor && cursor <= p.row_end)
-        {
+        if let Some(idx) = self.pending_at_row(cursor) {
+            // Reopen at the annotation's anchor in THIS view, not wherever
+            // it was first written.
+            let (row_start, row_end) = self.pending_anchor(idx).unwrap_or((cursor, cursor));
             let p = &self.pending[idx];
             self.input = Some(InputMode::Comment {
                 buf: p.annotation.comment.clone(),
                 tag: p.annotation.tag.as_deref().and_then(Tag::from_label),
                 editing: Some(idx),
-                row_start: p.row_start,
-                row_end: p.row_end,
+                row_start,
+                row_end,
             });
             return;
         }
@@ -964,13 +1243,7 @@ impl<'a> App<'a> {
     /// `x` in diff focus, input closed: delete the pending annotation
     /// covering the cursor row on the current file, if any.
     fn delete_pending_at_cursor(&mut self) {
-        let cursor = self.diff.cursor;
-        let selected = self.nav.selected;
-        if let Some(idx) = self
-            .pending
-            .iter()
-            .position(|p| p.file_idx == selected && p.row_start <= cursor && cursor <= p.row_end)
-        {
+        if let Some(idx) = self.pending_at_row(self.diff.cursor) {
             self.pending.remove(idx);
         }
     }
@@ -991,11 +1264,11 @@ impl<'a> App<'a> {
                     _ => {}
                 }
                 if self.nav.selected != before {
-                    self.diff.reset();
+                    self.file_changed();
                 }
             }
             Focus::Diff => {
-                let row_count = self.diff_rows().len();
+                let row_count = self.view_row_count();
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count),
                     KeyCode::Char('k') | KeyCode::Up => self.diff.up(),
@@ -1005,10 +1278,11 @@ impl<'a> App<'a> {
                     KeyCode::Char('u') | KeyCode::PageUp => {
                         self.diff.page_up(half_page(term_size, self.show_navigator))
                     }
-                    KeyCode::Char('n') => {
+                    // Hunk jumps only mean something in the diff view.
+                    KeyCode::Char('n') if self.view == ViewMode::Diff => {
                         self.diff.next_hunk(&hunk_row_indices(&self.diff_rows()))
                     }
-                    KeyCode::Char('p') => {
+                    KeyCode::Char('p') if self.view == ViewMode::Diff => {
                         self.diff.prev_hunk(&hunk_row_indices(&self.diff_rows()))
                     }
                     KeyCode::Char('g') => self.diff.top(),
@@ -1029,6 +1303,7 @@ impl<'a> App<'a> {
                     }
                     KeyCode::Char('c') => self.open_comment_input(),
                     KeyCode::Char('x') => self.delete_pending_at_cursor(),
+                    KeyCode::Char('t') => self.toggle_view(term_size),
                     _ => {}
                 }
             }
@@ -1040,6 +1315,15 @@ impl<'a> App<'a> {
     /// lines fall back to the old side, marked as such.
     fn cursor_position(&self) -> Option<String> {
         let file = self.selected_file()?;
+        if self.view == ViewMode::Source {
+            // Source rows ARE lines, so the position is exact — unless the
+            // file has no source view, where the single row is a placeholder.
+            return Some(if self.source_line_count() > 0 {
+                format!("{}:{}", file.path, self.diff.cursor + 1)
+            } else {
+                file.path.clone()
+            });
+        }
         let rows = self.diff_rows();
         match rows.get(self.diff.cursor)? {
             DiffRow::Line(line) => match (line.new_no, line.old_no) {
@@ -1123,7 +1407,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 // "where am I" survives and only the key hints get cut.
                 let pos = app.cursor_position().unwrap_or_default();
                 format!(
-                    " {pos} \u{b7} j/k move \u{b7} \u{2190}/\u{2192} pan \u{b7} d/u half page \u{b7} n/p hunk \u{b7} b files \u{b7} z zoom \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} h/tab navigator \u{b7} {GLOBAL_HINTS}"
+                    " {pos} \u{b7} j/k move \u{b7} \u{2190}/\u{2192} pan \u{b7} d/u half page \u{b7} n/p hunk \u{b7} t view \u{b7} b files \u{b7} z zoom \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} h/tab navigator \u{b7} {GLOBAL_HINTS}"
                 )
             }
         },
@@ -1236,7 +1520,10 @@ fn nav_item(file: &FileDiff) -> ListItem<'_> {
 }
 
 fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) {
-    let title = file.map(file_display_path).unwrap_or_else(|| "diff".to_string());
+    let mut title = file.map(file_display_path).unwrap_or_else(|| "diff".to_string());
+    if app.view == ViewMode::Source {
+        title.push_str(" [source]");
+    }
     let block = pane_block(title, app.focus == Focus::Diff);
 
     if file.is_none() {
@@ -1244,16 +1531,23 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
         return;
     }
 
-    // Pre-highlighted in `App::new`; drawing just clones the cached, owned
-    // lines rather than re-running syntect on every frame.
-    let mut lines: Vec<Line> = app.row_cache.get(&app.nav.selected).cloned().unwrap_or_default();
+    // Pre-highlighted (diff rows in `App::new`, source rows on first `t`);
+    // drawing just clones the cached, owned lines rather than re-running
+    // syntect on every frame.
+    let mut lines: Vec<Line> = app.view_lines();
+
+    // Where each annotation sits in THIS view; annotations with no anchor
+    // here (an old-side one in source view, or lines outside every hunk in
+    // diff view) draw nothing at all.
+    let anchors = app.view_anchors();
 
     // Gutter markers: one per row covered by a pending annotation on this
     // file, colored by tag. Overwrites the first character of the gutter
     // span in place so the column width doesn't shift.
     for pending in app.pending.iter().filter(|p| p.file_idx == app.nav.selected) {
+        let Some((row_start, row_end)) = anchors.anchor(&pending.annotation) else { continue };
         let color = tag_color(pending.annotation.tag.as_deref());
-        for row in pending.row_start..=pending.row_end {
+        for row in row_start..=row_end {
             if let Some(line) = lines.get_mut(row) {
                 if let Some(span) = line.spans.first_mut() {
                     let mut chars: Vec<char> = span.content.chars().collect();
@@ -1331,7 +1625,8 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
         if Some(i) == editing_idx {
             continue;
         }
-        groups.entry(p.row_end).or_default().extend(inline_comment_lines(
+        let Some((_, row_end)) = anchors.anchor(&p.annotation) else { continue };
+        groups.entry(row_end).or_default().extend(inline_comment_lines(
             p.annotation.tag.as_deref(),
             &p.annotation.comment,
             false,
@@ -1669,6 +1964,70 @@ fn highlight_file_rows(hl: &'static Highlighter, file: &FileDiff) -> Vec<Line<'s
         }
     }
     out
+}
+
+/// Width of the source view's line-number field. The diff gutter renders
+/// two 4-wide numbers, a separator and a trailing space, then a 1-column
+/// origin marker (11 columns before the code); the source view spends the
+/// same 11 on `{n:>8}` + two spaces + the one-space spacer span, so code
+/// starts in the same column whichever view you're in.
+const SOURCE_NUMBER_WIDTH: usize = 8;
+
+/// Highlight a whole source file into display-ready rows, one per line.
+///
+/// Unlike the diff (highlighted hunk by hunk, each hunk mixing two file
+/// states), the source view feeds one `HighlightLines` the entire file top
+/// to bottom — the highlighter sees exactly the text the parser expects, so
+/// multi-line strings, block comments and nested blocks all come out right.
+///
+/// Row layout is `[gutter, one-space spacer, content…]`, deliberately at
+/// least three spans: `draw_diff` pins the first two spans of any row with
+/// three or more when panning horizontally, which keeps the line numbers
+/// on screen exactly as the diff view's gutter+marker do. Blank lines get
+/// an empty content span so they hit that rule too.
+fn highlight_source_rows(
+    hl: &'static Highlighter,
+    path: &str,
+    lines: &[String],
+) -> Vec<Line<'static>> {
+    let syntax = syntax_for_path(hl, path);
+    let mut state = HighlightLines::new(syntax, &hl.theme);
+    let mut out = Vec::with_capacity(lines.len());
+
+    for (i, text) in lines.iter().enumerate() {
+        let mut spans = vec![
+            Span::styled(
+                format!("{:>width$}  ", i + 1, width = SOURCE_NUMBER_WIDTH),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(" "),
+        ];
+
+        // Same newline dance as the diff highlighter: syntect needs the
+        // trailing newline for state tracking, and it must not be rendered.
+        let mut fed = text.clone();
+        fed.push('\n');
+        let ranges = state.highlight_line(&fed, &hl.syntax_set).unwrap_or_default();
+        for (style, chunk) in ranges {
+            let chunk = chunk.strip_suffix('\n').unwrap_or(chunk);
+            if chunk.is_empty() {
+                continue;
+            }
+            let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+            spans.push(Span::styled(chunk.to_string(), Style::default().fg(fg)));
+        }
+        if spans.len() == 2 {
+            // Blank line: still needs a content span to keep the gutter pinned.
+            spans.push(Span::raw(""));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// The single row shown instead of source for files that have none.
+fn source_placeholder_line(reason: &str) -> Line<'static> {
+    Line::styled(format!("(no source view: {reason})"), Style::default().fg(Color::DarkGray))
 }
 
 /// Highlight one diff line's content and compose it with the existing
@@ -2254,8 +2613,6 @@ mod tests {
         let mut app = App::new(&request, &model);
         app.pending.push(PendingAnnotation {
             file_idx: 0,
-            row_start: 1,
-            row_end: 1,
             annotation: Annotation {
                 file: "src/lib.rs".to_string(),
                 lines: LineRange { start: 2, end: 2 },
@@ -2266,19 +2623,22 @@ mod tests {
         });
 
         let inner_width = 40;
+        // The annotation carries no display anchor of its own: new-side line
+        // 2 is the add row, flattened row 2 (header, context, add, …).
+        assert_eq!(app.pending_anchor(0), Some((2, 2)));
 
         // Not editing: disp_map counts the saved annotation's own rows.
         let saved_h = comment_height(Some("fix"), "a saved note", inner_width);
         let map = app.disp_map(inner_width);
-        assert_eq!(map.extra_at(1), saved_h);
+        assert_eq!(map.extra_at(2), saved_h);
 
-        // Open edit mode on that same annotation (row_start == row_end == 1).
+        // Open edit mode on that same annotation (at its anchor row).
         app.input = Some(InputMode::Comment {
             buf: "editing now, with a much longer replacement comment".to_string(),
             tag: Some(Tag::Fix),
             editing: Some(0),
-            row_start: 1,
-            row_end: 1,
+            row_start: 2,
+            row_end: 2,
         });
 
         // The saved annotation's rows are gone from the map; only the
@@ -2288,8 +2648,211 @@ mod tests {
             inner_width,
         );
         let map = app.disp_map(inner_width);
-        assert_eq!(map.extra_at(1), box_h);
+        assert_eq!(map.extra_at(2), box_h);
         assert_eq!(map.total(app.diff_rows().len()), app.diff_rows().len() + box_h);
+    }
+
+    // --- annotation anchoring (protocol lines -> display rows) ----------
+
+    /// An annotation on `sample_file`, spelled by side and line range.
+    fn anno(side: Side, start: u32, end: u32) -> Annotation {
+        Annotation {
+            file: "src/lib.rs".to_string(),
+            lines: LineRange { start, end },
+            side,
+            tag: None,
+            comment: "why".to_string(),
+        }
+    }
+
+    #[test]
+    fn annotation_rows_new_side_range_spans_add_and_context_rows() {
+        let file = sample_file();
+        let rows = flatten_rows(&file);
+        // New-side lines 2..=3 are the add row (row 2) and the context row
+        // after it (row 3) — the range covers both, and the header above
+        // them is not a Line row so it never anchors.
+        assert_eq!(annotation_rows(&anno(Side::New, 2, 3), &rows), Some((2, 3)));
+        // A single line still yields a degenerate (min, max).
+        assert_eq!(annotation_rows(&anno(Side::New, 12, 12), &rows), Some((7, 7)));
+    }
+
+    #[test]
+    fn annotation_rows_old_side_anchors_to_the_remove_row() {
+        let file = sample_file();
+        let rows = flatten_rows(&file);
+        // Old-side line 10 exists only on the removed line (row 5); the add
+        // row next to it carries new_no 11, which the Old side ignores.
+        assert_eq!(annotation_rows(&anno(Side::Old, 10, 10), &rows), Some((5, 5)));
+    }
+
+    #[test]
+    fn annotation_rows_returns_none_when_no_row_matches() {
+        let file = sample_file();
+        let rows = flatten_rows(&file);
+        // New-side lines 4..=10 fall between the two hunks: not in the diff
+        // at all, so there is nothing to dot or weave under.
+        assert!(annotation_rows(&anno(Side::New, 4, 10), &rows).is_none());
+        // Old-side line 3 likewise: the old file's line 3 is not shown.
+        assert!(annotation_rows(&anno(Side::Old, 3, 3), &rows).is_none());
+    }
+
+    #[test]
+    fn source_annotation_rows_are_line_numbers_clamped_to_the_file() {
+        // Lines 3..=5 of a 10-line file are rows 2..=4.
+        assert_eq!(source_annotation_rows(&anno(Side::New, 3, 5), 10), Some((2, 4)));
+        // Shorter file: the range clamps to its last row instead of vanishing.
+        assert_eq!(source_annotation_rows(&anno(Side::New, 3, 5), 4), Some((2, 3)));
+        assert_eq!(source_annotation_rows(&anno(Side::New, 3, 5), 3), Some((2, 2)));
+        // Old-side annotations have no place in the source view, and neither
+        // does anything when there is no source (deleted/binary/unreadable).
+        assert!(source_annotation_rows(&anno(Side::Old, 3, 5), 10).is_none());
+        assert!(source_annotation_rows(&anno(Side::New, 3, 5), 0).is_none());
+    }
+
+    #[test]
+    fn cursor_remaps_between_diff_rows_and_source_lines() {
+        let file = sample_file();
+        let rows = flatten_rows(&file);
+
+        // Diff -> source: the row's new-side line, zero-based.
+        assert_eq!(diff_row_to_source_row(&rows, 2), 1); // add, new line 2
+        assert_eq!(diff_row_to_source_row(&rows, 7), 11); // context, new line 12
+        // Rows with no new side (hunk header, removed line) fall to the top.
+        assert_eq!(diff_row_to_source_row(&rows, 0), 0);
+        assert_eq!(diff_row_to_source_row(&rows, 5), 0);
+        assert_eq!(diff_row_to_source_row(&rows, 99), 0);
+
+        // Source -> diff: the first row showing that line.
+        assert_eq!(source_row_to_diff_row(&rows, 1), 2); // line 2 -> add row
+        assert_eq!(source_row_to_diff_row(&rows, 11), 7); // line 12 -> last row
+        assert_eq!(source_row_to_diff_row(&rows, 0), 1); // line 1 -> first context
+        // A line outside every hunk isn't in the diff: fall to the top.
+        assert_eq!(source_row_to_diff_row(&rows, 5), 0);
+    }
+
+    // --- source view ----------------------------------------------------
+
+    #[test]
+    fn source_rows_carry_gutter_spacer_and_content_spans() {
+        let lines: Vec<String> = ["fn main() {", "", "    let x = 1;"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = highlight_source_rows(highlighter(), "src/lib.rs", &lines);
+        assert_eq!(rows.len(), 3);
+
+        for (i, row) in rows.iter().enumerate() {
+            // [gutter, spacer, content…] — at least three spans on EVERY row
+            // (blank lines included) so `draw_diff`'s `spans.len() >= 3 -> pin
+            // 2` rule keeps the gutter and spacer put while panning.
+            assert!(row.spans.len() >= 3, "row {i} has {} spans", row.spans.len());
+            let gutter = row.spans[0].content.as_ref();
+            assert_eq!(gutter.trim(), (i + 1).to_string(), "row {i} gutter");
+            assert_eq!(gutter.chars().count(), SOURCE_NUMBER_WIDTH + 2);
+            assert_eq!(row.spans[1].content.as_ref(), " ");
+            let content: String = row.spans[2..].iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(content, lines[i], "row {i} content");
+        }
+
+        // The pin actually holds: panning past the whole line leaves the
+        // gutter and spacer untouched.
+        let mut row = rows[0].clone();
+        let pinned = if row.spans.len() >= 3 { 2 } else { 0 };
+        pan_and_clip(&mut row, 500, 80, pinned);
+        assert_eq!(row.spans[0].content.trim(), "1");
+        assert_eq!(row.spans[1].content.as_ref(), " ");
+    }
+
+    #[test]
+    fn source_view_toggles_and_annotates_by_line_number() {
+        // A real file on disk: the source view reads the worktree, which IS
+        // the new side of the diff whatever the baseline was.
+        let dir = std::env::temp_dir()
+            .join(format!("herdr-annotator-source-view-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).expect("temp dir");
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "fn main() {\n    setup();\n    run();\n}\n",
+        )
+        .expect("write source");
+
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: dir.to_string_lossy().into_owned(),
+            baseline: None,
+            note: None,
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+
+        // `t` switches to source and loads the file: 4 rows, one per line.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert!(app.view == ViewMode::Source);
+        assert_eq!(app.view_row_count(), 4);
+
+        // Comment on source row 2, i.e. new-side line 3.
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        assert_eq!(app.diff.cursor, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        for ch in "here".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+
+        assert_eq!(app.pending.len(), 1);
+        let saved = &app.pending[0].annotation;
+        assert_eq!(saved.side, Side::New);
+        assert_eq!((saved.lines.start, saved.lines.end), (3, 3));
+        assert_eq!(saved.file, "src/lib.rs");
+        assert_eq!(app.pending_anchor(0), Some((2, 2)));
+
+        // Back to the diff: the SAME annotation re-anchors to the diff row
+        // showing new-side line 3, and the cursor follows the same line.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert!(app.view == ViewMode::Diff);
+        assert_eq!(app.pending_anchor(0), Some((3, 3)));
+        assert_eq!(app.diff.cursor, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_source_falls_back_to_a_placeholder_row() {
+        // working_dir points nowhere: the file can't be read, so the source
+        // view is a single placeholder row and annotating there is inert.
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: std::env::temp_dir()
+                .join("herdr-annotator-does-not-exist")
+                .to_string_lossy()
+                .into_owned(),
+            baseline: None,
+            note: None,
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert_eq!(app.view_row_count(), 1);
+        assert_eq!(app.source_line_count(), 0);
+        let lines = app.view_lines();
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("(no source view: "), "got {text:?}");
+
+        // `c` + Enter saves nothing: there are no source lines to anchor to.
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        for ch in "nope".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+        assert!(app.pending.is_empty());
     }
 
     #[test]
