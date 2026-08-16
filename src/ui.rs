@@ -1241,8 +1241,11 @@ fn draw_note(frame: &mut Frame, area: Rect, request: &ReviewRequest, pending_cou
 fn summary_footer_text(buf: &str, width: usize) -> String {
     let label = " request changes \u{2014} summary: ";
     let suffix = " \u{23ce} send \u{b7} esc cancel";
-    let avail = width.saturating_sub(label.chars().count());
-    if buf.chars().count() + suffix.chars().count() <= avail {
+    // Display columns, not chars: a CJK buffer can "fit" by char count while
+    // its real rendered width (2 columns/char) already overflows the footer
+    // once the hint suffix is appended (Codex P0).
+    let avail = width.saturating_sub(str_cols(label));
+    if str_cols(buf) + str_cols(suffix) <= avail {
         format!("{label}{buf}{suffix}")
     } else {
         format!("{label}{}", tail_fit(buf, avail))
@@ -2165,6 +2168,30 @@ mod tests {
         let text = summary_footer_text(long, exact_width - 1);
         assert!(!text.contains("send"));
         assert_eq!(text, format!("{label}{}", tail_fit(long, exact_width - 1 - label.chars().count())));
+    }
+
+    #[test]
+    fn summary_footer_measures_the_fit_in_display_columns_not_chars() {
+        // Regression (Codex P0): the fit decision compared
+        // `buf.chars().count()` to the available width, so a CJK buffer (2
+        // display columns per char) could "fit" by char count while its
+        // real rendered width already overflowed the footer once the hint
+        // suffix was appended.
+        let label = " request changes \u{2014} summary: ";
+        let suffix = " \u{23ce} send \u{b7} esc cancel";
+        let cjk: String = "\u{56fd}".repeat(10); // 10 chars, 20 display columns
+
+        // Sized so the OLD char-count check (10 + suffix_chars <= avail)
+        // would pass, but the real column width (20 + suffix_chars) does
+        // not — the exact mismatch the finding describes.
+        let avail_chars = cjk.chars().count() + suffix.chars().count() + 5;
+        let width = label.chars().count() + avail_chars;
+
+        let text = summary_footer_text(&cjk, width);
+        assert!(
+            !text.contains("send"),
+            "hint must be dropped once the CJK buffer's real column width no longer fits: {text:?}"
+        );
     }
 
     #[test]
