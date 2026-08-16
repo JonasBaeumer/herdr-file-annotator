@@ -1493,13 +1493,48 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
                 continue;
             }
             let mut kept = String::new();
+            // Set when the scalar that missed the budget is itself glue (a
+            // zero-width mark, ZWJ, or skin-tone modifier) — the retained
+            // prefix is then a cluster sliced in half, not a clean cut.
+            let mut cut_mid_cluster = false;
             for c in span.content.chars() {
                 let w = char_cols(c);
                 if used + w > keep {
+                    cut_mid_cluster = w == 0 || is_emoji_modifier(c);
                     break;
                 }
                 kept.push(c);
                 used += w;
+            }
+            // A cut landing right after a ZWJ (the joiner fit, the
+            // pictograph it introduces did not) is the same half-cluster
+            // case, visible from the retained side instead of the dropped one.
+            cut_mid_cluster |= kept.chars().last() == Some('\u{200d}');
+            if cut_mid_cluster {
+                // Walk the retained tail back to the cluster head — every
+                // pictograph joined by a ZWJ, every skin-tone modifier, and
+                // every zero-width mark — and drop the WHOLE cluster rather
+                // than render a truncated prefix, which is a DIFFERENT glyph
+                // (e.g. a four-person family missing its last member renders
+                // as a couple). `glued` tracks whether the character just
+                // removed (immediately to the right of the current tail)
+                // was itself glue; a real char is only part of the cut
+                // cluster — and thus also dropped — when it was.
+                let mut chars: Vec<char> = kept.chars().collect();
+                let mut glued = true; // the budget boundary itself was glue
+                while let Some(&c) = chars.last() {
+                    let w = char_cols(c);
+                    if w == 0 || is_emoji_modifier(c) {
+                        chars.pop();
+                        glued = true;
+                    } else if glued {
+                        chars.pop();
+                        glued = false;
+                    } else {
+                        break;
+                    }
+                }
+                kept = chars.into_iter().collect();
             }
             span.content = kept.into();
             // Force every following span to truncate to empty (a wide char
@@ -1508,7 +1543,8 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
         }
         // Never leave a dangling joiner or bare marks at the cut: a trailing
         // ZWJ would fuse the last glyph with the … marker into a nonsense
-        // cluster.
+        // cluster. (Belt-and-suspenders: the walk-back above already
+        // handles this for the span that was actually cut.)
         for span in line.spans.iter_mut().rev() {
             if span.content.is_empty() {
                 continue;
@@ -2164,6 +2200,25 @@ mod tests {
         pan_and_clip(&mut line, 0, 15, 2); // 12 pinned + 3 → cuts inside the cluster
         let visible: String = line.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
         assert!(!visible.trim_end_matches('\u{2026}').ends_with('\u{200d}'));
+
+        // Regression (Codex P1, thread 3792159813): right clip landing
+        // after the family's SECOND pictograph. The old cleanup only
+        // trimmed the trailing joiner, leaving "woman ZWJ woman" behind —
+        // a COUPLE, a genuinely different emoji from the source family.
+        // The cut must drop the WHOLE cluster, retained pictographs
+        // included, not just the dangling joiner.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 0, 17, 2); // 12 pinned + 4 → cuts before the 3rd member
+        let visible = line.spans[2].content.as_ref();
+        assert!(
+            visible.is_empty(),
+            "no pictograph from the cut cluster may survive, got {visible:?}"
+        );
+        assert!(!visible.contains('\u{200d}'), "no joiner may survive either");
+        assert!(!visible.contains('\u{1f469}'), "no partial family may render as a couple");
+        let total: usize = line.spans.iter().map(|s| str_cols(s.content.as_ref())).sum();
+        assert!(total <= 17, "rendered {total} cols > width 17");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
     }
 
     #[test]
