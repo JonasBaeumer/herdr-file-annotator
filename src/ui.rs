@@ -1574,6 +1574,17 @@ fn highlight_diff_line(
         spans.push(Span::styled(text.to_string(), span_style));
     }
 
+    // Always emit a content span, even for blank lines: pan/clip pins the
+    // gutter+marker only on rows with 3+ spans, so a 2-span blank changed
+    // line would have its line numbers consumed by horizontal panning.
+    if spans.len() == 2 {
+        let mut span_style = Style::default();
+        if let Some(bg) = bg {
+            span_style = span_style.bg(bg);
+        }
+        spans.push(Span::styled(String::new(), span_style));
+    }
+
     Line::from(spans)
 }
 
@@ -1817,6 +1828,37 @@ mod tests {
         // No files: selection pinned to 0.
         nav.down(0);
         assert_eq!(nav.selected, 0);
+    }
+
+    #[test]
+    fn blank_changed_lines_keep_their_gutter_under_panning() {
+        // Regression (Codex P1): an empty added line rendered only gutter +
+        // marker spans, so the "3+ spans → pin 2" rule failed and panning
+        // consumed the line numbers.
+        let file = FileDiff {
+            path: "src/lib.rs".to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,2 @@".to_string(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![line(Origin::Add, None, Some(2), "")],
+            }],
+        };
+        let rows = highlight_file_rows(highlighter(), &file);
+        let blank = &rows[1];
+        assert!(blank.spans.len() >= 3, "blank line must still carry a content span");
+
+        let mut panned = blank.clone();
+        pan_and_clip(&mut panned, 16, 100, 2);
+        assert_eq!(panned.spans[0].content.as_ref(), "        2 ");
+        assert_eq!(panned.spans[1].content.as_ref(), "+");
     }
 
     #[test]
