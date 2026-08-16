@@ -1882,8 +1882,21 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
         lines.splice(at..at, group);
     }
 
-    let paragraph = Paragraph::new(lines).block(block).scroll((app.diff.scroll as u16, 0));
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll_row_u16(app.diff.scroll), 0));
     frame.render_widget(paragraph, area);
+}
+
+/// Narrow a display-space scroll offset to the `u16` `Paragraph::scroll`
+/// takes, WITHOUT wrapping. `MAX_SOURCE_LINES`'s margin for woven comment
+/// rows is a soft guideline sized for a realistic annotation count, not an
+/// enforced bound — a saved comment or the open editing box can add extra
+/// display rows without limit, so `scroll` itself could still exceed
+/// `u16::MAX` given enough of them. Clamping here means that pathological
+/// case stops scrolling further, rather than the offset wrapping and the
+/// pane silently rendering unrelated earlier rows while the cursor/footer
+/// still report the true, later position.
+fn scroll_row_u16(scroll: usize) -> u16 {
+    scroll.min(u16::MAX as usize) as u16
 }
 
 fn str_cols(s: &str) -> usize {
@@ -4280,6 +4293,22 @@ mod tests {
         assert_eq!(app.pan_cap(), diff_cap);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scroll_row_u16_clamps_past_the_line_cap_margin_instead_of_wrapping() {
+        // Regression (Codex P1): MAX_SOURCE_LINES's margin bounds the
+        // source's BASE rows, but saved comments and the open editing box
+        // add unbounded extra display rows on top — a source near the line
+        // cap with enough wrapped comments can still push `scroll` past
+        // `u16::MAX`. A bare `as u16` cast would wrap that back down to a
+        // small offset and render unrelated earlier rows while the
+        // cursor/footer still report the true, later position; clamping
+        // instead just stops scrolling further, which is the safe failure.
+        assert_eq!(scroll_row_u16(0), 0);
+        assert_eq!(scroll_row_u16(65_535), 65_535, "must reach the real max exactly");
+        assert_eq!(scroll_row_u16(65_536), 65_535, "one past the max clamps, not wraps");
+        assert_eq!(scroll_row_u16(200_000), 65_535, "far past the max still clamps to it");
     }
 
     #[test]
