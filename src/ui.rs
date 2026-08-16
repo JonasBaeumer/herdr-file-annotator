@@ -1629,7 +1629,10 @@ fn editing_box_height(buf: &str, inner_width: usize) -> usize {
 /// buffer still renders one row, just the caret), and a bottom rule carrying
 /// the commit/tag/cancel button chips.
 fn editing_box_lines(buf: &str, tag: Option<Tag>, inner_width: usize) -> Vec<Line<'static>> {
-    let width = inner_width.max(4);
+    // NOT `.max(4)`: the box must fit the pane it's actually drawn into, not
+    // a hypothetical wider one — forcing a wider width here just moves the
+    // overflow from "rows too wide" to "box wider than the pane" (Codex P2).
+    let width = inner_width.max(1);
     let rule_style = Style::default().fg(EDIT_RULE_FG).bg(COMMENT_BG);
     let text_style = Style::default().fg(Color::White).bg(COMMENT_BG);
 
@@ -1670,6 +1673,17 @@ fn editing_box_lines(buf: &str, tag: Option<Tag>, inner_width: usize) -> Vec<Lin
     }
 
     lines.push(bottom_rule_line(tag, width));
+
+    // Belt-and-braces never-overflow: `editing_wrap_width`'s own `.max(1)`
+    // floor (content needs at least one column to make progress) means a
+    // pane narrower than the box's minimum chrome (prefix + one content
+    // column + caret + closing border, 5 columns) still renders a row wider
+    // than `width` even after the change above. Clip every row with the
+    // same column-accurate, cluster-atomic primitive diff rows already use,
+    // rather than duplicating that logic here.
+    for line in &mut lines {
+        pan_and_clip(line, 0, width, 0);
+    }
     lines
 }
 
@@ -3240,6 +3254,26 @@ mod tests {
         for (i, line) in editing_box_lines(&cjk, Some(Tag::Fix), width).into_iter().enumerate() {
             let cols: usize = line.spans.iter().map(|s| str_cols(&s.content)).sum();
             assert_eq!(cols, width, "row {i} must render at exactly the box width, got {cols}");
+        }
+    }
+
+    #[test]
+    fn editing_box_never_exceeds_a_pathologically_narrow_pane() {
+        // Regression (Codex P2): forcing the box to a minimum width of 4
+        // rendered it wider than panes with fewer inner columns, and even
+        // at exactly 4 the forced one-column wrap width plus prefix, caret,
+        // and closing border made each content row 5 columns wide — both
+        // violate the documented never-overflow invariant.
+        for width in 1..=6usize {
+            for buf in ["", "hi", "a longer note than the pane can hold"] {
+                for (i, line) in editing_box_lines(buf, Some(Tag::Fix), width).into_iter().enumerate() {
+                    let cols: usize = line.spans.iter().map(|s| str_cols(&s.content)).sum();
+                    assert!(
+                        cols <= width,
+                        "width={width} buf={buf:?} row={i}: rendered {cols} cols, wider than the pane"
+                    );
+                }
+            }
         }
     }
 
