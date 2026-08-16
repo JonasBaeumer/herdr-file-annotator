@@ -484,6 +484,10 @@ const WHEEL_STEP: usize = 3;
 /// Columns one horizontal pan step shifts the code.
 const HSCROLL_STEP: usize = 8;
 
+/// Columns of the pinned lead on line rows: the 11-col line-number gutter
+/// plus the 1-col origin marker (see `highlight_diff_line`'s format).
+const GUTTER_AND_MARKER_COLS: usize = 12;
+
 /// The navigator/diff rects for mouse hit-testing, mirroring `draw`'s
 /// layout: header (1) + note (1) above the body, footer (1) below.
 fn body_rects(term_size: Size, show_navigator: bool) -> (Rect, Rect) {
@@ -854,8 +858,19 @@ impl<'a> App<'a> {
     /// Stepping by a single column instead whenever that would happen keeps
     /// every row's content reachable, while long lines with no such
     /// short-row conflict still jump the full step.
-    fn next_pan_stop(&self, current: usize) -> usize {
-        let target = current + HSCROLL_STEP;
+    /// One pan step in columns: the full `HSCROLL_STEP` on normal panes,
+    /// but never more than half the visible CODE columns — in a pane
+    /// narrower than the step, whole-step jumps skip offsets that were
+    /// never on screen (middle of short rows, tails at the cap), so narrow
+    /// panes fine-step down to single columns.
+    fn pan_step(&self, term_size: Size) -> usize {
+        let code_cols = diff_inner_width(term_size, self.show_navigator)
+            .saturating_sub(GUTTER_AND_MARKER_COLS);
+        HSCROLL_STEP.min((code_cols / 2).max(1))
+    }
+
+    fn next_pan_stop(&self, current: usize, step: usize) -> usize {
+        let target = current + step;
         // <= target, not < target: a row whose pannable width lands EXACTLY
         // on the step boundary is just as skipped-over as one strictly
         // inside it — landing there means every offset that would have
@@ -954,12 +969,14 @@ impl<'a> App<'a> {
             }
             MouseEventKind::ScrollRight => {
                 if in_diff {
-                    self.diff.hscroll = self.next_pan_stop(self.diff.hscroll).min(self.pan_cap());
+                    self.diff.hscroll = self
+                        .next_pan_stop(self.diff.hscroll, self.pan_step(term_size))
+                        .min(self.pan_cap());
                 }
             }
             MouseEventKind::ScrollLeft => {
                 if in_diff {
-                    self.diff.hscroll = self.diff.hscroll.saturating_sub(HSCROLL_STEP);
+                    self.diff.hscroll = self.diff.hscroll.saturating_sub(self.pan_step(term_size));
                 }
             }
             _ => {}
@@ -1117,10 +1134,11 @@ impl<'a> App<'a> {
                     KeyCode::Char('G') => self.diff.bottom(row_count),
                     KeyCode::Right | KeyCode::Char('L') => {
                         self.diff.hscroll =
-                            self.next_pan_stop(self.diff.hscroll).min(self.pan_cap())
+                            self.next_pan_stop(self.diff.hscroll, self.pan_step(term_size))
+                                .min(self.pan_cap())
                     }
                     KeyCode::Left | KeyCode::Char('H') => {
-                        self.diff.hscroll = self.diff.hscroll.saturating_sub(HSCROLL_STEP)
+                        self.diff.hscroll = self.diff.hscroll.saturating_sub(self.pan_step(term_size))
                     }
                     KeyCode::Char('0') => self.diff.hscroll = 0,
                     KeyCode::Char('h') | KeyCode::Tab => {
@@ -2308,6 +2326,55 @@ mod tests {
             visible.contains('\u{1f1fa}') && visible.contains('\u{1f1f8}'),
             "the whole flag must survive together at max pan, got {visible:?}"
         );
+    }
+
+    #[test]
+    fn narrow_panes_pan_by_fine_steps() {
+        // Regression (Codex P1, thread 3792516905): in a pane exposing only
+        // a couple of code columns, whole 8-column jumps skip offsets that
+        // were never on screen, hiding short rows' middles forever. The
+        // step now caps at half the visible code columns (min 1).
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let rows = vec![
+            line(Origin::Add, None, Some(1), "abcdefghi"), // 9 cols
+            line(Origin::Add, None, Some(2), &"x".repeat(120)),
+        ];
+        let file = FileDiff {
+            path: "a.py".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 2,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,2 @@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                lines: rows,
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.show_navigator = false;
+
+        // Stacked/narrow: 16-wide terminal → 14 inner → 2 code columns.
+        let narrow = Size { width: 16, height: 24 };
+        assert_eq!(app.pan_step(narrow), 1);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        app.handle_key(right, narrow);
+        assert_eq!(app.diff.hscroll, 1, "narrow panes advance one column at a time");
+
+        // Wide terminal: full step (modulo the short-row fine-step rule).
+        let wide = Size { width: 120, height: 30 };
+        assert_eq!(app.pan_step(wide), HSCROLL_STEP);
     }
 
     #[test]
