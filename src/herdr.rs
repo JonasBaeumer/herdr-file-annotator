@@ -80,3 +80,56 @@ pub fn open_review_pane(socket_path: &str, config: &Config) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// Serializes the HERDR_BIN_PATH mutation: these tests swap the binary
+    /// the whole module resolves, so they must not overlap each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fake_herdr(dir: &Path, exit_code: i32) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all(dir).unwrap();
+        let log = dir.join("argv.log");
+        let script = dir.join("herdr-fake.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nexit {}\n", log.display(), exit_code),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, log)
+    }
+
+    #[test]
+    fn zoom_invokes_the_documented_herdr_cli_contract() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-zoom-ok-{}", std::process::id()));
+        let (script, log) = fake_herdr(&dir, 0);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        let result = zoom_toggle_current();
+        std::env::remove_var("HERDR_BIN_PATH");
+
+        assert!(result.is_ok(), "zero exit must be Ok: {result:?}");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(argv.trim(), "pane zoom --current --toggle");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zoom_surfaces_a_nonzero_exit_as_an_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-zoom-err-{}", std::process::id()));
+        let (script, _log) = fake_herdr(&dir, 1);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        let result = zoom_toggle_current();
+        std::env::remove_var("HERDR_BIN_PATH");
+
+        assert!(result.is_err(), "nonzero exit must be Err so the caller can log it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
