@@ -757,6 +757,11 @@ impl<'a> App<'a> {
             if !close {
                 self.input = Some(mode);
             }
+            // Typing can grow the editing box (more wrapped rows) or close
+            // it back down to nothing — either way the set of display rows
+            // under the cursor just changed, so re-follow it now rather than
+            // leaving the scroll offset stuck until the next nav key.
+            self.ensure_cursor_visible(term_size);
             return outcome;
         }
 
@@ -2136,6 +2141,50 @@ mod tests {
         assert_eq!(follow_display(0, 9, &map, 10), 1);
         // Without the comment, no scroll needed.
         assert_eq!(follow_display(0, 9, &DispMap::new(vec![]), 10), 0);
+    }
+
+    #[test]
+    fn typing_in_the_comment_box_re_follows_the_caret_as_it_grows() {
+        // Regression (Codex P0): the active-input arm of `handle_key`
+        // returned before `ensure_cursor_visible` ran, so growing the
+        // editing box past the viewport bottom while typing left the scroll
+        // offset stuck — the caret and bottom controls slid off-screen
+        // instead of staying visible like every other row-count change does.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        // Narrow + short terminal: a small diff viewport and a narrow wrap
+        // width so a modest amount of typed text wraps into several rows.
+        let size = Size::new(30, 12);
+        let viewport = diff_viewport_rows(size, app.show_navigator);
+
+        // Move the cursor to the LAST row (sample_file flattens to 8 rows:
+        // 0..=7) so the comment box opens right at the viewport's bottom.
+        for _ in 0..7 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        }
+        assert_eq!(app.diff.cursor, 7);
+        assert!(app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size)
+            .is_none());
+
+        // Type enough text to wrap across several rows at this narrow width.
+        let long = "this comment is long enough to wrap across several rows at this narrow width";
+        for ch in long.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), size);
+        }
+
+        // The box's bottom row must stay inside the viewport — the same
+        // invariant `ensure_cursor_visible` maintains after every other key.
+        let map = app.disp_map(diff_inner_width(size, app.show_navigator));
+        let dc = map.disp(app.diff.cursor);
+        let tail = dc + map.extra_at(app.diff.cursor);
+        assert!(
+            tail < app.diff.scroll + viewport,
+            "box bottom (tail={tail}) must stay within the viewport (scroll={}, viewport={viewport})",
+            app.diff.scroll
+        );
     }
 
     #[test]
