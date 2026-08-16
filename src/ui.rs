@@ -881,13 +881,19 @@ impl<'a> App<'a> {
     /// short-row conflict still jump the full step.
     fn next_pan_stop(&self, current: usize) -> usize {
         let target = current + HSCROLL_STEP;
+        // <= target, not < target: a row whose pannable width lands EXACTLY
+        // on the step boundary is just as skipped-over as one strictly
+        // inside it — landing there means every offset that would have
+        // revealed that row's middle/tail (current+1..target-1) was never
+        // visited, and `target` itself is already "fully panned off, empty"
+        // for that row.
         let overshoots_a_row = self
             .row_cache
             .get(&self.nav.selected)
             .into_iter()
             .flatten()
             .map(pannable_cols)
-            .any(|cols| cols > current && cols < target);
+            .any(|cols| cols > current && cols <= target);
         if overshoots_a_row {
             current + 1
         } else {
@@ -2332,6 +2338,62 @@ mod tests {
             app.handle_key(right, term);
         }
         assert_eq!(app.diff.hscroll, app.pan_cap(), "must still reach the file-wide pan cap");
+    }
+
+    #[test]
+    fn short_rows_stay_reachable_at_an_exact_step_boundary() {
+        // Regression (Codex P1): `next_pan_stop`'s overshoot check used a
+        // strict `cols < target`, excluding a row whose pannable width
+        // lands EXACTLY on the step boundary (an 8-char row against the
+        // default HSCROLL_STEP=8). The first Right press still jumped
+        // straight from offset 0 to offset 8 — where that row is already
+        // fully panned off, empty — skipping every offset that would have
+        // revealed its middle/tail characters.
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 2,
+            dels: 0,
+            hunks: vec![Hunk {
+                // Empty: a nonempty header (even a short one) would itself
+                // fall strictly inside (0, 8) and trigger fine-stepping on
+                // its own, masking the exact-8 boundary this test isolates.
+                header: String::new(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![
+                    line(Origin::Add, None, Some(1), "abcdefgh"), // exactly HSCROLL_STEP cols
+                    line(Origin::Add, None, Some(2), &"y".repeat(200)),
+                ],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+
+        let term = Size { width: 16, height: 30 };
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            app.handle_key(right, term);
+            let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+            pan_and_clip(&mut row, app.diff.hscroll, 14, 2);
+            let tail: String = row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+            seen.extend(tail.chars());
+        }
+        for c in "cdefgh".chars() {
+            assert!(seen.contains(&c), "{c:?} never became visible while panning, saw {seen:?}");
+        }
     }
 
     #[test]
