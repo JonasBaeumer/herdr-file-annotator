@@ -1180,19 +1180,29 @@ impl<'a> App<'a> {
 
     fn next_pan_stop(&self, current: usize, step: usize) -> usize {
         let target = current + step;
+        // The overshoot check must scan the rows actually ON SCREEN, not
+        // always the diff's: in source view those are wholly different rows
+        // (a source file's line widths have nothing to do with the diff's),
+        // so checking `row_cache` there would miss a short SOURCE row's
+        // overshoot entirely and jump the full step over it — the same bug
+        // `short_rows_stay_reachable_when_a_longer_row_sets_a_big_pan_cap`
+        // once pinned for diff rows, reappearing in the other view.
+        let rows: Option<&Vec<Line<'static>>> = match self.view {
+            ViewMode::Diff => self.row_cache.get(&self.nav.selected),
+            ViewMode::Source => self
+                .source_cache
+                .get(&self.nav.selected)
+                .and_then(|r| r.as_ref().ok())
+                .map(|s| &s.lines),
+        };
         // <= target, not < target: a row whose pannable width lands EXACTLY
         // on the step boundary is just as skipped-over as one strictly
         // inside it — landing there means every offset that would have
         // revealed that row's middle/tail (current+1..target-1) was never
         // visited, and `target` itself is already "fully panned off, empty"
         // for that row.
-        let overshoots_a_row = self
-            .row_cache
-            .get(&self.nav.selected)
-            .into_iter()
-            .flatten()
-            .map(pannable_cols)
-            .any(|cols| cols > current && cols <= target);
+        let overshoots_a_row =
+            rows.into_iter().flatten().map(pannable_cols).any(|cols| cols > current && cols <= target);
         if overshoots_a_row {
             current + 1
         } else {
@@ -2909,6 +2919,98 @@ mod tests {
             app.handle_key(right, term);
         }
         assert_eq!(app.diff.hscroll, app.pan_cap(), "must still reach the file-wide pan cap");
+    }
+
+    #[test]
+    fn source_view_short_rows_stay_reachable_when_a_longer_row_sets_a_big_pan_cap() {
+        // Regression (Codex P1): `next_pan_stop`'s overshoot check always
+        // scanned `row_cache` — the DIFF rows — even in source view. A
+        // source file's line widths have nothing to do with the diff's, so
+        // a short SOURCE row's overshoot went undetected there and Right
+        // jumped the full step straight past it: the same bug
+        // `short_rows_stay_reachable_when_a_longer_row_sets_a_big_pan_cap`
+        // pinned for diff rows, reappearing in the other view.
+        let dir = std::env::temp_dir()
+            .join(format!("herdr-annotator-source-pan-reach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // On disk: a short row and a much longer one — deliberately
+        // DIFFERENT from the diff's own (uniformly wide) lines below, so a
+        // next_pan_stop that (bugfully) checks diff rows instead sees no
+        // short row at all and never fine-steps.
+        std::fs::write(dir.join("a.txt"), format!("abcdef\n{}\n", "y".repeat(200)))
+            .expect("write source");
+
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: dir.to_string_lossy().into_owned(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 2,
+            dels: 0,
+            hunks: vec![Hunk {
+                // Wide even as the (unpinned, single-span) header row: every
+                // diff row here must be wide, or the header itself would be
+                // the "short row" that (correctly, by accident) triggers
+                // the overshoot check regardless of which rows are scanned.
+                header: "@".repeat(200),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                // Uniformly wide diff rows: if next_pan_stop wrongly checks
+                // these instead of the source rows, it never detects an
+                // overshoot and always jumps the full step.
+                lines: vec![
+                    line(Origin::Add, None, Some(1), &"z".repeat(200)),
+                    line(Origin::Add, None, Some(2), &"z".repeat(200)),
+                ],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        // A WIDE pane, deliberately: a narrow one clamps `pan_step` itself
+        // down to single columns (see `pan_step`'s adaptive narrow-pane
+        // rule), which fine-steps regardless of the overshoot check and
+        // would mask this bug. Only a pane wide enough for the full
+        // `HSCROLL_STEP` makes the overshoot branch the thing deciding
+        // whether the short row is ever revealed.
+        let size = Size { width: 120, height: 40 };
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE), size);
+        assert!(app.view == ViewMode::Source);
+        assert_eq!(app.pan_step(size), HSCROLL_STEP, "must be wide enough for a full step");
+        assert!(
+            app.pan_cap() > HSCROLL_STEP,
+            "the long source row must set a cap well past a single step"
+        );
+
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            app.handle_key(right, size);
+            let source = match app.source_cache.get(&0) {
+                Some(Ok(source)) => source,
+                _ => panic!("expected the source to load"),
+            };
+            let mut row = source.lines[0].clone();
+            pan_and_clip(&mut row, app.diff.hscroll, 100, 2);
+            let tail: String = row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+            seen.extend(tail.chars());
+        }
+        for c in "cdef".chars() {
+            assert!(
+                seen.contains(&c),
+                "{c:?} never became visible while panning source view, saw {seen:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
