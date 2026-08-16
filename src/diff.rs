@@ -155,6 +155,15 @@ pub fn load(working_dir: &str, baseline: Option<&str>) -> Result<DiffModel> {
     Ok(DiffModel { files })
 }
 
+/// Source view refuses to load a file larger than this: reading, copying
+/// every line, and syntax-highlighting the whole thing runs synchronously on
+/// the render thread (this is a single-threaded TUI event loop, not an async
+/// one), so an unbounded read of a large generated or minified file — cheap
+/// to review as a small DIFF — would freeze the pane for however long that
+/// takes. 2 MiB comfortably covers real source files while still catching
+/// the generated/minified/vendored case the diff itself never has to pay for.
+const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Read a file's post-change contents as lines, for the UI's source view.
 ///
 /// No git plumbing needed regardless of baseline: the worktree IS the new
@@ -170,12 +179,25 @@ pub fn load(working_dir: &str, baseline: Option<&str>) -> Result<DiffModel> {
 /// key) if a reviewed change plants a symlink pointing there. Checking
 /// `symlink_metadata` (which does not follow the link) before ever opening
 /// the target keeps that content out of the pane.
+///
+/// Files over `MAX_SOURCE_BYTES` are refused for the same reason binary
+/// files are: there is nothing useful — or safe to the pane's
+/// responsiveness — to render, so the UI shows a placeholder instead of
+/// blocking on the read and the highlight pass that follows it.
 pub fn load_source(working_dir: &str, path: &str) -> Result<Vec<String>> {
     let full = Path::new(working_dir).join(path);
     let meta = std::fs::symlink_metadata(&full)
         .with_context(|| format!("reading {}", full.display()))?;
     if meta.file_type().is_symlink() {
         bail!("{} is a symlink; source view does not follow worktree symlinks", full.display());
+    }
+    if meta.len() > MAX_SOURCE_BYTES {
+        bail!(
+            "{} is {} bytes, over the {}-byte source view limit",
+            full.display(),
+            meta.len(),
+            MAX_SOURCE_BYTES
+        );
     }
     let text = std::fs::read_to_string(&full)
         .with_context(|| format!("reading {}", full.display()))?;
@@ -904,5 +926,28 @@ index 1111111..2222222 100644
         assert!(msg.contains("symlink"), "error should name the reason, got {msg:?}");
 
         let _ = std::fs::remove_dir_all(&secret_dir);
+    }
+
+    #[test]
+    fn load_source_refuses_a_file_over_the_size_limit() {
+        // Regression (Codex P1): source view read, copied, and
+        // syntax-highlighted a file of any size synchronously on the render
+        // thread. A generated/minified file the diff itself never had to pay
+        // for could freeze the pane just because the reviewer pressed `t`.
+        let repo = TempRepo::new("oversized_source");
+        let oversized = "x".repeat((MAX_SOURCE_BYTES + 1) as usize);
+        repo.write("huge.txt", &oversized);
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let result = load_source(&wd, "huge.txt");
+        assert!(result.is_err(), "an oversized file must be refused: {result:?}");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("limit"), "error should name the reason, got {msg:?}");
+
+        // A file right at the limit still loads normally — this guards the
+        // limit itself, not files that merely happen to be sizeable.
+        let at_limit = "y".repeat(MAX_SOURCE_BYTES as usize);
+        repo.write("at_limit.txt", &at_limit);
+        assert!(load_source(&wd, "at_limit.txt").is_ok(), "a file at the limit must still load");
     }
 }
