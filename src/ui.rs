@@ -1474,7 +1474,6 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
         groups.entry(p.row_end).or_default().extend(inline_comment_lines(
             p.annotation.tag.as_deref(),
             &p.annotation.comment,
-            false,
             inner_width,
         ));
     }
@@ -1806,32 +1805,23 @@ fn comment_height(tag: Option<&str>, text: &str, inner_width: usize) -> usize {
 }
 
 /// Build one saved comment as display rows: `┃ [tag] text…` with wrapped
-/// continuation rows indented under the text column. `live` marks the
-/// in-progress preview (typing caret on the last row) — used only for the
-/// rare caller that still wants a plain preview rather than the editing box.
-fn inline_comment_lines(
-    tag: Option<&str>,
-    text: &str,
-    live: bool,
-    inner_width: usize,
-) -> Vec<Line<'static>> {
+/// continuation rows indented under the text column. The editing box (see
+/// `editing_box_lines`) handles the in-progress/typing case; this renders
+/// only settled, saved annotations.
+fn inline_comment_lines(tag: Option<&str>, text: &str, inner_width: usize) -> Vec<Line<'static>> {
     let marker = comment_marker(tag);
     let indent = comment_marker_continuation(tag);
     let base = Style::default().bg(COMMENT_BG);
     let chunks = wrap_comment(text, comment_text_width(tag, inner_width));
-    let last = chunks.len() - 1;
     chunks
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
             let lead = if i == 0 { marker.clone() } else { indent.clone() };
-            let mut spans = vec![
+            let spans = vec![
                 Span::styled(lead, base.fg(tag_color(tag)).add_modifier(Modifier::BOLD)),
                 Span::styled(chunk, base.fg(Color::White).add_modifier(Modifier::ITALIC)),
             ];
-            if live && i == last {
-                spans.push(Span::styled("\u{258f}", base.fg(Color::White))); // typing caret
-            }
             Line::from(spans)
         })
         .collect()
@@ -2122,7 +2112,7 @@ mod tests {
         let text = "a fairly long review comment that will definitely need wrapping at narrow widths";
         for width in [20usize, 40, 80, 200] {
             let height = comment_height(Some("fix"), text, width);
-            let lines = inline_comment_lines(Some("fix"), text, false, width);
+            let lines = inline_comment_lines(Some("fix"), text, width);
             assert_eq!(height, lines.len(), "width {width}");
             // Reassembling the chunks loses only layout, not content.
             let joined: String = lines
