@@ -2154,6 +2154,37 @@ mod tests {
     }
 
     #[test]
+    fn inline_comment_continuation_rows_align_under_the_first_row_marker() {
+        // Regression (Codex P1): `comment_height_matches_rendered_line_count`
+        // only reads spans[1] (the wrapped text), never spans[0] (the lead),
+        // so a regression in the `┃ [tag] ` marker or its continuation
+        // indent would still pass. Pin the lead on both the first row and
+        // continuation rows, and that they render at equal display width so
+        // continuation text visually lines up under the first row's text.
+        let tag = Some("fix");
+        let text = "a fairly long review comment that will definitely need wrapping at a narrow width";
+        let width = 30;
+        let lines = inline_comment_lines(tag, text, width);
+        assert!(lines.len() >= 2, "expected wrapping at width {width}, got {} row(s)", lines.len());
+
+        let marker = comment_marker(tag);
+        let continuation = comment_marker_continuation(tag);
+        assert_eq!(lines[0].spans[0].content.as_ref(), marker, "first row must carry the tag marker");
+        assert_eq!(
+            str_cols(&marker),
+            str_cols(&continuation),
+            "marker and continuation lead must render at the same display width"
+        );
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            assert_eq!(
+                line.spans[0].content.as_ref(),
+                continuation,
+                "continuation row {i} must carry the aligned indent, not the marker"
+            );
+        }
+    }
+
+    #[test]
     fn tail_fit_keeps_the_end_of_long_input_visible() {
         assert_eq!(tail_fit("short", 10), "short");
         assert_eq!(tail_fit("abcdefghij", 6), "\u{2026}fghij");
