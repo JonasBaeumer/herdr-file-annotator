@@ -164,6 +164,18 @@ pub fn load(working_dir: &str, baseline: Option<&str>) -> Result<DiffModel> {
 /// the generated/minified/vendored case the diff itself never has to pay for.
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Source view also refuses a file with more rows than this, independent of
+/// the byte cap above: a file well under 2 MiB can still hold tens of
+/// thousands of very short lines. The ratatui `Paragraph::scroll` the pane
+/// renders through takes a `u16` row offset, so a source view with more than
+/// `u16::MAX` rows could need a scroll position that silently wraps when
+/// narrowed to `u16` — the pane would then render unrelated earlier rows
+/// while the cursor and footer, which track the real `usize` position,
+/// still report the true (later) line. 50,000 leaves a wide margin under
+/// `u16::MAX` (65,535) for the extra display rows woven-in annotation
+/// comments add on top of the base row count.
+const MAX_SOURCE_LINES: usize = 50_000;
+
 /// Read a file's post-change contents as lines, for the UI's source view.
 ///
 /// No git plumbing needed regardless of baseline: the worktree IS the new
@@ -183,7 +195,8 @@ const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 /// Files over `MAX_SOURCE_BYTES` are refused for the same reason binary
 /// files are: there is nothing useful — or safe to the pane's
 /// responsiveness — to render, so the UI shows a placeholder instead of
-/// blocking on the read and the highlight pass that follows it.
+/// blocking on the read and the highlight pass that follows it. Files over
+/// `MAX_SOURCE_LINES` are refused for the separate reason documented there.
 pub fn load_source(working_dir: &str, path: &str) -> Result<Vec<String>> {
     let full = Path::new(working_dir).join(path);
     let meta = std::fs::symlink_metadata(&full)
@@ -201,7 +214,16 @@ pub fn load_source(working_dir: &str, path: &str) -> Result<Vec<String>> {
     }
     let text = std::fs::read_to_string(&full)
         .with_context(|| format!("reading {}", full.display()))?;
-    Ok(text.lines().map(|line| line.to_string()).collect())
+    let lines: Vec<String> = text.lines().map(|line| line.to_string()).collect();
+    if lines.len() > MAX_SOURCE_LINES {
+        bail!(
+            "{} has {} lines, over the {}-line source view limit",
+            full.display(),
+            lines.len(),
+            MAX_SOURCE_LINES
+        );
+    }
+    Ok(lines)
 }
 
 /// Parse `git diff --no-color` unified output into file diffs.
@@ -949,5 +971,39 @@ index 1111111..2222222 100644
         let at_limit = "y".repeat(MAX_SOURCE_BYTES as usize);
         repo.write("at_limit.txt", &at_limit);
         assert!(load_source(&wd, "at_limit.txt").is_ok(), "a file at the limit must still load");
+    }
+
+    #[test]
+    fn load_source_refuses_a_file_with_too_many_lines() {
+        // Regression (Codex P1): ratatui's `Paragraph::scroll` takes a `u16`
+        // row offset. A file well under the byte cap can still hold tens of
+        // thousands of very short lines; scrolling into one would need an
+        // offset that silently wraps when narrowed from `usize` to `u16`,
+        // rendering unrelated earlier rows while the cursor/footer still
+        // report the true (later, wrapped-away) line. Bytes alone don't
+        // catch this, so the line count needs its own, separate cap.
+        let repo = TempRepo::new("too_many_lines");
+        // Short lines so this is nowhere near MAX_SOURCE_BYTES — this test
+        // isolates the LINE cap, not the byte one.
+        let many_lines = "x\n".repeat(MAX_SOURCE_LINES + 1);
+        assert!(
+            (many_lines.len() as u64) < MAX_SOURCE_BYTES,
+            "test setup must stay under the byte cap to isolate the line cap"
+        );
+        repo.write("many_lines.txt", &many_lines);
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let result = load_source(&wd, "many_lines.txt");
+        assert!(result.is_err(), "a file with too many lines must be refused: {result:?}");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("lines"), "error should name the reason, got {msg:?}");
+
+        // A file at exactly the limit still loads.
+        let at_limit = "x\n".repeat(MAX_SOURCE_LINES);
+        repo.write("at_limit_lines.txt", &at_limit);
+        assert!(
+            load_source(&wd, "at_limit_lines.txt").is_ok(),
+            "a file at the line limit must still load"
+        );
     }
 }
