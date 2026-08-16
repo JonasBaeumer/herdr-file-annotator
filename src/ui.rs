@@ -1386,8 +1386,20 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
 /// A char's rendered terminal width (CJK/emoji are 2 columns, combining
 /// marks 0) — `chars().count()` is NOT this, and using it here made pans
 /// move double the columns and clipping miss on wide-character content.
+///
+/// Deliberate: widths are per-scalar sums (ratatui's own model via
+/// unicode-width), NOT grapheme-cluster widths. A ZWJ emoji sequence counts
+/// each pictograph, because that is exactly how ratatui pads and truncates
+/// what we hand it — diverging from the render layer's arithmetic would
+/// misalign every row. Cluster ATOMICITY (never splitting one) is handled
+/// separately in `pan_and_clip`.
 fn char_cols(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Skin-tone modifiers attach to the preceding emoji without a joiner.
+fn is_emoji_modifier(c: char) -> bool {
+    ('\u{1f3fb}'..='\u{1f3ff}').contains(&c)
 }
 
 fn str_cols(s: &str) -> usize {
@@ -1407,10 +1419,11 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
     if hscroll > 0 {
         let mut col = 0usize; // columns consumed from the unpinned content
         let mut dropped = false;
-        let mut pad_next = false; // wide char straddled the boundary
-        let mut crossing = true; // still owed: orphan marks of the last dropped cell
+        let mut pad_cols = 0usize; // columns dropped past the boundary, refilled as spaces
+        let mut crossing = true; // still owed: the tail of the last dropped cluster
+        let mut prev_zwj = false; // last dropped char was a zero-width joiner
         for span in line.spans.iter_mut().skip(pinned) {
-            if col >= hscroll && !pad_next && !crossing {
+            if col >= hscroll && pad_cols == 0 && !crossing {
                 break;
             }
             let mut kept = String::new();
@@ -1420,18 +1433,24 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
                     col += w;
                     dropped = true;
                     if col > hscroll {
-                        pad_next = true;
+                        pad_cols += col - hscroll; // wide char straddled
                     }
-                } else if crossing && w == 0 {
-                    // A zero-width char (combining mark) right after the pan
-                    // boundary belongs to the last DROPPED cell: dropping it
-                    // too keeps it from attaching to the clip marker.
+                    prev_zwj = c == '\u{200d}';
+                } else if crossing && (w == 0 || prev_zwj || is_emoji_modifier(c)) {
+                    // The tail of the last dropped grapheme cluster: combining
+                    // marks and ZWJ/VS scalars (width 0), a pictograph joined
+                    // by a preceding ZWJ, or a skin-tone modifier. Dropping a
+                    // cluster partially would render a DIFFERENT glyph (half a
+                    // family emoji) or leave a joiner to fuse with the clip
+                    // marker — drop the whole cluster and pad the columns.
+                    pad_cols += w;
                     dropped = true;
+                    prev_zwj = c == '\u{200d}';
                 } else {
                     crossing = false;
-                    if pad_next {
-                        kept.push(' ');
-                        pad_next = false;
+                    if pad_cols > 0 {
+                        kept.extend(std::iter::repeat(' ').take(pad_cols));
+                        pad_cols = 0;
                     }
                     kept.push(c);
                 }
@@ -1486,6 +1505,25 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
             // Force every following span to truncate to empty (a wide char
             // stopping short of `keep` leaves at most a one-column gap).
             used = keep;
+        }
+        // Never leave a dangling joiner or bare marks at the cut: a trailing
+        // ZWJ would fuse the last glyph with the … marker into a nonsense
+        // cluster.
+        for span in line.spans.iter_mut().rev() {
+            if span.content.is_empty() {
+                continue;
+            }
+            while span
+                .content
+                .chars()
+                .last()
+                .is_some_and(|c| c == '\u{200d}' || char_cols(c) == 0)
+            {
+                let mut chars: Vec<char> = span.content.chars().collect();
+                chars.pop();
+                span.content = chars.into_iter().collect::<String>().into();
+            }
+            break;
         }
         line.spans.push(Span::styled("\u{2026}", Style::default().fg(Color::DarkGray)));
     }
@@ -2105,6 +2143,27 @@ mod tests {
         let mut line = mk("a\u{301}e\u{301}b");
         pan_and_clip(&mut line, 1, 100, 2);
         assert_eq!(line.spans[2].content.as_ref(), "\u{2039}b");
+
+        // ZWJ emoji sequence (family = 4 pictographs joined by ZWJs, scalar
+        // width 8): a pan boundary inside the cluster drops it WHOLE and
+        // pads the overshoot, so no partial family or dangling joiner ever
+        // renders — and total columns stay consistent with per-scalar math.
+        let family = "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        let content = format!("{family}abcdefgh");
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 4, 100, 2); // boundary lands mid-cluster
+        let visible = line.spans[2].content.as_ref();
+        assert!(!visible.contains('\u{200d}'), "no joiner may survive a mid-cluster pan");
+        assert!(!visible.contains('\u{1f469}'), "no partial family may render");
+        // 16 scalar cols originally; 4 panned → 12 remain (pad included).
+        assert_eq!(str_cols(visible), 12);
+        assert!(visible.ends_with("abcdefgh"));
+
+        // Right clip that lands after a ZWJ trims the dangling joiner.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 0, 15, 2); // 12 pinned + 3 → cuts inside the cluster
+        let visible: String = line.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+        assert!(!visible.trim_end_matches('\u{2026}').ends_with('\u{200d}'));
     }
 
     #[test]
