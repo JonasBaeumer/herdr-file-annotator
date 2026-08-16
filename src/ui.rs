@@ -30,7 +30,8 @@ use ratatui::{
     Frame, Terminal,
 };
 use syntect::easy::HighlightLines;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
@@ -591,40 +592,14 @@ fn pannable_cols(line: &Line) -> usize {
         .sum()
 }
 
-/// The display width of a row's final "cell" in its pannable (unpinned)
-/// content — its last nonzero-width scalar, ignoring any zero-width marks
-/// trailing it. 1 or 2 columns, matching whatever `char_cols` reports for
-/// that scalar (rows with no pannable content default to 1: there is
-/// nothing to protect, so no need to reserve for a wide glyph that isn't
-/// there).
+/// The display width of a row's final grapheme cluster in its pannable
+/// (unpinned) content — scalar-sum width per the render model, so a
+/// trailing family emoji reserves its full rendered footprint. Rows with
+/// no pannable content default to 1 (nothing to protect).
 fn trailing_cell_width(line: &Line) -> usize {
-    let tail: Vec<char> = line
-        .spans
-        .iter()
-        .skip(pinned_spans(line))
-        .flat_map(|s| s.content.chars())
-        .filter(|c| char_cols(*c) > 0)
-        .collect();
-    let Some(&last) = tail.last() else {
-        return 1;
-    };
-    if is_regional_indicator(last) {
-        // A trailing RI only stands alone if it's the odd one out in its
-        // run (no earlier RI in the run pairs with it — pairing is
-        // positional from the run's start). When the run length is even,
-        // the last TWO scalars are a complete flag pair, and reserving for
-        // only the final one isn't enough: the pair is atomic (fixed
-        // elsewhere in this file), but the marker-replacement step below
-        // only ever protects trailing zero-width marks on the char it
-        // overwrites, not a second cluster scalar — landing the pan
-        // boundary cleanly before such a flag would let the marker eat its
-        // first RI and orphan the second.
-        let run = tail.iter().rev().take_while(|&&c| is_regional_indicator(c)).count();
-        if run % 2 == 0 {
-            return 2;
-        }
-    }
-    char_cols(last)
+    let content: String =
+        line.spans.iter().skip(pinned_spans(line)).map(|s| s.content.as_ref()).collect();
+    content.graphemes(true).next_back().map(|g| str_cols(g).max(1)).unwrap_or(1)
 }
 
 /// The largest horizontal pan that still leaves the widest row's own final
@@ -1472,71 +1447,29 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
     frame.render_widget(paragraph, area);
 }
 
-/// A char's rendered terminal width (CJK/emoji are 2 columns, combining
-/// marks 0) — `chars().count()` is NOT this, and using it here made pans
-/// move double the columns and clipping miss on wide-character content.
-///
-/// Deliberate: widths are per-scalar sums (ratatui's own model via
-/// unicode-width), NOT grapheme-cluster widths. A ZWJ emoji sequence counts
-/// each pictograph, because that is exactly how ratatui pads and truncates
-/// what we hand it — diverging from the render layer's arithmetic would
-/// misalign every row. Cluster ATOMICITY (never splitting one) is handled
-/// separately in `pan_and_clip`.
-fn char_cols(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(0)
-}
-
-/// Skin-tone modifiers attach to the preceding emoji without a joiner.
-fn is_emoji_modifier(c: char) -> bool {
-    ('\u{1f3fb}'..='\u{1f3ff}').contains(&c)
-}
-
-/// Regional-indicator symbols (A-Z, doubled). A flag is exactly TWO of
-/// these back to back — with no joiner or other marker between them,
-/// unlike every other cluster this file tracks — so pairing is purely
-/// positional: they pair up from the start of each maximal run of them.
-fn is_regional_indicator(c: char) -> bool {
-    ('\u{1f1e6}'..='\u{1f1ff}').contains(&c)
-}
-
 fn str_cols(s: &str) -> usize {
     UnicodeWidthStr::width(s)
-}
-
-/// The scalar count of the FIRST cluster in `chars`: the leading scalar
-/// plus everything glued to it — trailing zero-width marks, a skin-tone
-/// modifier, pictographs continuing a ZWJ chain, or (when the leading
-/// scalar is a regional indicator) its flag partner. Mirrors the same
-/// cluster rules the pan-left crossing predicate and right-clip walk-back
-/// already enforce, just scanning forward instead of backward — used to
-/// mark the pan cut on a whole cluster instead of splitting it.
-fn leading_cluster_len(chars: &[char]) -> usize {
-    let Some(&first) = chars.first() else {
-        return 0;
-    };
-    if is_regional_indicator(first) && chars.get(1).is_some_and(|&c| is_regional_indicator(c)) {
-        return 2;
-    }
-    let mut i = 1;
-    let mut prev_zwj = first == '\u{200d}';
-    while let Some(&c) = chars.get(i) {
-        if char_cols(c) == 0 || is_emoji_modifier(c) || prev_zwj {
-            prev_zwj = c == '\u{200d}';
-            i += 1;
-        } else {
-            break;
-        }
-    }
-    i
 }
 
 /// Pan a rendered row `hscroll` display columns to the left — keeping its
 /// first `pinned` spans (gutter + origin marker) in place — then clip it to
 /// `width` display columns. Clipped edges get dim `‹` / `…` indicators so
-/// the reviewer can tell content continues off-screen. All arithmetic is in
-/// terminal columns, not chars: a wide char straddling the pan boundary is
-/// dropped whole and replaced by a pad space so columns stay aligned across
-/// rows.
+/// the reviewer can tell content continues off-screen.
+///
+/// Two invariants, deliberately separate:
+/// - WIDTHS are unicode-width 0.2 string widths per grapheme — the exact
+///   crate+version pair ratatui 0.29 pins for its own rendering, so a ZWJ
+///   family emoji counts whatever ratatui will actually draw it as.
+///   Diverging from the render layer's math would misalign every row.
+/// - ATOMICITY is by extended grapheme cluster (UAX #29 via
+///   unicode-segmentation): a boundary never splits a cluster — no half
+///   families, orphaned flag halves, or bare Indic conjunct pieces. A
+///   cluster straddling the pan boundary drops whole with pad spaces so
+///   columns stay aligned; one straddling the clip budget drops whole under
+///   the … marker. Earlier hand-rolled ZWJ/flag/modifier heuristics kept
+///   missing scripts (viramas were next); UAX #29 is the single primitive
+///   that ends that series. Segmentation runs per span — syntect splits on
+///   token boundaries, which do not land inside grapheme clusters.
 fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: usize) {
     let pinned = pinned.min(line.spans.len());
 
@@ -1544,79 +1477,43 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
         let mut col = 0usize; // columns consumed from the unpinned content
         let mut dropped = false;
         let mut pad_cols = 0usize; // columns dropped past the boundary, refilled as spaces
-        let mut crossing = true; // still owed: the tail of the last dropped cluster
-        let mut prev_zwj = false; // last dropped char was a zero-width joiner
-        // Toggles on every regional-indicator scalar processed, off on
-        // anything else: true means the char just processed was the FIRST
-        // (unpaired) half of a flag, so the very next RI scalar completes
-        // it and must be dropped too — unlike ZWJ chains, RI pairs have no
-        // separator to key off, only this odd/even position in the run.
-        let mut prev_regional = false;
         for span in line.spans.iter_mut().skip(pinned) {
-            if col >= hscroll && pad_cols == 0 && !crossing {
+            if col >= hscroll && pad_cols == 0 {
                 break;
             }
             let mut kept = String::new();
-            for c in span.content.chars() {
-                let w = char_cols(c);
-                let is_ri = is_regional_indicator(c);
+            for g in span.content.graphemes(true) {
+                let w = str_cols(g);
                 if col < hscroll {
+                    // Still panning: the cluster drops WHOLE; if it straddles
+                    // the boundary the overshoot comes back as pad spaces.
                     col += w;
                     dropped = true;
                     if col > hscroll {
-                        pad_cols += col - hscroll; // wide char straddled
+                        pad_cols += col - hscroll;
                     }
-                    prev_zwj = c == '\u{200d}';
-                    prev_regional = if is_ri { !prev_regional } else { false };
-                } else if crossing
-                    && (w == 0 || prev_zwj || is_emoji_modifier(c) || (is_ri && prev_regional))
-                {
-                    // The tail of the last dropped grapheme cluster: combining
-                    // marks and ZWJ/VS scalars (width 0), a pictograph joined
-                    // by a preceding ZWJ, a skin-tone modifier, or the second
-                    // half of a regional-indicator flag pair. Dropping a
-                    // cluster partially would render a DIFFERENT glyph (half a
-                    // family emoji, an orphaned flag letter) or leave a joiner
-                    // to fuse with the clip marker — drop the whole cluster
-                    // and pad the columns.
-                    pad_cols += w;
-                    dropped = true;
-                    prev_zwj = c == '\u{200d}';
-                    prev_regional = if is_ri { !prev_regional } else { false };
                 } else {
-                    crossing = false;
                     if pad_cols > 0 {
                         kept.extend(std::iter::repeat(' ').take(pad_cols));
                         pad_cols = 0;
                     }
-                    kept.push(c);
+                    kept.push_str(g);
                 }
             }
             span.content = kept.into();
         }
         if dropped {
-            // Mark the left clip on the first visible CLUSTER — not just
-            // its first scalar — preserving the cluster's total display
-            // width (a multi-column cluster becomes "‹" plus padding
-            // spaces, same convention as a single wide char). Replacing
-            // only the first scalar would split a cluster the pan logic
-            // above went out of its way to keep atomic — e.g. an RI flag
-            // pair landing right at the pan boundary: the old code
-            // replaced just the first indicator, orphaning the second
-            // ("‹🇸" instead of the whole flag).
+            // Mark the left clip on the first visible cluster, preserving
+            // its full display width ("‹" plus pad spaces for wide clusters)
+            // so columns stay aligned with unpanned rows.
             for span in line.spans.iter_mut().skip(pinned) {
                 if !span.content.is_empty() {
-                    let chars: Vec<char> = span.content.chars().collect();
-                    let cluster_len = leading_cluster_len(&chars);
-                    let cluster_width =
-                        chars[..cluster_len].iter().map(|&c| char_cols(c)).sum::<usize>().max(1);
-                    let rest: String = chars[cluster_len..].iter().collect();
-                    let marked = if cluster_width >= 2 {
-                        format!("\u{2039}{}{rest}", " ".repeat(cluster_width - 1))
-                    } else {
-                        format!("\u{2039}{rest}")
-                    };
-                    span.content = marked.into();
+                    let mut graphemes = span.content.graphemes(true);
+                    let first = graphemes.next().unwrap_or_default();
+                    let cluster_width = str_cols(first).max(1);
+                    let rest: String = graphemes.collect();
+                    span.content =
+                        format!("\u{2039}{}{rest}", " ".repeat(cluster_width - 1)).into();
                     break;
                 }
             }
@@ -1634,86 +1531,21 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
                 continue;
             }
             let mut kept = String::new();
-            // Set when the scalar that missed the budget is itself glue (a
-            // zero-width mark, ZWJ, skin-tone modifier, or the second half
-            // of a regional-indicator flag pair) — the retained prefix is
-            // then a cluster sliced in half, not a clean cut.
-            let mut cut_mid_cluster = false;
-            for c in span.content.chars() {
-                let w = char_cols(c);
+            for g in span.content.graphemes(true) {
+                let w = str_cols(g);
                 if used + w > keep {
-                    // A flag pair is cut in half when the dropped scalar is
-                    // itself an RI completing an odd (unpaired) trailing
-                    // run already in `kept` — an RI landing after a
-                    // COMPLETE pair just starts a fresh, untouched flag.
-                    let splits_a_flag = is_regional_indicator(c)
-                        && kept
-                            .chars()
-                            .rev()
-                            .take_while(|&k| is_regional_indicator(k))
-                            .count()
-                            % 2
-                            == 1;
-                    cut_mid_cluster = w == 0 || is_emoji_modifier(c) || splits_a_flag;
+                    // The straddling cluster drops whole: rendering a
+                    // truncated prefix would show a DIFFERENT glyph (a
+                    // family cut to a couple, half a flag, a bare conjunct).
                     break;
                 }
-                kept.push(c);
+                kept.push_str(g);
                 used += w;
             }
-            // A cut landing right after a ZWJ (the joiner fit, the
-            // pictograph it introduces did not) is the same half-cluster
-            // case, visible from the retained side instead of the dropped one.
-            cut_mid_cluster |= kept.chars().last() == Some('\u{200d}');
-            if cut_mid_cluster {
-                // Walk the retained tail back to the cluster head — every
-                // pictograph joined by a ZWJ, every skin-tone modifier, and
-                // every zero-width mark — and drop the WHOLE cluster rather
-                // than render a truncated prefix, which is a DIFFERENT glyph
-                // (e.g. a four-person family missing its last member renders
-                // as a couple). `glued` tracks whether the character just
-                // removed (immediately to the right of the current tail)
-                // was itself glue; a real char is only part of the cut
-                // cluster — and thus also dropped — when it was.
-                let mut chars: Vec<char> = kept.chars().collect();
-                let mut glued = true; // the budget boundary itself was glue
-                while let Some(&c) = chars.last() {
-                    let w = char_cols(c);
-                    if w == 0 || is_emoji_modifier(c) {
-                        chars.pop();
-                        glued = true;
-                    } else if glued {
-                        chars.pop();
-                        glued = false;
-                    } else {
-                        break;
-                    }
-                }
-                kept = chars.into_iter().collect();
-            }
             span.content = kept.into();
-            // Force every following span to truncate to empty (a wide char
-            // stopping short of `keep` leaves at most a one-column gap).
+            // Force every following span to truncate to empty (a dropped
+            // straddler leaves at most a small gap before the marker).
             used = keep;
-        }
-        // Never leave a dangling joiner or bare marks at the cut: a trailing
-        // ZWJ would fuse the last glyph with the … marker into a nonsense
-        // cluster. (Belt-and-suspenders: the walk-back above already
-        // handles this for the span that was actually cut.)
-        for span in line.spans.iter_mut().rev() {
-            if span.content.is_empty() {
-                continue;
-            }
-            while span
-                .content
-                .chars()
-                .last()
-                .is_some_and(|c| c == '\u{200d}' || char_cols(c) == 0)
-            {
-                let mut chars: Vec<char> = span.content.chars().collect();
-                chars.pop();
-                span.content = chars.into_iter().collect::<String>().into();
-            }
-            break;
         }
         line.spans.push(Span::styled("\u{2026}", Style::default().fg(Color::DarkGray)));
     }
@@ -2566,20 +2398,22 @@ mod tests {
         pan_and_clip(&mut line, 1, 100, 2);
         assert_eq!(line.spans[2].content.as_ref(), "\u{2039}b");
 
-        // ZWJ emoji sequence (family = 4 pictographs joined by ZWJs, scalar
-        // width 8): a pan boundary inside the cluster drops it WHOLE and
-        // pads the overshoot, so no partial family or dangling joiner ever
-        // renders — and total columns stay consistent with per-scalar math.
+        // ZWJ emoji sequence (family): ONE grapheme cluster, whose width is
+        // whatever unicode-width 0.2 says ratatui will render it as. A pan
+        // boundary can only ever drop it whole — no partial family, no
+        // dangling joiner — and the remaining columns follow exactly.
         let family = "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
         let content = format!("{family}abcdefgh");
+        let total_before = str_cols(&content);
         let mut line = mk(&content);
-        pan_and_clip(&mut line, 4, 100, 2); // boundary lands mid-cluster
+        pan_and_clip(&mut line, 4, 100, 2);
         let visible = line.spans[2].content.as_ref();
-        assert!(!visible.contains('\u{200d}'), "no joiner may survive a mid-cluster pan");
-        assert!(!visible.contains('\u{1f469}'), "no partial family may render");
-        // 16 scalar cols originally; 4 panned → 12 remain (pad included).
-        assert_eq!(str_cols(visible), 12);
-        assert!(visible.ends_with("abcdefgh"));
+        assert!(!visible.contains('\u{200d}'), "no joiner may survive a pan");
+        assert!(
+            visible.contains(family) || !visible.contains('\u{1f469}'),
+            "family must be whole or gone, never partial: {visible:?}"
+        );
+        assert_eq!(str_cols(visible), total_before - 4);
 
         // Right clip that lands after a ZWJ trims the dangling joiner.
         let mut line = mk(&content);
@@ -2587,24 +2421,45 @@ mod tests {
         let visible: String = line.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
         assert!(!visible.trim_end_matches('\u{2026}').ends_with('\u{200d}'));
 
-        // Regression (Codex P1, thread 3792159813): right clip landing
-        // after the family's SECOND pictograph. The old cleanup only
-        // trimmed the trailing joiner, leaving "woman ZWJ woman" behind —
-        // a COUPLE, a genuinely different emoji from the source family.
-        // The cut must drop the WHOLE cluster, retained pictographs
-        // included, not just the dangling joiner.
+        // Regression (Codex P1, thread 3792159813): a right clip must never
+        // render a partial family (a COUPLE is a genuinely different emoji).
+        // Under the render model the whole family is one narrow cluster, so
+        // it either fits entirely or drops entirely — assert exactly that
+        // invariant at a budget that cuts within the following text, and at
+        // one too small for the cluster at all.
         let mut line = mk(&content);
-        pan_and_clip(&mut line, 0, 17, 2); // 12 pinned + 4 → cuts before the 3rd member
-        let visible = line.spans[2].content.as_ref();
+        pan_and_clip(&mut line, 0, 17, 2);
+        let visible = line.spans[2].content.as_ref().to_string();
         assert!(
-            visible.is_empty(),
-            "no pictograph from the cut cluster may survive, got {visible:?}"
+            visible.contains(family) || !visible.contains('\u{1f469}'),
+            "family must be whole or gone, never a couple: {visible:?}"
         );
-        assert!(!visible.contains('\u{200d}'), "no joiner may survive either");
-        assert!(!visible.contains('\u{1f469}'), "no partial family may render as a couple");
         let total: usize = line.spans.iter().map(|s| str_cols(s.content.as_ref())).sum();
         assert!(total <= 17, "rendered {total} cols > width 17");
         assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // Budget of a single column cannot hold the 2-col family cluster:
+        // it drops whole, no couple, no dangling joiner.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 0, 14, 2); // 12 pinned + 1 col budget
+        let visible = line.spans[2].content.as_ref();
+        assert!(visible.is_empty(), "cluster over budget must drop whole, got {visible:?}");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // Regression (Codex P1, thread 3792495132): Indic conjuncts. KA +
+        // virama + SSA is ONE cluster (UAX #29 GB9c); the old zero-width
+        // heuristics dropped the virama but kept SSA, rendering "‹ष" — a
+        // bare consonant instead of the source conjunct. The marker must
+        // consume the conjunct whole.
+        let conjunct = "\u{915}\u{94d}\u{937}"; // क्ष
+        let mut line = mk(&format!("a{conjunct}b"));
+        pan_and_clip(&mut line, 1, 100, 2); // pan off the 'a'
+        let visible = line.spans[2].content.as_ref();
+        assert!(
+            visible.contains(conjunct) || !visible.contains('\u{937}'),
+            "conjunct must be whole or gone, never a bare piece: {visible:?}"
+        );
+        assert!(visible.starts_with('\u{2039}'));
     }
 
     #[test]
@@ -2625,17 +2480,20 @@ mod tests {
         let flag = "\u{1f1fa}\u{1f1f8}"; // US flag: 2 RI scalars, 1 col each
         let content = format!("{flag}abcdefgh");
 
-        // Pan boundary lands mid-cluster ahead of the flag (inside a CJK
-        // char, bridged by a ZWJ) so the crossing run reaches the flag with
-        // pad already owed — the lone marker-replacement on a bare leading
-        // flag would otherwise coincidentally hide an unfixed orphan; this
-        // shape doesn't. Both RI scalars must still go together.
-        let bridged = format!("\u{4f60}\u{200d}{content}"); // CJK + ZWJ + flag + text
+        // Pan boundary lands inside the cluster ahead of the flag (a CJK
+        // char carrying a trailing ZWJ — per UAX #29 the ZWJ does NOT glue
+        // it to the following flag, matching how terminals render it). The
+        // CJK cluster drops whole with a pad; the flag must survive INTACT:
+        // the invariant is that a flag never splits, wherever the boundary
+        // lands.
+        let bridged = format!("\u{4f60}\u{200d}{content}"); // CJK+ZWJ cluster, then flag + text
         let mut line = mk(&bridged);
         pan_and_clip(&mut line, 1, 100, 2);
         let visible = line.spans[2].content.as_ref();
-        assert!(!visible.contains('\u{1f1fa}'), "no orphaned first RI, got {visible:?}");
-        assert!(!visible.contains('\u{1f1f8}'), "no orphaned second RI, got {visible:?}");
+        let intact = visible.contains(flag);
+        let absent = !visible.contains('\u{1f1fa}') && !visible.contains('\u{1f1f8}');
+        assert!(intact || absent, "flag must be whole or gone, never split: {visible:?}");
+        assert!(intact, "flag is a separate cluster and must survive this pan: {visible:?}");
         assert!(visible.ends_with("abcdefgh"), "trailing text intact, got {visible:?}");
 
         // Right clip lands between the two RI scalars (first kept, second
