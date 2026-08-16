@@ -803,11 +803,14 @@ impl<'a> App<'a> {
         DispMap::new(ends)
     }
 
-    /// Largest useful horizontal pan for the selected file: one column short
-    /// of its widest row's pannable width, so the tail of every line —
-    /// including generated/minified ones — stays reachable with no magic cap.
+    /// Largest useful horizontal pan for the selected file: three columns
+    /// short of its widest row's pannable width, leaving room for the `‹`
+    /// clip marker (1 col) plus the final glyph even when it is double-width
+    /// (2 cols) — otherwise, at maximum pan the marker replaces the last
+    /// visible character and the 8-col step granularity can make the
+    /// intermediate offsets that would reveal it unreachable.
     fn pan_cap(&self) -> usize {
-        self.pan_limit.get(&self.nav.selected).copied().unwrap_or(0).saturating_sub(1)
+        self.pan_limit.get(&self.nav.selected).copied().unwrap_or(0).saturating_sub(3)
     }
 
     /// Display-space scroll follow, run after every key that can move the
@@ -1056,7 +1059,13 @@ impl<'a> App<'a> {
                         self.diff.hscroll = self.diff.hscroll.saturating_sub(HSCROLL_STEP)
                     }
                     KeyCode::Char('0') => self.diff.hscroll = 0,
-                    KeyCode::Char('h') | KeyCode::Tab => self.focus = Focus::Navigator,
+                    KeyCode::Char('h') | KeyCode::Tab => {
+                        // Focusing an invisible pane strands the keyboard
+                        // (j/k would switch files with no visible feedback):
+                        // going "to the files" while collapsed reveals them.
+                        self.show_navigator = true;
+                        self.focus = Focus::Navigator;
+                    }
                     KeyCode::Char('v') => {
                         self.visual_anchor = match self.visual_anchor {
                             Some(_) => None,
@@ -1974,14 +1983,61 @@ mod tests {
         let mut app = App::new(&request, &model);
         app.focus = Focus::Diff;
 
-        assert_eq!(app.pan_cap(), 1499); // widest pannable row minus one
+        // Widest pannable row minus three: the ‹ marker (1 col) plus a
+        // possibly double-width final glyph (2 cols) stay visible at max pan.
+        assert_eq!(app.pan_cap(), 1497);
 
         let term = Size { width: 120, height: 30 };
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         for _ in 0..500 {
             app.handle_key(right, term);
         }
-        assert_eq!(app.diff.hscroll, 1499, "pan must reach the line's end, past 1000");
+        assert_eq!(app.diff.hscroll, 1497, "pan must reach the line's end, past 1000");
+
+        // At maximum pan the final character is genuinely inspectable: the
+        // marker lands before it, not on it.
+        let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+        pan_and_clip(&mut row, app.diff.hscroll, 120, 2);
+        let tail: String =
+            row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+        assert!(tail.ends_with("xx"), "final glyph visible past the ‹ marker, got {tail:?}");
+    }
+
+    #[test]
+    fn focusing_files_from_a_collapsed_navigator_reveals_it() {
+        // Regression (Codex P2): h/Tab focused the hidden navigator, so j/k
+        // switched files invisibly and diff keys went dead.
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.py".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,1 @@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![line(Origin::Add, None, Some(1), "x")],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.show_navigator = false;
+
+        let term = Size { width: 120, height: 30 };
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), term);
+        assert!(app.show_navigator, "focusing the files must reveal them");
+        assert!(matches!(app.focus, Focus::Navigator));
     }
 
     #[test]
