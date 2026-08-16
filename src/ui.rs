@@ -598,14 +598,33 @@ fn pannable_cols(line: &Line) -> usize {
 /// nothing to protect, so no need to reserve for a wide glyph that isn't
 /// there).
 fn trailing_cell_width(line: &Line) -> usize {
-    line.spans
+    let tail: Vec<char> = line
+        .spans
         .iter()
         .skip(pinned_spans(line))
         .flat_map(|s| s.content.chars())
         .filter(|c| char_cols(*c) > 0)
-        .last()
-        .map(char_cols)
-        .unwrap_or(1)
+        .collect();
+    let Some(&last) = tail.last() else {
+        return 1;
+    };
+    if is_regional_indicator(last) {
+        // A trailing RI only stands alone if it's the odd one out in its
+        // run (no earlier RI in the run pairs with it — pairing is
+        // positional from the run's start). When the run length is even,
+        // the last TWO scalars are a complete flag pair, and reserving for
+        // only the final one isn't enough: the pair is atomic (fixed
+        // elsewhere in this file), but the marker-replacement step below
+        // only ever protects trailing zero-width marks on the char it
+        // overwrites, not a second cluster scalar — landing the pan
+        // boundary cleanly before such a flag would let the marker eat its
+        // first RI and orphan the second.
+        let run = tail.iter().rev().take_while(|&&c| is_regional_indicator(c)).count();
+        if run % 2 == 0 {
+            return 2;
+        }
+    }
+    char_cols(last)
 }
 
 /// The largest horizontal pan that still leaves the widest row's own final
@@ -2313,6 +2332,57 @@ mod tests {
             app.handle_key(right, term);
         }
         assert_eq!(app.diff.hscroll, app.pan_cap(), "must still reach the file-wide pan cap");
+    }
+
+    #[test]
+    fn pan_cap_protects_a_trailing_flag_pair_whole() {
+        // Regression (Codex P1, thread 3792439091): trailing_cell_width
+        // sized the reserve from only the row's LAST scalar. For a row
+        // ending in a regional-indicator flag, that scalar is one RI (1
+        // col) — but a flag is an atomic 2-scalar pair (fixed elsewhere in
+        // this file). Reserving for only the last scalar let pan_cap land
+        // the boundary cleanly BEFORE the flag, where the marker-
+        // replacement step (which only ever protects trailing zero-width
+        // marks on the char it overwrites, not a whole second cluster
+        // scalar) ate the flag's first RI and left the second standing
+        // alone.
+        let content = "abcdef\u{1f1fa}\u{1f1f8}"; // 6 letters + US flag (2 RI scalars)
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 1,
+                lines: vec![line(Origin::Add, None, Some(1), content)],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let app = App::new(&request, &model);
+
+        // 8 pannable cols total (6 letters + 2 RI scalars); the reserve
+        // must protect the whole 2-col pair, not just its last scalar.
+        assert_eq!(app.pan_cap(), 5, "reserve must be 1 (marker) + 2 (whole flag pair)");
+
+        let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+        pan_and_clip(&mut row, app.pan_cap(), 100, 2);
+        let visible = row.spans[2].content.as_ref();
+        assert!(
+            visible.contains('\u{1f1fa}') && visible.contains('\u{1f1f8}'),
+            "the whole flag must survive together at max pan, got {visible:?}"
+        );
     }
 
     #[test]
