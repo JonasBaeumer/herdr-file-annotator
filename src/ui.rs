@@ -849,6 +849,33 @@ impl<'a> App<'a> {
         self.pan_limit.get(&self.nav.selected).copied().unwrap_or(0)
     }
 
+    /// The horizontal-pan offset a single rightward step should land on: a
+    /// full `HSCROLL_STEP` jump, UNLESS some row's pannable width sits
+    /// strictly inside that jump. A short row would otherwise vanish from
+    /// "showing its first few columns" straight to "fully panned off,
+    /// empty" in one step — with a much longer row elsewhere in the same
+    /// file supplying a big enough `pan_cap`, every offset that would have
+    /// revealed the short row's remaining content becomes permanently
+    /// unreachable (Right/Left only ever move in whole `HSCROLL_STEP`s).
+    /// Stepping by a single column instead whenever that would happen keeps
+    /// every row's content reachable, while long lines with no such
+    /// short-row conflict still jump the full step.
+    fn next_pan_stop(&self, current: usize) -> usize {
+        let target = current + HSCROLL_STEP;
+        let overshoots_a_row = self
+            .row_cache
+            .get(&self.nav.selected)
+            .into_iter()
+            .flatten()
+            .map(pannable_cols)
+            .any(|cols| cols > current && cols < target);
+        if overshoots_a_row {
+            current + 1
+        } else {
+            target
+        }
+    }
+
     /// Display-space scroll follow, run after every key that can move the
     /// cursor or change which comment rows exist.
     fn ensure_cursor_visible(&mut self, term_size: Size) {
@@ -927,7 +954,7 @@ impl<'a> App<'a> {
             }
             MouseEventKind::ScrollRight => {
                 if in_diff {
-                    self.diff.hscroll = (self.diff.hscroll + HSCROLL_STEP).min(self.pan_cap());
+                    self.diff.hscroll = self.next_pan_stop(self.diff.hscroll).min(self.pan_cap());
                 }
             }
             MouseEventKind::ScrollLeft => {
@@ -1089,7 +1116,8 @@ impl<'a> App<'a> {
                     KeyCode::Char('g') => self.diff.top(),
                     KeyCode::Char('G') => self.diff.bottom(row_count),
                     KeyCode::Right | KeyCode::Char('L') => {
-                        self.diff.hscroll = (self.diff.hscroll + HSCROLL_STEP).min(self.pan_cap())
+                        self.diff.hscroll =
+                            self.next_pan_stop(self.diff.hscroll).min(self.pan_cap())
                     }
                     KeyCode::Left | KeyCode::Char('H') => {
                         self.diff.hscroll = self.diff.hscroll.saturating_sub(HSCROLL_STEP)
@@ -1438,6 +1466,14 @@ fn is_emoji_modifier(c: char) -> bool {
     ('\u{1f3fb}'..='\u{1f3ff}').contains(&c)
 }
 
+/// Regional-indicator symbols (A-Z, doubled). A flag is exactly TWO of
+/// these back to back — with no joiner or other marker between them,
+/// unlike every other cluster this file tracks — so pairing is purely
+/// positional: they pair up from the start of each maximal run of them.
+fn is_regional_indicator(c: char) -> bool {
+    ('\u{1f1e6}'..='\u{1f1ff}').contains(&c)
+}
+
 fn str_cols(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
@@ -1458,6 +1494,12 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
         let mut pad_cols = 0usize; // columns dropped past the boundary, refilled as spaces
         let mut crossing = true; // still owed: the tail of the last dropped cluster
         let mut prev_zwj = false; // last dropped char was a zero-width joiner
+        // Toggles on every regional-indicator scalar processed, off on
+        // anything else: true means the char just processed was the FIRST
+        // (unpaired) half of a flag, so the very next RI scalar completes
+        // it and must be dropped too — unlike ZWJ chains, RI pairs have no
+        // separator to key off, only this odd/even position in the run.
+        let mut prev_regional = false;
         for span in line.spans.iter_mut().skip(pinned) {
             if col >= hscroll && pad_cols == 0 && !crossing {
                 break;
@@ -1465,6 +1507,7 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
             let mut kept = String::new();
             for c in span.content.chars() {
                 let w = char_cols(c);
+                let is_ri = is_regional_indicator(c);
                 if col < hscroll {
                     col += w;
                     dropped = true;
@@ -1472,16 +1515,22 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
                         pad_cols += col - hscroll; // wide char straddled
                     }
                     prev_zwj = c == '\u{200d}';
-                } else if crossing && (w == 0 || prev_zwj || is_emoji_modifier(c)) {
+                    prev_regional = if is_ri { !prev_regional } else { false };
+                } else if crossing
+                    && (w == 0 || prev_zwj || is_emoji_modifier(c) || (is_ri && prev_regional))
+                {
                     // The tail of the last dropped grapheme cluster: combining
                     // marks and ZWJ/VS scalars (width 0), a pictograph joined
-                    // by a preceding ZWJ, or a skin-tone modifier. Dropping a
+                    // by a preceding ZWJ, a skin-tone modifier, or the second
+                    // half of a regional-indicator flag pair. Dropping a
                     // cluster partially would render a DIFFERENT glyph (half a
-                    // family emoji) or leave a joiner to fuse with the clip
-                    // marker — drop the whole cluster and pad the columns.
+                    // family emoji, an orphaned flag letter) or leave a joiner
+                    // to fuse with the clip marker — drop the whole cluster
+                    // and pad the columns.
                     pad_cols += w;
                     dropped = true;
                     prev_zwj = c == '\u{200d}';
+                    prev_regional = if is_ri { !prev_regional } else { false };
                 } else {
                     crossing = false;
                     if pad_cols > 0 {
@@ -1530,13 +1579,26 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
             }
             let mut kept = String::new();
             // Set when the scalar that missed the budget is itself glue (a
-            // zero-width mark, ZWJ, or skin-tone modifier) — the retained
-            // prefix is then a cluster sliced in half, not a clean cut.
+            // zero-width mark, ZWJ, skin-tone modifier, or the second half
+            // of a regional-indicator flag pair) — the retained prefix is
+            // then a cluster sliced in half, not a clean cut.
             let mut cut_mid_cluster = false;
             for c in span.content.chars() {
                 let w = char_cols(c);
                 if used + w > keep {
-                    cut_mid_cluster = w == 0 || is_emoji_modifier(c);
+                    // A flag pair is cut in half when the dropped scalar is
+                    // itself an RI completing an odd (unpaired) trailing
+                    // run already in `kept` — an RI landing after a
+                    // COMPLETE pair just starts a fresh, untouched flag.
+                    let splits_a_flag = is_regional_indicator(c)
+                        && kept
+                            .chars()
+                            .rev()
+                            .take_while(|&k| is_regional_indicator(k))
+                            .count()
+                            % 2
+                            == 1;
+                    cut_mid_cluster = w == 0 || is_emoji_modifier(c) || splits_a_flag;
                     break;
                 }
                 kept.push(c);
@@ -2185,6 +2247,75 @@ mod tests {
     }
 
     #[test]
+    fn short_rows_stay_reachable_when_a_longer_row_sets_a_big_pan_cap() {
+        // Regression (Codex P1): the fixed 8-column HSCROLL_STEP could jump
+        // straight past a short row's entire remaining content in one press
+        // when a much longer row (elsewhere in the same file) supplied a
+        // big file-wide pan_cap. A 6-char row's middle/final characters
+        // became permanently unreachable: Right skipped from "showing the
+        // first couple of chars" to "fully panned off, empty" without ever
+        // passing through the offsets that would reveal the rest, and Left
+        // only ever returns to 0 (same fixed step).
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "a.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 2,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@".to_string(), // shorter than either content line
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![
+                    line(Origin::Add, None, Some(1), "abcdef"),
+                    line(Origin::Add, None, Some(2), &"y".repeat(200)),
+                ],
+            }],
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![file] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        assert!(
+            app.pan_cap() > HSCROLL_STEP,
+            "the long row must set a cap well past a single step"
+        );
+
+        let term = Size { width: 16, height: 30 };
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+
+        // 11 pinned gutter/marker columns in a 14-column pane leaves 2
+        // content columns — the narrow case from the report. Every one of
+        // the short row's characters must surface in some frame as we step.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            app.handle_key(right, term);
+            let mut row = app.row_cache.get(&0).unwrap()[1].clone();
+            pan_and_clip(&mut row, app.diff.hscroll, 14, 2);
+            let tail: String = row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
+            seen.extend(tail.chars());
+        }
+        for c in "cdef".chars() {
+            assert!(seen.contains(&c), "{c:?} never became visible while panning, saw {seen:?}");
+        }
+
+        // Fine-stepping past the short row must not cripple navigation on
+        // the long row: Right still reaches the file's real pan cap.
+        for _ in 0..300 {
+            app.handle_key(right, term);
+        }
+        assert_eq!(app.diff.hscroll, app.pan_cap(), "must still reach the file-wide pan cap");
+    }
+
+    #[test]
     fn focusing_files_from_a_collapsed_navigator_reveals_it() {
         // Regression (Codex P2): h/Tab focused the hidden navigator, so j/k
         // switched files invisibly and diff keys went dead.
@@ -2311,6 +2442,56 @@ mod tests {
         let total: usize = line.spans.iter().map(|s| str_cols(s.content.as_ref())).sum();
         assert!(total <= 17, "rendered {total} cols > width 17");
         assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+    }
+
+    #[test]
+    fn pan_and_clip_keeps_regional_indicator_flags_atomic() {
+        // Regression (Codex P1, thread 3792368958): a flag is exactly two
+        // regional-indicator scalars with NO joiner between them (unlike
+        // every other cluster this file protects) — pairing is purely
+        // positional. A pan or clip boundary landing between the two used
+        // to drop only one, leaving the other to render alone as an
+        // orphaned boxed letter instead of the source flag.
+        let mk = |content: &str| {
+            Line::from(vec![
+                Span::raw("   1    2  "), // 11-col mock gutter (pinned)
+                Span::raw("+"),           // 1-col mock marker (pinned)
+                Span::raw(content.to_string()),
+            ])
+        };
+        let flag = "\u{1f1fa}\u{1f1f8}"; // US flag: 2 RI scalars, 1 col each
+        let content = format!("{flag}abcdefgh");
+
+        // Pan boundary lands mid-cluster ahead of the flag (inside a CJK
+        // char, bridged by a ZWJ) so the crossing run reaches the flag with
+        // pad already owed — the lone marker-replacement on a bare leading
+        // flag would otherwise coincidentally hide an unfixed orphan; this
+        // shape doesn't. Both RI scalars must still go together.
+        let bridged = format!("\u{4f60}\u{200d}{content}"); // CJK + ZWJ + flag + text
+        let mut line = mk(&bridged);
+        pan_and_clip(&mut line, 1, 100, 2);
+        let visible = line.spans[2].content.as_ref();
+        assert!(!visible.contains('\u{1f1fa}'), "no orphaned first RI, got {visible:?}");
+        assert!(!visible.contains('\u{1f1f8}'), "no orphaned second RI, got {visible:?}");
+        assert!(visible.ends_with("abcdefgh"), "trailing text intact, got {visible:?}");
+
+        // Right clip lands between the two RI scalars (first kept, second
+        // dropped by the budget): the walk-back must drop the retained
+        // first RI too, not leave it standing alone.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 0, 14, 2); // 12 pinned + 1 → cuts inside the flag
+        let visible = line.spans[2].content.as_ref();
+        assert!(visible.is_empty(), "no lone RI from the cut flag may survive, got {visible:?}");
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // A clean cut exactly AT the flag boundary (not inside it) is
+        // unaffected: the whole flag pans off normally, nothing orphaned.
+        // The ‹ marker replaces the first surviving cell ('a'), as usual.
+        let mut line = mk(&content);
+        pan_and_clip(&mut line, 2, 100, 2);
+        let visible = line.spans[2].content.as_ref();
+        assert!(!visible.contains('\u{1f1fa}') && !visible.contains('\u{1f1f8}'));
+        assert!(visible.ends_with("bcdefgh"), "got {visible:?}");
     }
 
     #[test]
