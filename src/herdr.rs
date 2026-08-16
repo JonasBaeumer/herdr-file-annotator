@@ -17,6 +17,20 @@ fn herdr_bin() -> String {
     std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
 }
 
+/// Toggle zoom on the pane this process runs in (the review pane calls this
+/// for its `z` key). Best-effort: a failure is the caller's to ignore — zoom
+/// is a convenience, never a correctness matter.
+pub fn zoom_toggle_current() -> Result<()> {
+    let output = Command::new(herdr_bin())
+        .args(["pane", "zoom", "--current", "--toggle"])
+        .output()
+        .context("spawning herdr CLI for zoom")?;
+    if !output.status.success() {
+        bail!("`herdr pane zoom` failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
 pub fn inside_herdr() -> bool {
     std::env::var("HERDR_ENV").as_deref() == Ok("1")
 }

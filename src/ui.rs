@@ -170,11 +170,15 @@ struct DiffViewState {
     /// The addressed row — what j/k move, what gets highlighted, and what a
     /// future annotation anchors to.
     cursor: usize,
+    /// Horizontal pan (columns of code shifted off the left edge); the
+    /// line-number gutter and origin marker stay pinned.
+    hscroll: usize,
 }
 
 impl DiffViewState {
     fn reset(&mut self) {
         self.scroll = 0;
+        self.hscroll = 0;
         self.cursor = 0;
     }
 
@@ -456,31 +460,34 @@ fn resolve_annotation(
 /// logic as the real layout (header + note + footer chrome, then body_split,
 /// then the diff pane's top/bottom border) — so cursor-following stays
 /// correct in both the side-by-side and stacked layouts.
-fn diff_viewport_rows(term_size: Size) -> usize {
+fn diff_viewport_rows(term_size: Size, show_navigator: bool) -> usize {
     let body = Rect::new(0, 0, term_size.width, term_size.height.saturating_sub(3));
-    let (_, diff_area) = body_split(body);
+    let (_, diff_area) = body_split(body, show_navigator);
     (diff_area.height.saturating_sub(2) as usize).max(1)
 }
 
 /// Half a screen's worth of diff rows.
-fn half_page(term_size: Size) -> usize {
-    (diff_viewport_rows(term_size) / 2).max(1)
+fn half_page(term_size: Size, show_navigator: bool) -> usize {
+    (diff_viewport_rows(term_size, show_navigator) / 2).max(1)
 }
 
 /// Display rows a wheel/trackpad tick scrolls the diff.
 const WHEEL_STEP: usize = 3;
 
+/// Columns one horizontal pan step shifts the code.
+const HSCROLL_STEP: usize = 8;
+
 /// The navigator/diff rects for mouse hit-testing, mirroring `draw`'s
 /// layout: header (1) + note (1) above the body, footer (1) below.
-fn body_rects(term_size: Size) -> (Rect, Rect) {
+fn body_rects(term_size: Size, show_navigator: bool) -> (Rect, Rect) {
     let body = Rect::new(0, 2, term_size.width, term_size.height.saturating_sub(3));
-    body_split(body)
+    body_split(body, show_navigator)
 }
 
 /// Inner (borderless) width of the diff pane — the wrap width for inline
 /// comments; must match what `draw_diff` derives from its render area.
-fn diff_inner_width(term_size: Size) -> usize {
-    let (_, diff_rect) = body_rects(term_size);
+fn diff_inner_width(term_size: Size, show_navigator: bool) -> usize {
+    let (_, diff_rect) = body_rects(term_size, show_navigator);
     (diff_rect.width.saturating_sub(2)).max(1) as usize
 }
 
@@ -539,6 +546,8 @@ struct App<'a> {
     /// Base row where a left-button press landed in the diff; a subsequent
     /// drag turns it into the visual anchor (mouse range selection).
     drag_origin: Option<usize>,
+    /// `b` collapses the file navigator to give the diff the full width.
+    show_navigator: bool,
     /// Annotations the reviewer has left so far, in creation order.
     pending: Vec<PendingAnnotation>,
     /// Fully syntax-highlighted body rows per file, keyed by index into
@@ -569,6 +578,7 @@ impl<'a> App<'a> {
             input: None,
             visual_anchor: None,
             drag_origin: None,
+            show_navigator: true,
             pending: Vec::new(),
             row_cache,
         }
@@ -712,6 +722,19 @@ impl<'a> App<'a> {
                 self.input = Some(InputMode::Summary { buf: String::new() });
                 return None;
             }
+            KeyCode::Char('b') => {
+                self.show_navigator = !self.show_navigator;
+                if !self.show_navigator && self.focus == Focus::Navigator {
+                    self.focus = Focus::Diff;
+                }
+                return None;
+            }
+            KeyCode::Char('z') => {
+                if let Err(err) = crate::herdr::zoom_toggle_current() {
+                    eprintln!("herdr-annotator pane: {err:#}");
+                }
+                return None;
+            }
             _ => {}
         }
 
@@ -746,12 +769,12 @@ impl<'a> App<'a> {
     /// Display-space scroll follow, run after every key that can move the
     /// cursor or change which comment rows exist.
     fn ensure_cursor_visible(&mut self, term_size: Size) {
-        let map = self.disp_map(diff_inner_width(term_size));
+        let map = self.disp_map(diff_inner_width(term_size, self.show_navigator));
         self.diff.scroll = follow_display(
             self.diff.scroll,
             self.diff.cursor,
             &map,
-            diff_viewport_rows(term_size),
+            diff_viewport_rows(term_size, self.show_navigator),
         );
     }
 
@@ -761,7 +784,7 @@ impl<'a> App<'a> {
         if self.input.is_some() {
             return;
         }
-        let (nav_rect, diff_rect) = body_rects(term_size);
+        let (nav_rect, diff_rect) = body_rects(term_size, self.show_navigator);
         let in_nav = rect_contains(nav_rect, mouse.column, mouse.row);
         let in_diff = rect_contains(diff_rect, mouse.column, mouse.row);
 
@@ -819,6 +842,16 @@ impl<'a> App<'a> {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_origin = None;
             }
+            MouseEventKind::ScrollRight => {
+                if in_diff {
+                    self.diff.hscroll = (self.diff.hscroll + HSCROLL_STEP).min(1000);
+                }
+            }
+            MouseEventKind::ScrollLeft => {
+                if in_diff {
+                    self.diff.hscroll = self.diff.hscroll.saturating_sub(HSCROLL_STEP);
+                }
+            }
             _ => {}
         }
     }
@@ -831,14 +864,14 @@ impl<'a> App<'a> {
         if base_count == 0 {
             return;
         }
-        let map = self.disp_map(diff_inner_width(term_size));
+        let map = self.disp_map(diff_inner_width(term_size, self.show_navigator));
         let max_scroll = map.total(base_count).saturating_sub(1);
         self.diff.scroll = if down {
             (self.diff.scroll + WHEEL_STEP).min(max_scroll)
         } else {
             self.diff.scroll.saturating_sub(WHEEL_STEP)
         };
-        let viewport = diff_viewport_rows(term_size);
+        let viewport = diff_viewport_rows(term_size, self.show_navigator);
         let cursor_disp = map.disp(self.diff.cursor);
         if cursor_disp < self.diff.scroll {
             self.diff.cursor = map.base_at(self.diff.scroll, base_count);
@@ -959,10 +992,10 @@ impl<'a> App<'a> {
                     KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count),
                     KeyCode::Char('k') | KeyCode::Up => self.diff.up(),
                     KeyCode::Char('d') | KeyCode::PageDown => {
-                        self.diff.page_down(half_page(term_size), row_count)
+                        self.diff.page_down(half_page(term_size, self.show_navigator), row_count)
                     }
                     KeyCode::Char('u') | KeyCode::PageUp => {
-                        self.diff.page_up(half_page(term_size))
+                        self.diff.page_up(half_page(term_size, self.show_navigator))
                     }
                     KeyCode::Char('n') => {
                         self.diff.next_hunk(&hunk_row_indices(&self.diff_rows()))
@@ -972,6 +1005,13 @@ impl<'a> App<'a> {
                     }
                     KeyCode::Char('g') => self.diff.top(),
                     KeyCode::Char('G') => self.diff.bottom(row_count),
+                    KeyCode::Right | KeyCode::Char('L') => {
+                        self.diff.hscroll = (self.diff.hscroll + HSCROLL_STEP).min(1000)
+                    }
+                    KeyCode::Left | KeyCode::Char('H') => {
+                        self.diff.hscroll = self.diff.hscroll.saturating_sub(HSCROLL_STEP)
+                    }
+                    KeyCode::Char('0') => self.diff.hscroll = 0,
                     KeyCode::Char('h') | KeyCode::Tab => self.focus = Focus::Navigator,
                     KeyCode::Char('v') => {
                         self.visual_anchor = match self.visual_anchor {
@@ -1069,7 +1109,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 // "where am I" survives and only the key hints get cut.
                 let pos = app.cursor_position().unwrap_or_default();
                 format!(
-                    " {pos} \u{b7} j/k move \u{b7} d/u half page \u{b7} n/p hunk \u{b7} g/G top/bottom \u{b7} h/tab navigator \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} {GLOBAL_HINTS}"
+                    " {pos} \u{b7} j/k move \u{b7} \u{2190}/\u{2192} pan \u{b7} d/u half page \u{b7} n/p hunk \u{b7} b files \u{b7} z zoom \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} h/tab navigator \u{b7} {GLOBAL_HINTS}"
                 )
             }
         },
@@ -1100,7 +1140,11 @@ fn draw_empty_message(frame: &mut Frame, area: Rect) {
 /// stack: navigator strip on top, diff below.
 const STACK_THRESHOLD: u16 = 64;
 
-fn body_split(area: Rect) -> (Rect, Rect) {
+fn body_split(area: Rect, show_navigator: bool) -> (Rect, Rect) {
+    if !show_navigator {
+        // Navigator collapsed (`b`): the diff gets the whole body.
+        return (Rect::new(area.x, area.y, 0, 0), area);
+    }
     if area.width < STACK_THRESHOLD {
         let nav_height = ((area.height as u32 * 30 / 100) as u16).clamp(4, 10).min(area.height);
         let rows = Layout::default()
@@ -1128,14 +1172,18 @@ fn pane_block(title: impl std::fmt::Display, focused: bool) -> Block<'static> {
 }
 
 fn draw_panes(frame: &mut Frame, area: Rect, app: &App, files: &[FileDiff]) {
-    let (nav_area, diff_area) = body_split(area);
-    draw_navigator(frame, nav_area, app, files);
+    let (nav_area, diff_area) = body_split(area, app.show_navigator);
+    if app.show_navigator {
+        draw_navigator(frame, nav_area, app, files);
+    }
     draw_diff(frame, diff_area, app, files.get(app.nav.selected));
 }
 
 fn draw_panes_with_error(frame: &mut Frame, area: Rect, app: &App, err: &anyhow::Error) {
-    let (nav_area, diff_area) = body_split(area);
-    draw_navigator(frame, nav_area, app, &[]);
+    let (nav_area, diff_area) = body_split(area, app.show_navigator);
+    if app.show_navigator {
+        draw_navigator(frame, nav_area, app, &[]);
+    }
 
     let block = pane_block("diff", app.focus == Focus::Diff);
     let text = Paragraph::new(format!("{err:#}"))
@@ -1235,13 +1283,24 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
         }
     }
 
+    let inner_width = (area.width.saturating_sub(2)).max(1) as usize;
+
+    // Horizontal pan + clip indicators for code rows. Gutter and origin
+    // marker (the first two spans of a line row) stay pinned; hunk headers
+    // and placeholders (single-span rows) pan whole. Runs after the style
+    // patches (they only touch styles/first gutter char) and before comment
+    // weaving (comments wrap instead of panning).
+    for line in &mut lines {
+        let pinned = if line.spans.len() >= 3 { 2 } else { 0 };
+        pan_and_clip(line, app.diff.hscroll, inner_width, pinned);
+    }
+
     // Inline comment rows, woven in directly under the lines they annotate
     // (GitHub-style) so feedback sits next to the code instead of living only
     // in the bottom bar. Long comments wrap to the pane width as continuation
     // rows. Must run AFTER all base-row patches above — the patches index
     // base rows, and insertion shifts everything below it. Groups are
     // inserted in descending anchor order to keep earlier indices valid.
-    let inner_width = (area.width.saturating_sub(2)).max(1) as usize;
     let mut groups: std::collections::BTreeMap<usize, Vec<Line>> = std::collections::BTreeMap::new();
     for p in app.pending.iter().filter(|p| p.file_idx == app.nav.selected) {
         groups.entry(p.row_end).or_default().extend(inline_comment_lines(
@@ -1269,6 +1328,61 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
 
     let paragraph = Paragraph::new(lines).block(block).scroll((app.diff.scroll as u16, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// Pan a rendered row `hscroll` columns to the left — keeping its first
+/// `pinned` spans (gutter + origin marker) in place — then clip it to
+/// `width` columns. Clipped edges get dim `‹` / `…` indicators so the
+/// reviewer can tell content continues off-screen.
+fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: usize) {
+    let pinned = pinned.min(line.spans.len());
+
+    if hscroll > 0 {
+        let mut remaining = hscroll;
+        let mut dropped = 0usize;
+        for span in line.spans.iter_mut().skip(pinned) {
+            if remaining == 0 {
+                break;
+            }
+            let len = span.content.chars().count();
+            let take = len.min(remaining);
+            if take > 0 {
+                let s: String = span.content.chars().skip(take).collect();
+                span.content = s.into();
+                remaining -= take;
+                dropped += take;
+            }
+        }
+        if dropped > 0 {
+            // Mark the left clip on the first visible content char.
+            for span in line.spans.iter_mut().skip(pinned) {
+                if !span.content.is_empty() {
+                    let mut chars: Vec<char> = span.content.chars().collect();
+                    chars[0] = '\u{2039}'; // ‹
+                    span.content = chars.into_iter().collect::<String>().into();
+                    break;
+                }
+            }
+        }
+    }
+
+    let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    if total > width {
+        let keep = width.saturating_sub(1);
+        let mut used = 0usize;
+        for span in line.spans.iter_mut() {
+            let len = span.content.chars().count();
+            if used + len <= keep {
+                used += len;
+                continue;
+            }
+            let take = keep - used;
+            let s: String = span.content.chars().take(take).collect();
+            span.content = s.into();
+            used = keep;
+        }
+        line.spans.push(Span::styled("\u{2026}", Style::default().fg(Color::DarkGray)));
+    }
 }
 
 /// Comment-row background: a warm dark slate distinct from both the code
@@ -1541,7 +1655,7 @@ mod tests {
     #[test]
     fn next_and_prev_hunk_jump_to_neighboring_headers() {
         let hunks = vec![0usize, 4];
-        let mut state = DiffViewState { scroll: 0, cursor: 0 };
+        let mut state = DiffViewState { scroll: 0, cursor: 0, hscroll: 0 };
 
         // From the first header, next jumps the CURSOR to the second header;
         // a further next is a no-op.
@@ -1563,7 +1677,7 @@ mod tests {
 
     #[test]
     fn diff_view_cursor_clamps_at_both_ends() {
-        let mut state = DiffViewState { scroll: 0, cursor: 0 };
+        let mut state = DiffViewState { scroll: 0, cursor: 0, hscroll: 0 };
         state.up(); // already at 0, saturating
         assert_eq!(state.cursor, 0);
 
@@ -1767,17 +1881,62 @@ mod tests {
     fn narrow_body_stacks_navigator_above_diff() {
         // 40 cols (the width the e2e run hit): side-by-side leaves no room
         // for code, so the split must go vertical.
-        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30));
+        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30), true);
         assert_eq!(nav.width, 40);
         assert_eq!(diff.width, 40);
         assert!(nav.height >= 4 && nav.height <= 10);
         assert_eq!(nav.y + nav.height, diff.y);
 
         // Wide pane keeps the horizontal split with the 24-col floor.
-        let (nav, diff) = body_split(Rect::new(0, 0, 120, 30));
+        let (nav, diff) = body_split(Rect::new(0, 0, 120, 30), true);
         assert_eq!(nav.height, 30);
         assert_eq!(nav.width, 36);
         assert_eq!(nav.x + nav.width, diff.x);
+
+        // Collapsed navigator: the diff takes the whole body at any width.
+        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30), false);
+        assert_eq!(nav.width, 0);
+        assert_eq!(diff, Rect::new(0, 0, 40, 30));
+    }
+
+    #[test]
+    fn pan_and_clip_pins_gutter_and_marks_both_edges() {
+        let mk = || {
+            Line::from(vec![
+                Span::raw("   1    2  "),        // gutter (pinned)
+                Span::raw("+"),                  // marker (pinned)
+                Span::raw("let alpha = "),       // content…
+                Span::raw("beta + gamma;"),
+            ])
+        };
+
+        // Pan 4: gutter+marker intact, first 4 content chars gone, and the
+        // ‹ marker REPLACES the first visible char (keeping column widths).
+        let mut line = mk();
+        pan_and_clip(&mut line, 4, 100, 2);
+        assert_eq!(line.spans[0].content.as_ref(), "   1    2  ");
+        assert_eq!(line.spans[1].content.as_ref(), "+");
+        assert_eq!(line.spans[2].content.as_ref(), "\u{2039}lpha = ");
+        assert_eq!(line.spans[3].content.as_ref(), "beta + gamma;");
+
+        // No pan, narrow width: right edge clipped with a … marker and the
+        // rendered width never exceeds the pane.
+        let mut line = mk();
+        pan_and_clip(&mut line, 0, 20, 2);
+        let total: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, 20);
+        assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // Fits: untouched, no markers.
+        let mut line = mk();
+        pan_and_clip(&mut line, 0, 100, 2);
+        assert_eq!(line.spans.len(), 4);
+        assert_eq!(line.spans[2].content.as_ref(), "let alpha = ");
+
+        // Pan past the end of content: everything unpinned empties, no panic.
+        let mut line = mk();
+        pan_and_clip(&mut line, 500, 100, 2);
+        assert!(line.spans[2].content.is_empty() && line.spans[3].content.is_empty());
     }
 
     // --- M3 annotation flow ------------------------------------------
