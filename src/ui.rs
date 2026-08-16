@@ -3276,4 +3276,32 @@ mod tests {
             assert!(rendered <= w, "width {rendered} exceeds available {w}");
         }
     }
+
+    #[test]
+    fn bottom_rule_drops_the_tag_chip_before_the_cancel_chip() {
+        // Codex P1 (confirm intended): bottom_rule_line's own docstring
+        // states the chips drop right-to-priority as the pane narrows — tag
+        // first, then cancel, commit never — so a medium-width pane keeps
+        // commit+cancel and loses the only visible `Ctrl-T` discoverability.
+        // That precedence is deliberate (the docstring predates this
+        // finding); pin it with a constrained-width case rather than only
+        // the "everything fits" / "nothing fits" ends already covered.
+        let contains = |w: usize, needle: &str| {
+            let line = bottom_rule_line(Some(Tag::Fix), w);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            text.contains(needle)
+        };
+        let first_width_with =
+            |needle: &str| (1..=100).find(|&w| contains(w, needle)).expect("must fit by width 100");
+        let cancel_at = first_width_with("esc"); // only in the cancel chip
+        let tag_at = first_width_with("^T"); // only in the tag chip
+        assert!(
+            cancel_at < tag_at,
+            "cancel (first fits at {cancel_at}) must become visible at a narrower width than \
+             tag (first fits at {tag_at}) — cancel is the higher-priority chip"
+        );
+        // And once the pane is wide enough for the tag chip, cancel is
+        // still there — commit+cancel is never traded away for tag.
+        assert!(contains(tag_at, "esc"));
+    }
 }
