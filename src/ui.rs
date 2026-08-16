@@ -1155,7 +1155,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         }
         None => match app.focus {
             Focus::Navigator => format!(
-                " j/k move \u{b7} g/G first/last \u{b7} l/enter/tab focus diff \u{b7} {GLOBAL_HINTS}"
+                " j/k move \u{b7} g/G first/last \u{b7} l/enter/tab focus diff \u{b7} b hide \u{b7} z zoom \u{b7} {GLOBAL_HINTS}"
             ),
             Focus::Diff => {
                 // Position first: when the footer clips in a narrow pane,
@@ -1408,19 +1408,27 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
         let mut col = 0usize; // columns consumed from the unpinned content
         let mut dropped = false;
         let mut pad_next = false; // wide char straddled the boundary
+        let mut crossing = true; // still owed: orphan marks of the last dropped cell
         for span in line.spans.iter_mut().skip(pinned) {
-            if col >= hscroll && !pad_next {
+            if col >= hscroll && !pad_next && !crossing {
                 break;
             }
             let mut kept = String::new();
             for c in span.content.chars() {
+                let w = char_cols(c);
                 if col < hscroll {
-                    col += char_cols(c);
+                    col += w;
                     dropped = true;
                     if col > hscroll {
                         pad_next = true;
                     }
+                } else if crossing && w == 0 {
+                    // A zero-width char (combining mark) right after the pan
+                    // boundary belongs to the last DROPPED cell: dropping it
+                    // too keeps it from attaching to the clip marker.
+                    dropped = true;
                 } else {
+                    crossing = false;
                     if pad_next {
                         kept.push(' ');
                         pad_next = false;
@@ -1431,12 +1439,19 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
             span.content = kept.into();
         }
         if dropped {
-            // Mark the left clip on the first visible cell, preserving its
-            // display width (a wide char's cell becomes "‹ ").
+            // Mark the left clip on the first visible CELL — the first
+            // nonzero-width char plus its trailing combining marks —
+            // preserving its display width (a wide cell becomes "‹ ").
             for span in line.spans.iter_mut().skip(pinned) {
                 if let Some(first) = span.content.chars().next() {
-                    let rest: String = span.content.chars().skip(1).collect();
-                    let marked = if char_cols(first) >= 2 {
+                    let cell_width = char_cols(first).max(1);
+                    let rest: String = span
+                        .content
+                        .chars()
+                        .skip(1)
+                        .skip_while(|c| char_cols(*c) == 0)
+                        .collect();
+                    let marked = if cell_width >= 2 {
                         format!("\u{2039} {rest}")
                     } else {
                         format!("\u{2039}{rest}")
@@ -2075,6 +2090,21 @@ mod tests {
         let total: usize = line.spans.iter().map(|s| str_cols(s.content.as_ref())).sum();
         assert!(total <= 16, "rendered {total} cols > width 16");
         assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
+
+        // Decomposed text: "a" + combining acute + "b" renders as 2 cells.
+        // Panning one column drops the accented cell WITH its mark (no
+        // orphaned combining char attaching to the marker), and the ‹
+        // replaces the b cell: exactly 1 column remains.
+        let mut line = mk("a\u{301}b");
+        pan_and_clip(&mut line, 1, 100, 2);
+        assert_eq!(line.spans[2].content.as_ref(), "\u{2039}");
+        assert_eq!(str_cols(line.spans[2].content.as_ref()), 1);
+
+        // Marker replaces a whole cell even when the surviving first cell
+        // carries its own combining mark.
+        let mut line = mk("a\u{301}e\u{301}b");
+        pan_and_clip(&mut line, 1, 100, 2);
+        assert_eq!(line.spans[2].content.as_ref(), "\u{2039}b");
     }
 
     #[test]
