@@ -126,11 +126,14 @@ Result (JSON in the tool response):
 
 ## Status
 
-**M1 (walking skeleton)** — the full blocking loop works end-to-end: colored
-scrollable diff (including untracked files), verdict keys, optional one-line
-summary on `request_changes`. Line-anchored annotations (`v` select, `c`
-comment, tags) are next; see the roadmap in the project plan. Release packaging
-for `herdr plugin install` comes after that.
+Released and feature-complete for the core loop: agent-summoned blocking
+review, two-pane syntax-highlighted diff viewer with full mouse support,
+line-anchored annotations (range select, tags, inline comments), a config
+file, and prebuilt, checksum-verified binaries for macOS and Linux via
+`herdr plugin install`. Listed on the herdr marketplace.
+
+See the [releases](https://github.com/JonasBaeumer/herdr-file-annotator/releases)
+for per-version changes; ongoing work happens in pull requests.
 
 ## License
 
