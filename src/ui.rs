@@ -1011,17 +1011,27 @@ impl<'a> App<'a> {
         }
         // An explicit view request switches the pane before the line maps —
         // advisory like everything else: an unknown view string is ignored,
-        // and a file with no usable source side simply renders the source
-        // placeholder (annotations stay inert there, as with manual `t`).
+        // and a source request for a file with no usable source side
+        // (deleted, binary, unreadable) is ignored too, keeping the useful
+        // diff on screen. Any actual switch clears a live visual selection:
+        // its anchor indexes the OLD view's row space, and combining it with
+        // a new-space cursor would let `c` save an unrelated line range
+        // (same rule as the manual `t` toggle).
         match target.view.as_deref() {
             Some("diff") if self.view != ViewMode::Diff => {
                 self.view = ViewMode::Diff;
+                self.visual_anchor = None;
                 self.diff.reset();
             }
             Some("source") if self.view != ViewMode::Source => {
                 self.view = ViewMode::Source;
-                self.diff.reset();
                 self.ensure_source_loaded();
+                if matches!(self.source_cache.get(&self.nav.selected), Some(Err(_))) {
+                    self.view = ViewMode::Diff; // no usable source: request ignored
+                } else {
+                    self.visual_anchor = None;
+                    self.diff.reset();
+                }
             }
             _ => {}
         }
@@ -3015,6 +3025,33 @@ mod tests {
             size,
         );
         assert!(app.view == ViewMode::Diff, "explicit diff view request must switch back");
+
+        // A live `v` selection must not survive an agent-pushed view switch:
+        // its anchor indexes the old view's rows, and `c` would otherwise
+        // save an unrelated range (same rule as the manual toggle).
+        app.visual_anchor = Some(3);
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            size,
+        );
+        assert!(app.visual_anchor.is_none(), "view switch must clear the visual anchor");
+
+        // A source request for a file with no usable source is IGNORED —
+        // the diff stays on screen, per the documented contract.
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()) },
+            size,
+        );
+        std::fs::remove_file(dir.join("src/lib.rs")).expect("delete source");
+        app.source_cache.clear(); // force a fresh load attempt
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            size,
+        );
+        assert!(
+            app.view == ViewMode::Diff,
+            "unusable source must keep the diff visible, not show a placeholder"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
