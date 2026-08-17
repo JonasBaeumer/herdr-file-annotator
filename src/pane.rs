@@ -23,9 +23,12 @@ pub fn run() -> Result<()> {
     };
     let mut conn = PaneConnection::connect(&socket_path)?;
     let request = conn.receive_request()?;
+    // Split the socket: verdict goes back on the write half; the read half
+    // becomes a live stream of agent-pushed navigation (guided walkthroughs).
+    let (mut channel, goto_rx) = conn.into_channel();
 
     let model = crate::diff::load(&request.working_dir, request.baseline.as_deref());
-    let outcome = crate::ui::run(&request, model)?;
+    let outcome = crate::ui::run(&request, model, goto_rx)?;
 
     let result = ReviewResult {
         version: PROTOCOL_VERSION,
@@ -33,7 +36,13 @@ pub fn run() -> Result<()> {
         summary: outcome.summary,
         annotations: outcome.annotations,
     };
-    conn.send_result(&result)?;
+    // A failed send is expected on the disconnect path (the server already
+    // shut the socket — timeout or agent exit); the review is discarded, not
+    // a pane crash.
+    if let Err(err) = channel.send_result(&result) {
+        eprintln!("herdr-annotator pane: verdict could not be delivered (agent gone): {err:#}");
+        return Ok(());
+    }
     println!(
         "verdict sent: {}",
         serde_json::to_string(&result.verdict).unwrap_or_default()

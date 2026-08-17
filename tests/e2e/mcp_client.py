@@ -106,19 +106,24 @@ def main():
         )
         response = read_response(proc, 2, timeout=READ_TIMEOUT)
     finally:
+        # The server child must never outlive this harness: close its stdin,
+        # give it a moment to exit, then kill. A timeout or protocol error
+        # above used to propagate past a bare proc.wait(), orphaning the
+        # server (observed as inert `herdr-annotator mcp` processes piling
+        # up across interrupted test rounds).
         try:
             proc.stdin.close()
         except Exception:
             pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
 
     result = response.get("result", {})
     print(json.dumps(result, indent=2))
 
-    is_error = result.get("isError", True)
-
-    proc.wait(timeout=10)
-
-    return 1 if is_error else 0
+    return 1 if result.get("isError", True) else 0
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use crate::diff::{load_source, DiffLine, DiffModel, FileDiff, FileStatus, Origin};
-use crate::protocol::{Annotation, LineRange, ReviewRequest, Side, Verdict};
+use crate::protocol::{Annotation, GotoTarget, LineRange, ReviewRequest, Side, Verdict};
 
 /// What the reviewer decided, handed back to `pane.rs`.
 pub struct Outcome {
@@ -84,7 +84,11 @@ fn syntax_for_path<'a>(hl: &'a Highlighter, path: &str) -> &'a SyntaxReference {
 ///
 /// `model` is the already-loaded diff (or the error from trying to load it —
 /// the UI still lets the reviewer cancel out even when the parser/git failed).
-pub fn run(request: &ReviewRequest, model: Result<DiffModel>) -> Result<Outcome> {
+pub fn run(
+    request: &ReviewRequest,
+    model: Result<DiffModel>,
+    goto_rx: std::sync::mpsc::Receiver<GotoTarget>,
+) -> Result<Outcome> {
     let _guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -92,6 +96,25 @@ pub fn run(request: &ReviewRequest, model: Result<DiffModel>) -> Result<Outcome>
 
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
+        // Agent-pushed navigation (guided walkthroughs) arrives between
+        // keystrokes; drain it before waiting on input, and poll rather
+        // than block so pushes render within a tick even when the
+        // reviewer's hands are off the keyboard. A disconnected channel
+        // means the server shut the socket (timeout, or the agent process
+        // exited): the verdict can no longer be delivered, so keeping the
+        // pane alive would let the reviewer finish a review into the void —
+        // exit as cancelled instead.
+        let size = terminal.size()?;
+        if drain_navigation(&mut app, &goto_rx, size) {
+            return Ok(Outcome {
+                verdict: Verdict::Cancelled,
+                summary: Some("agent disconnected; the review could not be delivered".into()),
+                annotations: Vec::new(),
+            });
+        }
+        if !event::poll(std::time::Duration::from_millis(50))? {
+            continue;
+        }
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let size = terminal.size()?;
@@ -110,6 +133,24 @@ pub fn run(request: &ReviewRequest, model: Result<DiffModel>) -> Result<Outcome>
             }
             // Release events, etc: just redraw next iteration.
             _ => {}
+        }
+    }
+}
+
+/// Apply all pending navigation pushes. Returns true when the channel is
+/// DISCONNECTED — the goto-reader thread ended because the server closed the
+/// socket — which the caller must treat as "this review can no longer be
+/// delivered", distinct from the ordinary empty-channel case.
+fn drain_navigation(
+    app: &mut App,
+    goto_rx: &std::sync::mpsc::Receiver<GotoTarget>,
+    size: Size,
+) -> bool {
+    loop {
+        match goto_rx.try_recv() {
+            Ok(target) => app.apply_goto(&target, size),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
         }
     }
 }
@@ -640,6 +681,13 @@ struct App<'a> {
     /// Some(mode) while the "request changes" summary prompt or the
     /// annotation comment prompt is open.
     input: Option<InputMode>,
+    /// The latest agent-pushed goto that arrived while an input bar was
+    /// open, held for replay once it closes. `apply_goto` never disturbs an
+    /// open input, but the target itself is still valid and shouldn't be
+    /// silently lost — only the latest matters, since an earlier one it
+    /// displaced was never shown either. Cleared (and applied) the moment
+    /// `input` goes back to `None`.
+    pending_goto: Option<GotoTarget>,
     /// Set by `v` in diff focus at the cursor row; the active selection is
     /// `min(anchor, cursor)..=max(anchor, cursor)` and grows/shrinks as the
     /// cursor moves. Diff-focus only; cleared by a second `v`, by `Esc`, or
@@ -780,6 +828,7 @@ impl<'a> App<'a> {
             nav: NavState::default(),
             diff: DiffViewState::default(),
             input: None,
+            pending_goto: None,
             visual_anchor: None,
             drag_origin: None,
             show_navigator: true,
@@ -940,6 +989,55 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Agent-pushed navigation: focus `target.file` at new-side line
+    /// `target.line` in the CURRENT view. Advisory by contract — unknown
+    /// files are ignored, out-of-range lines clamp, and in diff view a line
+    /// outside the hunks lands on the nearest following changed/context row,
+    /// or the last new-side row if none follows (never wraps to the top).
+    /// Never disturbs an open input bar — while one is open the target is
+    /// held in `pending_goto` and replayed once it closes, rather than lost.
+    fn apply_goto(&mut self, target: &GotoTarget, term_size: Size) {
+        if self.input.is_some() {
+            self.pending_goto = Some(target.clone());
+            return;
+        }
+        let Ok(model) = self.model else { return };
+        let Some(idx) = model.files.iter().position(|f| f.path == target.file) else {
+            return;
+        };
+        if idx != self.nav.selected {
+            self.nav.selected = idx;
+            self.file_changed();
+        }
+        let row = match self.view {
+            ViewMode::Source => (target.line.saturating_sub(1) as usize)
+                .min(self.source_row_count().saturating_sub(1)),
+            ViewMode::Diff => {
+                let rows = self.diff_rows();
+                rows.iter()
+                    .position(
+                        |r| matches!(r, DiffRow::Line(l) if l.new_no == Some(target.line)),
+                    )
+                    .or_else(|| {
+                        rows.iter().position(
+                            |r| matches!(r, DiffRow::Line(l) if l.new_no.is_some_and(|n| n >= target.line)),
+                        )
+                    })
+                    // Past the last new-side line: clamp to it, matching
+                    // source view's clamp-to-last-line rather than falling
+                    // through to row 0 (which would read as "jumped to the
+                    // top" for a target that was actually past the end).
+                    .or_else(|| {
+                        rows.iter().rposition(|r| matches!(r, DiffRow::Line(l) if l.new_no.is_some()))
+                    })
+                    .unwrap_or(0)
+            }
+        };
+        self.diff.cursor = row;
+        self.focus = Focus::Diff;
+        self.ensure_cursor_visible(term_size);
+    }
+
     /// `t` in diff focus: switch views, carrying the cursor to the row
     /// showing the same line of code, and starting the new view unpanned.
     fn toggle_view(&mut self, term_size: Size) {
@@ -1094,6 +1192,10 @@ impl<'a> App<'a> {
             }
             if !close {
                 self.input = Some(mode);
+            } else if let Some(target) = self.pending_goto.take() {
+                // The input just closed: catch up to whatever navigation
+                // arrived (and was held) while the reviewer was typing.
+                self.apply_goto(&target, term_size);
             }
             // Typing can grow the editing box (more wrapped rows) or close
             // it back down to nothing — either way the set of display rows
@@ -2813,6 +2915,74 @@ mod tests {
         // No files: selection pinned to 0.
         nav.down(0);
         assert_eq!(nav.selected, 0);
+    }
+
+    #[test]
+    fn drain_distinguishes_disconnect_from_an_empty_channel() {
+        // An empty channel is the ordinary idle case; a DISCONNECTED one
+        // means the server shut the socket and the verdict can no longer be
+        // delivered — the pane must exit instead of reviewing into the void.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(80, 24);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(GotoTarget { file: "src/lib.rs".into(), line: 12 }).unwrap();
+        assert!(!drain_navigation(&mut app, &rx, size), "live channel: not a disconnect");
+        assert_eq!(app.diff.cursor, 7, "the pending goto was applied while draining");
+
+        drop(tx);
+        assert!(drain_navigation(&mut app, &rx, size), "dropped sender must surface as disconnect");
+    }
+
+    #[test]
+    fn goto_targeting_a_line_past_the_diffs_end_clamps_instead_of_wrapping_to_the_top() {
+        // sample_file flattens to 8 rows (0..=7); row 7 carries the final
+        // new-side line, new_no 12.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.diff.cursor = 3; // away from both 0 and the target, so a
+                              // wrap-to-top bug is visible either way.
+
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 999 },
+            Size::new(80, 24),
+        );
+
+        assert_eq!(
+            app.diff.cursor, 7,
+            "a target past the last new-side line must clamp to it, not wrap to row 0"
+        );
+    }
+
+    #[test]
+    fn a_goto_pushed_while_typing_is_replayed_once_the_input_bar_closes() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(80, 24);
+        app.diff.cursor = 1;
+        // Reviewer is mid-comment: the input bar is open.
+        app.input = Some(InputMode::Summary { buf: String::new() });
+
+        // A goto arrives while typing — must not move the cursor or disturb
+        // the open input, but must not be lost either.
+        app.apply_goto(&GotoTarget { file: "src/lib.rs".into(), line: 12 }, size);
+        assert_eq!(app.diff.cursor, 1, "an open input bar must not be disturbed");
+        assert!(app.input.is_some(), "the input bar must stay open");
+        assert!(app.pending_goto.is_some(), "the target must be held, not dropped");
+
+        // Esc cancels the summary prompt and closes the input bar; the held
+        // goto should be applied as part of that close, not lost.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), size);
+        assert!(app.input.is_none(), "Esc must close the input bar");
+        assert_eq!(
+            app.diff.cursor, 7,
+            "the deferred goto must be applied once the input bar closes"
+        );
+        assert!(app.pending_goto.is_none(), "the held target must be consumed, not replayed again");
     }
 
     #[test]
