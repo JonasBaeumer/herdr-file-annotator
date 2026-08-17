@@ -99,10 +99,18 @@ pub fn run(
         // Agent-pushed navigation (guided walkthroughs) arrives between
         // keystrokes; drain it before waiting on input, and poll rather
         // than block so pushes render within a tick even when the
-        // reviewer's hands are off the keyboard.
+        // reviewer's hands are off the keyboard. A disconnected channel
+        // means the server shut the socket (timeout, or the agent process
+        // exited): the verdict can no longer be delivered, so keeping the
+        // pane alive would let the reviewer finish a review into the void —
+        // exit as cancelled instead.
         let size = terminal.size()?;
-        while let Ok(target) = goto_rx.try_recv() {
-            app.apply_goto(&target, size);
+        if drain_navigation(&mut app, &goto_rx, size) {
+            return Ok(Outcome {
+                verdict: Verdict::Cancelled,
+                summary: Some("agent disconnected; the review could not be delivered".into()),
+                annotations: Vec::new(),
+            });
         }
         if !event::poll(std::time::Duration::from_millis(50))? {
             continue;
@@ -125,6 +133,24 @@ pub fn run(
             }
             // Release events, etc: just redraw next iteration.
             _ => {}
+        }
+    }
+}
+
+/// Apply all pending navigation pushes. Returns true when the channel is
+/// DISCONNECTED — the goto-reader thread ended because the server closed the
+/// socket — which the caller must treat as "this review can no longer be
+/// delivered", distinct from the ordinary empty-channel case.
+fn drain_navigation(
+    app: &mut App,
+    goto_rx: &std::sync::mpsc::Receiver<GotoTarget>,
+    size: Size,
+) -> bool {
+    loop {
+        match goto_rx.try_recv() {
+            Ok(target) => app.apply_goto(&target, size),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
         }
     }
 }
@@ -2889,6 +2915,25 @@ mod tests {
         // No files: selection pinned to 0.
         nav.down(0);
         assert_eq!(nav.selected, 0);
+    }
+
+    #[test]
+    fn drain_distinguishes_disconnect_from_an_empty_channel() {
+        // An empty channel is the ordinary idle case; a DISCONNECTED one
+        // means the server shut the socket and the verdict can no longer be
+        // delivered — the pane must exit instead of reviewing into the void.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(80, 24);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(GotoTarget { file: "src/lib.rs".into(), line: 12 }).unwrap();
+        assert!(!drain_navigation(&mut app, &rx, size), "live channel: not a disconnect");
+        assert_eq!(app.diff.cursor, 7, "the pending goto was applied while draining");
+
+        drop(tx);
+        assert!(drain_navigation(&mut app, &rx, size), "dropped sender must surface as disconnect");
     }
 
     #[test]

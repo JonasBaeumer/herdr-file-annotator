@@ -36,7 +36,13 @@ pub fn run() -> Result<()> {
         summary: outcome.summary,
         annotations: outcome.annotations,
     };
-    channel.send_result(&result)?;
+    // A failed send is expected on the disconnect path (the server already
+    // shut the socket — timeout or agent exit); the review is discarded, not
+    // a pane crash.
+    if let Err(err) = channel.send_result(&result) {
+        eprintln!("herdr-annotator pane: verdict could not be delivered (agent gone): {err:#}");
+        return Ok(());
+    }
     println!(
         "verdict sent: {}",
         serde_json::to_string(&result.verdict).unwrap_or_default()
