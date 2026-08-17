@@ -164,6 +164,11 @@ fn tool_descriptors() -> Vec<Value> {
                         "type": "integer",
                         "minimum": 1,
                         "description": "1-based line number on the new side."
+                    },
+                    "view": {
+                        "type": ["string", "null"],
+                        "enum": ["diff", "source", null],
+                        "description": "Optionally switch the pane's view before landing: \"diff\" (the changes) or \"source\" (the full post-change file — use when walking through whole files or lines outside the hunks). Omitted or null keeps the current view."
                     }
                 },
                 "required": ["file", "line"]
@@ -248,11 +253,23 @@ fn handle_goto(args: &Value, active: &mut Option<ActiveReview>) -> Value {
         Some(n) if n >= 1 => n,
         _ => return tool_error("goto requires \"line\" to be an integer >= 1".to_string()),
     };
+    // Same lenient-null / strict-otherwise contract as collect_review's
+    // wait_seconds: absent and null both mean "keep the current view".
+    let view = match args.get("view") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(v)) if v == "diff" || v == "source" => Some(v.clone()),
+        _ => {
+            return tool_error(
+                "goto requires \"view\" to be \"diff\" or \"source\" when given".to_string(),
+            )
+        }
+    };
 
-    match active_review.open.goto(&GotoTarget { file: file.clone(), line }) {
+    let view_note = view.as_deref().map(|v| format!(" in {v} view")).unwrap_or_default();
+    match active_review.open.goto(&GotoTarget { file: file.clone(), line, view }) {
         Ok(()) => {
             let text = format!(
-                "navigated the review pane to {file}:{line} (advisory — if the pane doesn't recognize that file, it ignores the push)"
+                "navigated the review pane to {file}:{line}{view_note} (advisory — if the pane doesn't recognize that file, it ignores the push)"
             );
             json!({ "content": [{ "type": "text", "text": text }], "isError": false })
         }

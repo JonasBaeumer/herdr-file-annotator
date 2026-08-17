@@ -115,7 +115,7 @@ the pane at any time, without waiting to be asked.
 |------|---------|-----------|---------|
 | `review_changes` | Yes | `baseline?`, `note?`, `working_dir?` | Verdict + annotations (below), once the human decides. |
 | `show_changes` | No | `baseline?`, `note?`, `working_dir?` | `{"opened": true, "working_dir": "..."}` immediately. |
-| `goto` | No | `file` (repo-relative, new/post-change side), `line` (1-based) | Confirmation text; navigation is advisory. |
+| `goto` | No | `file` (repo-relative, new/post-change side), `line` (1-based), `view` (optional: `diff` or `source`) | Confirmation text; navigation is advisory. |
 | `collect_review` | No, polls | `wait_seconds?` (0–120, default 0) | Verdict + annotations once landed, else `{"status": "pending", "open_for_secs": N}`. |
 
 `baseline`, `note`, and `working_dir` mean the same thing for `review_changes`

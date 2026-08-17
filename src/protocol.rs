@@ -54,6 +54,13 @@ pub enum ServerMsg {
 pub struct GotoTarget {
     pub file: String,
     pub line: u32,
+    /// Which view the pane should show the target in: "diff" or "source".
+    /// `None` keeps the pane's current view. Advisory like the rest of the
+    /// target — a file with no source side (deleted/binary) ignores a
+    /// source request. `#[serde(default)]` keeps the wire format compatible
+    /// with v2 peers that don't send it (per the protocol-change policy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -405,8 +412,8 @@ mod tests {
             .unwrap();
         // Nothing delivered yet: the mailbox is empty, not blocking.
         assert!(open.try_take().is_none());
-        open.goto(&GotoTarget { file: "src/a.rs".into(), line: 10 }).unwrap();
-        open.goto(&GotoTarget { file: "src/b.rs".into(), line: 3 }).unwrap();
+        open.goto(&GotoTarget { file: "src/a.rs".into(), line: 10, view: None }).unwrap();
+        open.goto(&GotoTarget { file: "src/b.rs".into(), line: 3, view: None }).unwrap();
         let result = open.wait(Some(Duration::from_secs(5))).unwrap();
         pane.join().unwrap();
         assert_eq!(result.verdict, Verdict::Approve);

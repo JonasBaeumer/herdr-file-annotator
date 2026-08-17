@@ -1009,6 +1009,22 @@ impl<'a> App<'a> {
             self.nav.selected = idx;
             self.file_changed();
         }
+        // An explicit view request switches the pane before the line maps —
+        // advisory like everything else: an unknown view string is ignored,
+        // and a file with no usable source side simply renders the source
+        // placeholder (annotations stay inert there, as with manual `t`).
+        match target.view.as_deref() {
+            Some("diff") if self.view != ViewMode::Diff => {
+                self.view = ViewMode::Diff;
+                self.diff.reset();
+            }
+            Some("source") if self.view != ViewMode::Source => {
+                self.view = ViewMode::Source;
+                self.diff.reset();
+                self.ensure_source_loaded();
+            }
+            _ => {}
+        }
         let row = match self.view {
             ViewMode::Source => (target.line.saturating_sub(1) as usize)
                 .min(self.source_row_count().saturating_sub(1)),
@@ -2928,7 +2944,7 @@ mod tests {
         let size = Size::new(80, 24);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(GotoTarget { file: "src/lib.rs".into(), line: 12 }).unwrap();
+        tx.send(GotoTarget { file: "src/lib.rs".into(), line: 12, view: None }).unwrap();
         assert!(!drain_navigation(&mut app, &rx, size), "live channel: not a disconnect");
         assert_eq!(app.diff.cursor, 7, "the pending goto was applied while draining");
 
@@ -2947,7 +2963,7 @@ mod tests {
                               // wrap-to-top bug is visible either way.
 
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 999 },
+            &GotoTarget { file: "src/lib.rs".into(), line: 999, view: None },
             Size::new(80, 24),
         );
 
@@ -2955,6 +2971,51 @@ mod tests {
             app.diff.cursor, 7,
             "a target past the last new-side line must clamp to it, not wrap to row 0"
         );
+    }
+
+    #[test]
+    fn goto_with_a_view_request_switches_the_pane_before_landing() {
+        // The agent can steer not just WHERE but HOW to look: view "source"
+        // shows the full post-change file (line maps directly), "diff" the
+        // hunks; omitted keeps the current view. Advisory like the rest.
+        let dir = std::env::temp_dir()
+            .join(format!("herdr-annotator-goto-view-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).expect("temp dir");
+        std::fs::write(dir.join("src/lib.rs"), "fn main() {\n    setup();\n    run();\n}\n")
+            .expect("write source");
+
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: dir.to_string_lossy().into_owned(),
+            baseline: None,
+            note: None,
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+        assert!(app.view == ViewMode::Diff);
+
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            size,
+        );
+        assert!(app.view == ViewMode::Source, "explicit source view request must switch");
+        assert_eq!(app.diff.cursor, 1, "source view maps line 2 to row index 1");
+
+        // Unknown view strings are ignored (advisory), current view kept.
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 1, view: Some("hexdump".into()) },
+            size,
+        );
+        assert!(app.view == ViewMode::Source);
+
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()) },
+            size,
+        );
+        assert!(app.view == ViewMode::Diff, "explicit diff view request must switch back");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2969,7 +3030,7 @@ mod tests {
 
         // A goto arrives while typing — must not move the cursor or disturb
         // the open input, but must not be lost either.
-        app.apply_goto(&GotoTarget { file: "src/lib.rs".into(), line: 12 }, size);
+        app.apply_goto(&GotoTarget { file: "src/lib.rs".into(), line: 12, view: None }, size);
         assert_eq!(app.diff.cursor, 1, "an open input bar must not be disturbed");
         assert!(app.input.is_some(), "the input bar must stay open");
         assert!(app.pending_goto.is_some(), "the target must be held, not dropped");
