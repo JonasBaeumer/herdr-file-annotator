@@ -655,6 +655,13 @@ struct App<'a> {
     /// Some(mode) while the "request changes" summary prompt or the
     /// annotation comment prompt is open.
     input: Option<InputMode>,
+    /// The latest agent-pushed goto that arrived while an input bar was
+    /// open, held for replay once it closes. `apply_goto` never disturbs an
+    /// open input, but the target itself is still valid and shouldn't be
+    /// silently lost — only the latest matters, since an earlier one it
+    /// displaced was never shown either. Cleared (and applied) the moment
+    /// `input` goes back to `None`.
+    pending_goto: Option<GotoTarget>,
     /// Set by `v` in diff focus at the cursor row; the active selection is
     /// `min(anchor, cursor)..=max(anchor, cursor)` and grows/shrinks as the
     /// cursor moves. Diff-focus only; cleared by a second `v`, by `Esc`, or
@@ -795,6 +802,7 @@ impl<'a> App<'a> {
             nav: NavState::default(),
             diff: DiffViewState::default(),
             input: None,
+            pending_goto: None,
             visual_anchor: None,
             drag_origin: None,
             show_navigator: true,
@@ -960,9 +968,11 @@ impl<'a> App<'a> {
     /// files are ignored, out-of-range lines clamp, and in diff view a line
     /// outside the hunks lands on the nearest following changed/context row,
     /// or the last new-side row if none follows (never wraps to the top).
-    /// Never disturbs an open input bar.
+    /// Never disturbs an open input bar — while one is open the target is
+    /// held in `pending_goto` and replayed once it closes, rather than lost.
     fn apply_goto(&mut self, target: &GotoTarget, term_size: Size) {
         if self.input.is_some() {
+            self.pending_goto = Some(target.clone());
             return;
         }
         let Ok(model) = self.model else { return };
@@ -1156,6 +1166,10 @@ impl<'a> App<'a> {
             }
             if !close {
                 self.input = Some(mode);
+            } else if let Some(target) = self.pending_goto.take() {
+                // The input just closed: catch up to whatever navigation
+                // arrived (and was held) while the reviewer was typing.
+                self.apply_goto(&target, term_size);
             }
             // Typing can grow the editing box (more wrapped rows) or close
             // it back down to nothing — either way the set of display rows
@@ -2896,6 +2910,34 @@ mod tests {
             app.diff.cursor, 7,
             "a target past the last new-side line must clamp to it, not wrap to row 0"
         );
+    }
+
+    #[test]
+    fn a_goto_pushed_while_typing_is_replayed_once_the_input_bar_closes() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(80, 24);
+        app.diff.cursor = 1;
+        // Reviewer is mid-comment: the input bar is open.
+        app.input = Some(InputMode::Summary { buf: String::new() });
+
+        // A goto arrives while typing — must not move the cursor or disturb
+        // the open input, but must not be lost either.
+        app.apply_goto(&GotoTarget { file: "src/lib.rs".into(), line: 12 }, size);
+        assert_eq!(app.diff.cursor, 1, "an open input bar must not be disturbed");
+        assert!(app.input.is_some(), "the input bar must stay open");
+        assert!(app.pending_goto.is_some(), "the target must be held, not dropped");
+
+        // Esc cancels the summary prompt and closes the input bar; the held
+        // goto should be applied as part of that close, not lost.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), size);
+        assert!(app.input.is_none(), "Esc must close the input bar");
+        assert_eq!(
+            app.diff.cursor, 7,
+            "the deferred goto must be applied once the input bar closes"
+        );
+        assert!(app.pending_goto.is_none(), "the held target must be consumed, not replayed again");
     }
 
     #[test]
