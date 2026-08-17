@@ -1733,13 +1733,24 @@ impl<'a> App<'a> {
             if self.view == ViewMode::Source { " \u{2014} inactive in source view" } else { "" };
 
         vec![
+            // The overlay is itself a modal state: while it is open, the
+            // close keys close IT, not the review — the reference must
+            // describe the state the reviewer is actually in.
             HelpSection {
-                name: "Finish",
+                name: "This help",
+                current: false,
+                rows: vec![
+                    HelpRow::new("? / esc / q / enter", "close this help"),
+                    HelpRow::new("j / k", "scroll it"),
+                ],
+            },
+            HelpSection {
+                name: "Finish (once help is closed)",
                 current: false,
                 rows: vec![
                     HelpRow::new("a", "approve"),
                     HelpRow::new("r", "request changes"),
-                    HelpRow::new("q", "cancel"),
+                    HelpRow::new("q", "cancel the review"),
                     HelpRow::new("esc", "cancel (clears an active selection first)"),
                     HelpRow::new("ctrl+c", "cancel, even mid-input"),
                 ],
@@ -1842,7 +1853,6 @@ impl<'a> App<'a> {
     }
 }
 
-/// One row of the `?` overlay: a short key label and what it does.
 struct HelpRow {
     key: &'static str,
     desc: String,
