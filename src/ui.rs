@@ -36,7 +36,7 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use crate::diff::{load_source, DiffLine, DiffModel, FileDiff, FileStatus, Origin};
-use crate::protocol::{Annotation, LineRange, ReviewRequest, Side, Verdict};
+use crate::protocol::{Annotation, GotoTarget, LineRange, ReviewRequest, Side, Verdict};
 
 /// What the reviewer decided, handed back to `pane.rs`.
 pub struct Outcome {
@@ -84,7 +84,11 @@ fn syntax_for_path<'a>(hl: &'a Highlighter, path: &str) -> &'a SyntaxReference {
 ///
 /// `model` is the already-loaded diff (or the error from trying to load it —
 /// the UI still lets the reviewer cancel out even when the parser/git failed).
-pub fn run(request: &ReviewRequest, model: Result<DiffModel>) -> Result<Outcome> {
+pub fn run(
+    request: &ReviewRequest,
+    model: Result<DiffModel>,
+    goto_rx: std::sync::mpsc::Receiver<GotoTarget>,
+) -> Result<Outcome> {
     let _guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -92,6 +96,17 @@ pub fn run(request: &ReviewRequest, model: Result<DiffModel>) -> Result<Outcome>
 
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
+        // Agent-pushed navigation (guided walkthroughs) arrives between
+        // keystrokes; drain it before waiting on input, and poll rather
+        // than block so pushes render within a tick even when the
+        // reviewer's hands are off the keyboard.
+        let size = terminal.size()?;
+        while let Ok(target) = goto_rx.try_recv() {
+            app.apply_goto(&target, size);
+        }
+        if !event::poll(std::time::Duration::from_millis(50))? {
+            continue;
+        }
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let size = terminal.size()?;
@@ -938,6 +953,45 @@ impl<'a> App<'a> {
         if self.view == ViewMode::Source {
             self.ensure_source_loaded();
         }
+    }
+
+    /// Agent-pushed navigation: focus `target.file` at new-side line
+    /// `target.line` in the CURRENT view. Advisory by contract — unknown
+    /// files are ignored, out-of-range lines clamp, and in diff view a line
+    /// outside the hunks lands on the nearest following changed/context row
+    /// (else the top). Never disturbs an open input bar.
+    fn apply_goto(&mut self, target: &GotoTarget, term_size: Size) {
+        if self.input.is_some() {
+            return;
+        }
+        let Ok(model) = self.model else { return };
+        let Some(idx) = model.files.iter().position(|f| f.path == target.file) else {
+            return;
+        };
+        if idx != self.nav.selected {
+            self.nav.selected = idx;
+            self.file_changed();
+        }
+        let row = match self.view {
+            ViewMode::Source => (target.line.saturating_sub(1) as usize)
+                .min(self.source_row_count().saturating_sub(1)),
+            ViewMode::Diff => {
+                let rows = self.diff_rows();
+                rows.iter()
+                    .position(
+                        |r| matches!(r, DiffRow::Line(l) if l.new_no == Some(target.line)),
+                    )
+                    .or_else(|| {
+                        rows.iter().position(
+                            |r| matches!(r, DiffRow::Line(l) if l.new_no.is_some_and(|n| n >= target.line)),
+                        )
+                    })
+                    .unwrap_or(0)
+            }
+        };
+        self.diff.cursor = row;
+        self.focus = Focus::Diff;
+        self.ensure_cursor_visible(term_size);
     }
 
     /// `t` in diff focus: switch views, carrying the cursor to the row
