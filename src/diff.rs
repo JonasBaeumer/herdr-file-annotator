@@ -977,13 +977,13 @@ index 1111111..2222222 100644
     #[test]
     #[cfg(unix)]
     fn same_file_detects_a_different_underlying_file_even_with_matching_size() {
-        // Regression (Codex P1): the symlink/size checks in load_source stat
-        // the PATH, then the read opens that same path again — a gap a
-        // racing path-swap could exploit (replace the path with a symlink,
-        // or a bigger file, between the check and the open). same_file is
-        // the guard that closes it: comparing the OPENED handle's own
-        // device/inode against what the pre-open check inspected, which a
-        // swap — even to a same-sized replacement — cannot fake.
+        // load_source's symlink/size checks stat the PATH, then the read
+        // opens that same path again — a gap a racing path-swap could
+        // exploit (replace the path with a symlink, or a bigger file,
+        // between the check and the open). same_file is the guard that
+        // closes it: comparing the OPENED handle's own device/inode against
+        // what the pre-open check inspected, which a swap — even to a
+        // same-sized replacement — cannot fake.
         let repo = TempRepo::new("same_file_check");
         repo.write("a.txt", "hello");
         repo.write("b.txt", "hello"); // same size, different underlying file
@@ -998,10 +998,10 @@ index 1111111..2222222 100644
 
     #[test]
     fn load_source_refuses_a_symlink_instead_of_following_it_outside_the_repo() {
-        // Regression (Codex P0): read_to_string follows symlinks. A reviewed
-        // change that plants a symlink pointing outside the repo — a secret
-        // file, an SSH key — must not have its target's content rendered in
-        // source view just because the reviewer pressed `t`.
+        // read_to_string follows symlinks. A reviewed change that plants a
+        // symlink pointing outside the repo — a secret file, an SSH key —
+        // must not have its target's content rendered in source view just
+        // because the reviewer pressed `t`.
         let repo = TempRepo::new("symlink_source");
 
         let secret_dir = std::env::temp_dir()
@@ -1025,10 +1025,10 @@ index 1111111..2222222 100644
 
     #[test]
     fn load_source_refuses_a_file_over_the_size_limit() {
-        // Regression (Codex P1): source view read, copied, and
-        // syntax-highlighted a file of any size synchronously on the render
-        // thread. A generated/minified file the diff itself never had to pay
-        // for could freeze the pane just because the reviewer pressed `t`.
+        // Source view must not read, copy, and syntax-highlight a file of
+        // unbounded size synchronously on the render thread. A
+        // generated/minified file the diff itself never had to pay for
+        // would freeze the pane just because the reviewer pressed `t`.
         let repo = TempRepo::new("oversized_source");
         let oversized = "x".repeat((MAX_SOURCE_BYTES + 1) as usize);
         repo.write("huge.txt", &oversized);
@@ -1048,13 +1048,13 @@ index 1111111..2222222 100644
 
     #[test]
     fn load_source_refuses_a_file_with_too_many_lines() {
-        // Regression (Codex P1): ratatui's `Paragraph::scroll` takes a `u16`
-        // row offset. A file well under the byte cap can still hold tens of
-        // thousands of very short lines; scrolling into one would need an
-        // offset that silently wraps when narrowed from `usize` to `u16`,
-        // rendering unrelated earlier rows while the cursor/footer still
-        // report the true (later, wrapped-away) line. Bytes alone don't
-        // catch this, so the line count needs its own, separate cap.
+        // ratatui's `Paragraph::scroll` takes a `u16` row offset. A file
+        // well under the byte cap can still hold tens of thousands of very
+        // short lines; scrolling into one would need an offset that
+        // silently wraps when narrowed from `usize` to `u16`, rendering
+        // unrelated earlier rows while the cursor/footer still report the
+        // true (later, wrapped-away) line. Bytes alone don't catch this, so
+        // the line count needs its own, separate cap.
         let repo = TempRepo::new("too_many_lines");
         // Short lines so this is nowhere near MAX_SOURCE_BYTES — this test
         // isolates the LINE cap, not the byte one.
