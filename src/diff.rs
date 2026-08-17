@@ -5,6 +5,8 @@
 //! lines 112–118 of src/portal.rs") can be derived directly from the cursor
 //! position without re-parsing anything.
 
+use std::io::Read as _;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -152,6 +154,127 @@ pub fn load(working_dir: &str, baseline: Option<&str>) -> Result<DiffModel> {
     }
 
     Ok(DiffModel { files })
+}
+
+/// Source view refuses to load a file larger than this: reading, copying
+/// every line, and syntax-highlighting the whole thing runs synchronously on
+/// the render thread (this is a single-threaded TUI event loop, not an async
+/// one), so an unbounded read of a large generated or minified file — cheap
+/// to review as a small DIFF — would freeze the pane for however long that
+/// takes. 2 MiB comfortably covers real source files while still catching
+/// the generated/minified/vendored case the diff itself never has to pay for.
+const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Source view also refuses a file with more rows than this, independent of
+/// the byte cap above: a file well under 2 MiB can still hold tens of
+/// thousands of very short lines. The ratatui `Paragraph::scroll` the pane
+/// renders through takes a `u16` row offset, so a source view with more than
+/// `u16::MAX` rows could need a scroll position that silently wraps when
+/// narrowed to `u16` — the pane would then render unrelated earlier rows
+/// while the cursor and footer, which track the real `usize` position,
+/// still report the true (later) line. 50,000 leaves a wide margin under
+/// `u16::MAX` (65,535) for the extra display rows woven-in annotation
+/// comments add on top of the base row count.
+const MAX_SOURCE_LINES: usize = 50_000;
+
+/// Read a file's post-change contents as lines, for the UI's source view.
+///
+/// No git plumbing needed regardless of baseline: the worktree IS the new
+/// side of the diff, so the file on disk is exactly what the annotations'
+/// `Side::New` line numbers refer to. Binary files (`read_to_string` rejects
+/// non-UTF-8), deleted files, and unreadable ones come back as `Err`; the UI
+/// turns that into a placeholder row rather than failing the review.
+///
+/// Symlinks are refused rather than followed: git's diff for a symlink shows
+/// the link's target STRING as the file's one-line content, but
+/// `read_to_string` would dereference the link and render whatever it points
+/// at instead — including files well outside the repo (`/etc/passwd`, an SSH
+/// key) if a reviewed change plants a symlink pointing there. Checking
+/// `symlink_metadata` (which does not follow the link) before ever opening
+/// the target keeps that content out of the pane.
+///
+/// Files over `MAX_SOURCE_BYTES` are refused for the same reason binary
+/// files are: there is nothing useful — or safe to the pane's
+/// responsiveness — to render, so the UI shows a placeholder instead of
+/// blocking on the read and the highlight pass that follows it. Files over
+/// `MAX_SOURCE_LINES` are refused for the separate reason documented there.
+///
+/// The symlink and size checks above run against the PATH
+/// (`symlink_metadata`), then the actual read opens that same path again —
+/// two separate filesystem operations with a gap between them. Something
+/// with write access to the reviewed worktree (the review pane's own
+/// threat model: a reviewed CHANGE, not a trusted actor) could swap the
+/// path for a symlink, or grow the file past the cap, in that gap, and
+/// have the read follow whatever it now finds. Closing that requires
+/// re-validating the OPENED FILE, not the path a second time: after
+/// opening, `same_file` compares the handle's own device/inode against
+/// what the pre-open check inspected — this is the one thing a
+/// racing path-swap cannot fake, since a symlink swap produces a
+/// different underlying file — and the read itself is hard-capped via
+/// `Read::take` regardless of what any stat reported.
+pub fn load_source(working_dir: &str, path: &str) -> Result<Vec<String>> {
+    let full = Path::new(working_dir).join(path);
+    let pre = std::fs::symlink_metadata(&full)
+        .with_context(|| format!("reading {}", full.display()))?;
+    if pre.file_type().is_symlink() {
+        bail!("{} is a symlink; source view does not follow worktree symlinks", full.display());
+    }
+    if pre.len() > MAX_SOURCE_BYTES {
+        bail!(
+            "{} is {} bytes, over the {}-byte source view limit",
+            full.display(),
+            pre.len(),
+            MAX_SOURCE_BYTES
+        );
+    }
+
+    let file = std::fs::File::open(&full)
+        .with_context(|| format!("reading {}", full.display()))?;
+    let post = file.metadata().with_context(|| format!("reading {}", full.display()))?;
+    #[cfg(unix)]
+    if !same_file(&pre, &post) {
+        bail!("{} changed while opening it; refusing a racy read", full.display());
+    }
+    if post.len() > MAX_SOURCE_BYTES {
+        bail!(
+            "{} is {} bytes, over the {}-byte source view limit",
+            full.display(),
+            post.len(),
+            MAX_SOURCE_BYTES
+        );
+    }
+
+    // However large `post.len()` claims to be, never actually read more
+    // than the cap allows — a size that changes again after this last
+    // stat is caught here rather than trusted.
+    let mut buf = String::new();
+    file.take(MAX_SOURCE_BYTES + 1)
+        .read_to_string(&mut buf)
+        .with_context(|| format!("reading {}", full.display()))?;
+    if buf.len() as u64 > MAX_SOURCE_BYTES {
+        bail!("{} grew past the {}-byte source view limit while reading", full.display(), MAX_SOURCE_BYTES);
+    }
+
+    let lines: Vec<String> = buf.lines().map(|line| line.to_string()).collect();
+    if lines.len() > MAX_SOURCE_LINES {
+        bail!(
+            "{} has {} lines, over the {}-line source view limit",
+            full.display(),
+            lines.len(),
+            MAX_SOURCE_LINES
+        );
+    }
+    Ok(lines)
+}
+
+/// Whether two `Metadata` values describe the SAME underlying file (same
+/// device, same inode) rather than merely files that happen to look alike.
+/// The one check a racing symlink-swap or file-replace cannot fake: even a
+/// same-sized, same-permissions replacement file gets a fresh inode.
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
 }
 
 /// Parse `git diff --no-color` unified output into file diffs.
@@ -849,5 +972,111 @@ index 1111111..2222222 100644
                 assert_eq!(line.origin, Origin::Add);
             }
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn same_file_detects_a_different_underlying_file_even_with_matching_size() {
+        // Regression (Codex P1): the symlink/size checks in load_source stat
+        // the PATH, then the read opens that same path again — a gap a
+        // racing path-swap could exploit (replace the path with a symlink,
+        // or a bigger file, between the check and the open). same_file is
+        // the guard that closes it: comparing the OPENED handle's own
+        // device/inode against what the pre-open check inspected, which a
+        // swap — even to a same-sized replacement — cannot fake.
+        let repo = TempRepo::new("same_file_check");
+        repo.write("a.txt", "hello");
+        repo.write("b.txt", "hello"); // same size, different underlying file
+
+        let meta_a = std::fs::symlink_metadata(repo.path.join("a.txt")).expect("stat a");
+        let meta_a_again = std::fs::symlink_metadata(repo.path.join("a.txt")).expect("stat a again");
+        let meta_b = std::fs::symlink_metadata(repo.path.join("b.txt")).expect("stat b");
+
+        assert!(same_file(&meta_a, &meta_a_again), "the same path stat'd twice must match");
+        assert!(!same_file(&meta_a, &meta_b), "two different files must not match, even same-sized");
+    }
+
+    #[test]
+    fn load_source_refuses_a_symlink_instead_of_following_it_outside_the_repo() {
+        // Regression (Codex P0): read_to_string follows symlinks. A reviewed
+        // change that plants a symlink pointing outside the repo — a secret
+        // file, an SSH key — must not have its target's content rendered in
+        // source view just because the reviewer pressed `t`.
+        let repo = TempRepo::new("symlink_source");
+
+        let secret_dir = std::env::temp_dir()
+            .join(format!("herdr_diff_test_secret_{}", std::process::id()));
+        std::fs::create_dir_all(&secret_dir).expect("create secret dir");
+        let secret_path = secret_dir.join("secret.txt");
+        std::fs::write(&secret_path, "TOP SECRET, outside the repo\n").expect("write secret");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&secret_path, repo.path.join("link.txt"))
+            .expect("create symlink");
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let result = load_source(&wd, "link.txt");
+        assert!(result.is_err(), "a symlink must be refused, not dereferenced: {result:?}");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("symlink"), "error should name the reason, got {msg:?}");
+
+        let _ = std::fs::remove_dir_all(&secret_dir);
+    }
+
+    #[test]
+    fn load_source_refuses_a_file_over_the_size_limit() {
+        // Regression (Codex P1): source view read, copied, and
+        // syntax-highlighted a file of any size synchronously on the render
+        // thread. A generated/minified file the diff itself never had to pay
+        // for could freeze the pane just because the reviewer pressed `t`.
+        let repo = TempRepo::new("oversized_source");
+        let oversized = "x".repeat((MAX_SOURCE_BYTES + 1) as usize);
+        repo.write("huge.txt", &oversized);
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let result = load_source(&wd, "huge.txt");
+        assert!(result.is_err(), "an oversized file must be refused: {result:?}");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("limit"), "error should name the reason, got {msg:?}");
+
+        // A file right at the limit still loads normally — this guards the
+        // limit itself, not files that merely happen to be sizeable.
+        let at_limit = "y".repeat(MAX_SOURCE_BYTES as usize);
+        repo.write("at_limit.txt", &at_limit);
+        assert!(load_source(&wd, "at_limit.txt").is_ok(), "a file at the limit must still load");
+    }
+
+    #[test]
+    fn load_source_refuses_a_file_with_too_many_lines() {
+        // Regression (Codex P1): ratatui's `Paragraph::scroll` takes a `u16`
+        // row offset. A file well under the byte cap can still hold tens of
+        // thousands of very short lines; scrolling into one would need an
+        // offset that silently wraps when narrowed from `usize` to `u16`,
+        // rendering unrelated earlier rows while the cursor/footer still
+        // report the true (later, wrapped-away) line. Bytes alone don't
+        // catch this, so the line count needs its own, separate cap.
+        let repo = TempRepo::new("too_many_lines");
+        // Short lines so this is nowhere near MAX_SOURCE_BYTES — this test
+        // isolates the LINE cap, not the byte one.
+        let many_lines = "x\n".repeat(MAX_SOURCE_LINES + 1);
+        assert!(
+            (many_lines.len() as u64) < MAX_SOURCE_BYTES,
+            "test setup must stay under the byte cap to isolate the line cap"
+        );
+        repo.write("many_lines.txt", &many_lines);
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let result = load_source(&wd, "many_lines.txt");
+        assert!(result.is_err(), "a file with too many lines must be refused: {result:?}");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("lines"), "error should name the reason, got {msg:?}");
+
+        // A file at exactly the limit still loads.
+        let at_limit = "x\n".repeat(MAX_SOURCE_LINES);
+        repo.write("at_limit_lines.txt", &at_limit);
+        assert!(
+            load_source(&wd, "at_limit_lines.txt").is_ok(),
+            "a file at the line limit must still load"
+        );
     }
 }
