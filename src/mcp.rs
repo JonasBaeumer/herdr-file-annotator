@@ -275,9 +275,19 @@ fn handle_collect_review(args: &Value, active: &mut Option<ActiveReview>) -> Val
 
     loop {
         let taken = active.as_ref().and_then(|a| a.open.try_take());
-        if let Some(result) = taken {
-            *active = None;
-            return review_result_response(&result);
+        match taken {
+            Some(Ok(result)) => {
+                *active = None;
+                return review_result_response(&result);
+            }
+            Some(Err(err)) => {
+                // A broken channel, not a verdict — clear the slot (there's
+                // nothing left to collect) and surface it as a real error
+                // rather than silently reporting a cancelled review.
+                *active = None;
+                return tool_error(format!("{err:#}"));
+            }
+            None => {}
         }
         if wait_seconds == 0 || Instant::now() >= deadline {
             let open_for_secs = active

@@ -158,6 +158,14 @@ impl Handoff {
     /// Send the request and hand back an open channel: the caller can push
     /// navigation to the pane and take the verdict whenever it lands. The
     /// verdict is read on a mailbox thread so nothing here ever blocks.
+    ///
+    /// EOF (the pane closed the connection without answering) is a genuine
+    /// `Cancelled` verdict — that's a normal way for a review to end. A
+    /// malformed line or any other read failure is a broken channel, not a
+    /// human decision, so it's kept out of the mailbox's `Cancelled`
+    /// vocabulary and surfaced as an `Err` instead — callers that treat
+    /// `Cancelled` as "nothing to worry about" must not see a protocol bug
+    /// dressed up as one.
     pub fn open(mut self, request: &ReviewRequest) -> Result<OpenReview> {
         write_json_line(&mut self.stream, &ServerMsg::Request(request.clone()))?;
         let writer = self.stream.try_clone().context("splitting review socket")?;
@@ -165,11 +173,13 @@ impl Handoff {
         let mailbox = std::sync::Arc::clone(&result);
         let read_stream = self.stream;
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(read_stream);
-            let outcome = match read_json_line::<ReviewResult, _>(&mut reader) {
-                Ok(Some(result)) => result,
-                Ok(None) => ReviewResult::cancelled("review pane closed without a verdict"),
-                Err(_) => ReviewResult::cancelled("review channel failed"),
+            let outcome: std::result::Result<ReviewResult, String> = {
+                let mut reader = BufReader::new(read_stream);
+                match read_json_line::<ReviewResult, _>(&mut reader) {
+                    Ok(Some(result)) => Ok(result),
+                    Ok(None) => Ok(ReviewResult::cancelled("review pane closed without a verdict")),
+                    Err(err) => Err(format!("{err:#}")),
+                }
             };
             if let Ok(mut slot) = mailbox.lock() {
                 *slot = Some(outcome);
@@ -182,9 +192,10 @@ impl Handoff {
     ///
     /// `timeout`: `None` waits forever (the default); a lapsed deadline maps
     /// to a `Cancelled` verdict rather than an error — a slow or silent
-    /// reviewer is not a protocol failure.
+    /// reviewer is not a protocol failure. A broken channel (malformed
+    /// reply, read error) is a different thing and propagates as `Err`.
     pub fn exchange(self, request: &ReviewRequest, timeout: Option<Duration>) -> Result<ReviewResult> {
-        Ok(self.open(request)?.wait(timeout))
+        self.open(request)?.wait(timeout)
     }
 }
 
@@ -193,7 +204,7 @@ impl Handoff {
 /// in the reader thread and is discarded).
 pub struct OpenReview {
     writer: UnixStream,
-    result: std::sync::Arc<std::sync::Mutex<Option<ReviewResult>>>,
+    result: std::sync::Arc<std::sync::Mutex<Option<std::result::Result<ReviewResult, String>>>>,
 }
 
 impl OpenReview {
@@ -204,9 +215,16 @@ impl OpenReview {
             .context("pushing navigation to the review pane")
     }
 
-    /// Take the verdict if the reviewer has delivered one.
-    pub fn try_take(&self) -> Option<ReviewResult> {
-        self.result.lock().ok().and_then(|mut slot| slot.take())
+    /// Take the verdict if the reviewer has delivered one. `Err` means the
+    /// channel itself broke (malformed reply, read failure) — distinct from
+    /// a `Cancelled` verdict, which means the pane closed cleanly without
+    /// deciding.
+    pub fn try_take(&self) -> Option<Result<ReviewResult>> {
+        self.result
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .map(|outcome| outcome.map_err(|msg| anyhow::anyhow!(msg)))
     }
 
     /// Wait for the verdict, polling the mailbox. `None` waits forever; a
@@ -218,7 +236,7 @@ impl OpenReview {
     /// gave up, so that read would otherwise block forever (and the pane
     /// stays connected to a review nobody is waiting on) — shutting the
     /// socket down here unblocks the reader with an EOF so it can exit.
-    pub fn wait(&self, timeout: Option<Duration>) -> ReviewResult {
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<ReviewResult> {
         let start = std::time::Instant::now();
         loop {
             if let Some(result) = self.try_take() {
@@ -227,7 +245,7 @@ impl OpenReview {
             if let Some(deadline) = timeout {
                 if start.elapsed() >= deadline {
                     let _ = self.writer.shutdown(std::net::Shutdown::Both);
-                    return ReviewResult::cancelled("review timed out");
+                    return Ok(ReviewResult::cancelled("review timed out"));
                 }
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -389,7 +407,7 @@ mod tests {
         assert!(open.try_take().is_none());
         open.goto(&GotoTarget { file: "src/a.rs".into(), line: 10 }).unwrap();
         open.goto(&GotoTarget { file: "src/b.rs".into(), line: 3 }).unwrap();
-        let result = open.wait(Some(Duration::from_secs(5)));
+        let result = open.wait(Some(Duration::from_secs(5))).unwrap();
         pane.join().unwrap();
         assert_eq!(result.verdict, Verdict::Approve);
         let _ = std::fs::remove_file(&sock);
@@ -541,6 +559,41 @@ mod tests {
         // leaving the background reader (and this connection) hanging.
         let n = pane.join().unwrap().unwrap();
         assert_eq!(n, 0, "pane's read must see EOF once the timed-out review shuts the socket down");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn a_malformed_reply_is_a_tool_error_not_a_cancelled_verdict() {
+        let dir = std::env::temp_dir().join(format!("annot-test-malformed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let sock_client = sock.clone();
+        let pane = std::thread::spawn(move || {
+            let mut conn = PaneConnection::connect(&sock_client).unwrap();
+            let _ = conn.receive_request().unwrap();
+            // A broken channel, not a human decision: reply with a line
+            // that isn't a valid ReviewResult at all.
+            conn.stream.write_all(b"not valid json\n").unwrap();
+        });
+
+        let handoff = Handoff::accept(listener, Duration::from_secs(5)).unwrap();
+        let result = handoff.exchange(
+            &ReviewRequest {
+                version: PROTOCOL_VERSION,
+                working_dir: "/".into(),
+                baseline: None,
+                note: None,
+            },
+            None,
+        );
+        pane.join().unwrap();
+
+        // Must be a genuine Err, not an Ok(Cancelled) — a caller that
+        // treats Cancelled as "nothing to worry about" must see this.
+        assert!(result.is_err(), "a malformed reply must surface as an error, not {result:?}");
         let _ = std::fs::remove_file(&sock);
     }
 }
