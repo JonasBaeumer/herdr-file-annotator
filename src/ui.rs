@@ -958,8 +958,9 @@ impl<'a> App<'a> {
     /// Agent-pushed navigation: focus `target.file` at new-side line
     /// `target.line` in the CURRENT view. Advisory by contract — unknown
     /// files are ignored, out-of-range lines clamp, and in diff view a line
-    /// outside the hunks lands on the nearest following changed/context row
-    /// (else the top). Never disturbs an open input bar.
+    /// outside the hunks lands on the nearest following changed/context row,
+    /// or the last new-side row if none follows (never wraps to the top).
+    /// Never disturbs an open input bar.
     fn apply_goto(&mut self, target: &GotoTarget, term_size: Size) {
         if self.input.is_some() {
             return;
@@ -985,6 +986,13 @@ impl<'a> App<'a> {
                         rows.iter().position(
                             |r| matches!(r, DiffRow::Line(l) if l.new_no.is_some_and(|n| n >= target.line)),
                         )
+                    })
+                    // Past the last new-side line: clamp to it, matching
+                    // source view's clamp-to-last-line rather than falling
+                    // through to row 0 (which would read as "jumped to the
+                    // top" for a target that was actually past the end).
+                    .or_else(|| {
+                        rows.iter().rposition(|r| matches!(r, DiffRow::Line(l) if l.new_no.is_some()))
                     })
                     .unwrap_or(0)
             }
@@ -2867,6 +2875,27 @@ mod tests {
         // No files: selection pinned to 0.
         nav.down(0);
         assert_eq!(nav.selected, 0);
+    }
+
+    #[test]
+    fn goto_targeting_a_line_past_the_diffs_end_clamps_instead_of_wrapping_to_the_top() {
+        // sample_file flattens to 8 rows (0..=7); row 7 carries the final
+        // new-side line, new_no 12.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.diff.cursor = 3; // away from both 0 and the target, so a
+                              // wrap-to-top bug is visible either way.
+
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 999 },
+            Size::new(80, 24),
+        );
+
+        assert_eq!(
+            app.diff.cursor, 7,
+            "a target past the last new-side line must clamp to it, not wrap to row 0"
+        );
     }
 
     #[test]
