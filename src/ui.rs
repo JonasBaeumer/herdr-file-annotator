@@ -26,7 +26,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use syntect::easy::HighlightLines;
@@ -737,6 +737,16 @@ struct App<'a> {
     /// (the initial stat failed) mean there's nothing to compare against,
     /// not that drift is impossible.
     source_baseline_mtime: HashMap<usize, std::time::SystemTime>,
+    /// Whether the `?` key-reference overlay is showing. While true it owns
+    /// the keyboard entirely (see `handle_key`): everything but `?`/`Esc`/
+    /// `Enter`/`q` (close) and `j`/`k` (scroll) is swallowed, and — crucially
+    /// — `q` here does NOT cancel the review the way it does everywhere
+    /// else. Toggled by `?` only when no input bar is open, so a literal
+    /// `?` can still be typed into a comment or summary.
+    help_open: bool,
+    /// Scroll offset, in overlay content rows, for the help overlay. Reset
+    /// to 0 every time the overlay opens so it never reopens mid-scroll.
+    help_scroll: usize,
 }
 
 /// The file's current modification time, or `None` if it can't be stat'd
@@ -838,6 +848,8 @@ impl<'a> App<'a> {
             source_cache: HashMap::new(),
             pan_limit,
             source_baseline_mtime,
+            help_open: false,
+            help_scroll: 0,
         }
     }
 
@@ -1205,8 +1217,35 @@ impl<'a> App<'a> {
             return outcome;
         }
 
+        // The help overlay owns the keyboard while it's open: close keys
+        // close it (note `q` does NOT fall through to the cancel arm below
+        // — a reviewer dismissing the help must not accidentally cancel the
+        // whole review), j/k scroll, everything else is swallowed rather
+        // than reaching the nav/verdict handling underneath.
+        if self.help_open {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                    self.help_open = false;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let max = self.help_max_scroll(term_size);
+                    self.help_scroll = (self.help_scroll + 1).min(max);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                _ => {}
+            }
+            return None;
+        }
+
         // Global verdict keys (disabled while an input prompt is open, handled above).
         match key.code {
+            KeyCode::Char('?') => {
+                self.help_open = true;
+                self.help_scroll = 0;
+                return None;
+            }
             KeyCode::Char('q') => {
                 return Some(Outcome {
                     verdict: Verdict::Cancelled,
@@ -1384,6 +1423,20 @@ impl<'a> App<'a> {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, term_size: Size) {
+        // The help overlay swallows mouse input the same way it swallows
+        // most keys — except the wheel, which scrolls it, since that's easy
+        // to support and matches j/k.
+        if self.help_open {
+            if let MouseEventKind::ScrollDown | MouseEventKind::ScrollUp = mouse.kind {
+                let max = self.help_max_scroll(term_size);
+                if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                    self.help_scroll = (self.help_scroll + 1).min(max);
+                } else {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+            }
+            return;
+        }
         // While an input bar is open the keyboard owns the interaction;
         // stray clicks/scrolls shouldn't move state under the typed comment.
         if self.input.is_some() {
@@ -1661,6 +1714,231 @@ impl<'a> App<'a> {
             DiffRow::Binary | DiffRow::NoContent => Some(file.path.clone()),
         }
     }
+
+    /// The `?` overlay's content, grouped into sections. **Finish** always
+    /// comes first (it applies everywhere); the section matching the
+    /// CURRENT focus (`Files` for `Focus::Navigator`, `Diff` for
+    /// `Focus::Diff`) is flagged `current` so `help_lines` can highlight its
+    /// header — the same "where am I" instinct the footer's position
+    /// already serves. `Annotate`, `Layout & views`, and `Mouse` are never
+    /// flagged: they're not a focus/view of their own, just always-on
+    /// actions reachable from wherever the reviewer is.
+    fn help_sections(&self) -> Vec<HelpSection> {
+        let files_current = self.focus == Focus::Navigator;
+        let diff_current = self.focus == Focus::Diff;
+        // n/p (hunk jumps) are a no-op outside diff view — see
+        // `handle_nav_key` — so the overlay says so right on the row rather
+        // than advertising a dead key while it's the active view.
+        let hunk_note =
+            if self.view == ViewMode::Source { " \u{2014} inactive in source view" } else { "" };
+
+        vec![
+            HelpSection {
+                name: "Finish",
+                current: false,
+                rows: vec![
+                    HelpRow::new("a", "approve"),
+                    HelpRow::new("r", "request changes"),
+                    HelpRow::new("q", "cancel"),
+                    HelpRow::new("esc", "cancel (clears an active selection first)"),
+                    HelpRow::new("ctrl+c", "cancel, even mid-input"),
+                ],
+            },
+            HelpSection {
+                name: "Files",
+                current: files_current,
+                rows: vec![
+                    HelpRow::new("j / k", "move down / up"),
+                    HelpRow::new("g / G", "first / last file"),
+                    HelpRow::new("l / enter / tab", "focus the diff"),
+                ],
+            },
+            HelpSection {
+                name: "Diff",
+                current: diff_current,
+                rows: vec![
+                    HelpRow::new("j / k", "move cursor"),
+                    HelpRow::new("g / G", "top / bottom"),
+                    HelpRow::new("\u{2190} / \u{2192} (H/L)", "pan left / right"),
+                    HelpRow::new("0", "reset pan"),
+                    HelpRow::new("d / u", "half page down / up"),
+                    HelpRow { key: "n / p", desc: format!("next / prev hunk{hunk_note}") },
+                    HelpRow::new("h / tab", "focus the files"),
+                    HelpRow::new("t", "toggle diff / source view"),
+                ],
+            },
+            HelpSection {
+                name: "Annotate",
+                current: false,
+                rows: vec![
+                    HelpRow::new("v", "start / clear a selection"),
+                    HelpRow::new("c", "comment on selection or cursor line"),
+                    HelpRow::new("  ctrl+t", "cycle the tag"),
+                    HelpRow::new("  enter", "save the comment"),
+                    HelpRow::new("  esc", "cancel the comment"),
+                    HelpRow::new("c (annotated line)", "edit the comment"),
+                    HelpRow::new("x", "delete annotation at cursor"),
+                ],
+            },
+            HelpSection {
+                name: "Layout & views",
+                current: false,
+                rows: vec![
+                    HelpRow::new("b", "show / hide the files pane"),
+                    HelpRow::new("z", "zoom the pane"),
+                    HelpRow::new("?", "toggle this help"),
+                ],
+            },
+            HelpSection {
+                name: "Mouse",
+                current: false,
+                rows: vec![
+                    HelpRow::new("wheel", "scroll the files or the diff"),
+                    HelpRow::new("horiz. wheel", "pan the diff"),
+                    HelpRow::new("click", "select a file / move the cursor"),
+                    HelpRow::new("drag", "select a range in the diff"),
+                ],
+            },
+        ]
+    }
+
+    /// `help_sections` flattened into display lines, each row clipped to
+    /// `width` display columns (see `head_fit`) so nothing overruns the
+    /// overlay regardless of pane size.
+    fn help_lines(&self, width: usize) -> Vec<Line<'static>> {
+        const KEY_COL: usize = 16;
+        let mut lines = Vec::new();
+        for (i, section) in self.help_sections().into_iter().enumerate() {
+            if i > 0 {
+                lines.push(Line::raw(""));
+            }
+            let marker = if section.current { "\u{25b8} " } else { "  " };
+            let suffix = if section.current { " (current)" } else { "" };
+            let header = format!("{marker}{}{suffix}", section.name);
+            let style = if section.current {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            lines.push(Line::styled(head_fit(&header, width), style));
+            for row in section.rows {
+                let text = format!(" {:<KEY_COL$} {}", row.key, row.desc);
+                lines.push(Line::raw(head_fit(&text, width)));
+            }
+        }
+        lines
+    }
+
+    /// The largest `help_scroll` that still leaves the overlay's content
+    /// filling its viewport — shared by `handle_key`'s j/k and
+    /// `handle_mouse`'s wheel so scrolling can't run past the end.
+    fn help_max_scroll(&self, term_size: Size) -> usize {
+        let (width, _) = help_overlay_geometry(term_size, 0);
+        let inner_width = width.saturating_sub(2).max(1) as usize;
+        let content_len = self.help_lines(inner_width).len();
+        let (_, height) = help_overlay_geometry(term_size, content_len);
+        let viewport = height.saturating_sub(2) as usize;
+        content_len.saturating_sub(viewport)
+    }
+}
+
+/// One row of the `?` overlay: a short key label and what it does.
+struct HelpRow {
+    key: &'static str,
+    desc: String,
+}
+
+impl HelpRow {
+    fn new(key: &'static str, desc: &str) -> Self {
+        HelpRow { key, desc: desc.to_string() }
+    }
+}
+
+/// One section of the `?` overlay's content — see `App::help_sections`.
+struct HelpSection {
+    name: &'static str,
+    /// Whether this section matches the reviewer's current focus/view, so
+    /// `help_lines` can highlight its header.
+    current: bool,
+    rows: Vec<HelpRow>,
+}
+
+/// The overlay's (width, height) for a `term_size`-sized frame and a given
+/// content length (line count from `App::help_lines`). Width never depends
+/// on content, only on the terminal — capped at 72 columns, and shrinking
+/// with a 4-column margin (2 either side) on narrower ones. Height fits the
+/// content up to the same margin against the terminal's height, so a short
+/// key list doesn't reserve a full-screen box, and a tall one still leaves
+/// a visible frame around it rather than filling the terminal edge-to-edge.
+fn help_overlay_geometry(term_size: Size, content_len: usize) -> (u16, u16) {
+    const MARGIN: u16 = 4;
+    const MAX_WIDTH: u16 = 72;
+    let width = term_size.width.saturating_sub(MARGIN).min(MAX_WIDTH).max(1);
+    let max_height = term_size.height.saturating_sub(MARGIN).max(3);
+    let height = (content_len as u16).saturating_add(2).min(max_height).max(3);
+    (width, height)
+}
+
+/// Clip a plain (unstyled) overlay row to `width` display columns,
+/// truncating the END with an ellipsis. The inverse of `tail_fit`: overlay
+/// rows are static reference text, not a live-typed buffer, so what matters
+/// is keeping the START (the key column) rather than the caret end.
+/// Grapheme-cluster aware, like `pan_and_clip`, so a clip never splits a
+/// multi-codepoint glyph — though overlay text is plain ASCII plus a
+/// handful of single-width symbols (arrows, the bullet, the middle dot), so
+/// in practice this never has to make that call.
+fn head_fit(s: &str, width: usize) -> String {
+    if str_cols(s) <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let avail = width - 1; // room for the trailing ellipsis
+    let mut out = String::new();
+    let mut cols = 0usize;
+    for g in s.graphemes(true) {
+        let w = UnicodeWidthStr::width(g);
+        if cols + w > avail {
+            break;
+        }
+        out.push_str(g);
+        cols += w;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Render the `?` overlay: a `Clear`ed, centered, bordered box over
+/// whatever's already drawn. Content is pre-clipped per row by
+/// `App::help_lines`, so the `Paragraph` here just scrolls — it doesn't
+/// wrap (wrapping would defeat the per-row clipping and let a long row spill
+/// onto an extra line, throwing off the scroll math).
+fn draw_help_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let term_size = Size { width: area.width, height: area.height };
+    let (width, _) = help_overlay_geometry(term_size, 0);
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let content = app.help_lines(inner_width);
+    let (_, height) = help_overlay_geometry(term_size, content.len());
+    let rect = Rect::new(
+        area.x + (area.width.saturating_sub(width)) / 2,
+        area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+
+    let viewport = height.saturating_sub(2) as usize;
+    let max_scroll = content.len().saturating_sub(viewport);
+    let scroll = app.help_scroll.min(max_scroll) as u16;
+
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" keys ");
+    let paragraph = Paragraph::new(content).block(block).scroll((scroll, 0));
+    frame.render_widget(paragraph, rect);
 }
 
 fn draw(frame: &mut Frame, app: &App) {
@@ -1679,6 +1957,9 @@ fn draw(frame: &mut Frame, app: &App) {
     draw_note(frame, rows[1], app.request, app.pending.len());
     draw_body(frame, rows[2], app);
     draw_footer(frame, rows[3], app);
+    if app.help_open {
+        draw_help_overlay(frame, area, app);
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, request: &ReviewRequest) {
@@ -1722,19 +2003,24 @@ fn summary_footer_text(buf: &str, width: usize) -> String {
     }
 }
 
-/// Shared by every footer state: the verdict keys that always apply.
-const GLOBAL_HINTS: &str = "a approve \u{b7} r request changes \u{b7} q cancel";
-
-/// The diff-focus footer's key hints, for the current position and view.
-/// The `n/p hunk` hint is diff-view-only: `handle_nav_key` makes `n`/`p`
-/// no-ops in source view (hunk jumps don't mean anything there), so
-/// advertising them in a mode where they do nothing would be stale,
-/// misleading help text — precisely in the newly added mode.
-fn diff_focus_footer(view: ViewMode, pos: &str) -> String {
-    let hunk_hint = if view == ViewMode::Diff { "n/p hunk \u{b7} " } else { "" };
-    format!(
-        " {pos} \u{b7} j/k move \u{b7} \u{2190}/\u{2192} pan \u{b7} d/u half page \u{b7} {hunk_hint}t view \u{b7} b files \u{b7} z zoom \u{b7} v select \u{b7} c comment \u{b7} x delete \u{b7} h/tab navigator \u{b7} {GLOBAL_HINTS}"
-    )
+/// The non-input footer, replacing the old per-focus hint sausage (a wall of
+/// key hints that ran off the right edge of narrow panes) with a short,
+/// constant tail — the full key reference now lives in the `?` overlay
+/// instead of being crammed into one line. `context` is the position
+/// (`path:line`, diff focus) or `files (n)` (navigator focus); it comes
+/// FIRST so it's what survives if the pane is too narrow for the rest, the
+/// same "position outlives the hints" convention the old footer used.
+fn slim_footer_text(context: &str, width: usize) -> String {
+    let hints = " \u{b7} a approve \u{b7} r request changes \u{b7} q cancel \u{b7} ? help";
+    let full = format!(" {context}{hints}");
+    if str_cols(&full) <= width {
+        return full;
+    }
+    let ctx_only = format!(" {context}");
+    if str_cols(&ctx_only) <= width {
+        return ctx_only;
+    }
+    tail_fit(&ctx_only, width)
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -1747,17 +2033,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             let label = format!(" comment [tag: {tag_label}]: ");
             format!("{label}{}", tail_fit(buf, (area.width as usize).saturating_sub(label.chars().count())))
         }
-        None => match app.focus {
-            Focus::Navigator => format!(
-                " j/k move \u{b7} g/G first/last \u{b7} l/enter/tab focus diff \u{b7} b hide \u{b7} z zoom \u{b7} {GLOBAL_HINTS}"
-            ),
-            Focus::Diff => {
-                // Position first: when the footer clips in a narrow pane,
-                // "where am I" survives and only the key hints get cut.
-                let pos = app.cursor_position().unwrap_or_default();
-                diff_focus_footer(app.view, &pos)
-            }
-        },
+        None => {
+            let context = match app.focus {
+                Focus::Navigator => format!("files ({})", app.files().len()),
+                Focus::Diff => app.cursor_position().unwrap_or_default(),
+            };
+            slim_footer_text(&context, area.width as usize)
+        }
     };
     let footer = Paragraph::new(text).style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_widget(footer, area);
@@ -2538,6 +2820,12 @@ mod tests {
         DiffLine { origin, old_no, new_no, content: content.to_string() }
     }
 
+    /// Concatenate a rendered `Line`'s spans back into plain text, for
+    /// asserting on content without caring about styling.
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     fn sample_file() -> FileDiff {
         FileDiff {
             path: "src/lib.rs".to_string(),
@@ -2753,22 +3041,49 @@ mod tests {
     }
 
     #[test]
-    fn diff_focus_footer_hides_the_hunk_hint_outside_diff_view() {
-        // The footer must not advertise `n/p hunk` in source view:
-        // handle_nav_key makes both keys no-ops there (hunk jumps only mean
-        // something in the diff), so showing the hint would be stale,
-        // misleading key help.
-        let diff = diff_focus_footer(ViewMode::Diff, "a.txt:1");
-        assert!(diff.contains("n/p hunk"), "diff view must still advertise the hunk hint");
+    fn slim_footer_shows_the_context_and_the_help_hint_when_it_fits() {
+        // The slimmed non-input footer: context first, then the four
+        // always-on keys, `? help` included — this is what replaced the old
+        // per-focus hint sausage that used to overflow narrow panes.
+        let text = slim_footer_text("a.txt:1", 80);
+        assert_eq!(text, " a.txt:1 \u{b7} a approve \u{b7} r request changes \u{b7} q cancel \u{b7} ? help");
+        assert!(str_cols(&text) <= 80);
+    }
 
-        let source = diff_focus_footer(ViewMode::Source, "a.txt:1");
-        assert!(!source.contains("n/p hunk"), "source view must not advertise a disabled shortcut");
+    #[test]
+    fn slim_footer_keeps_the_context_first_when_the_pane_is_too_narrow_for_hints() {
+        // Position survives, key hints get cut — the same convention the
+        // old (now-removed) `diff_focus_footer` used.
+        let wide_enough_for_context_only = " a.txt:1".chars().count();
+        let text = slim_footer_text("a.txt:1", wide_enough_for_context_only);
+        assert_eq!(text, " a.txt:1");
+        assert!(!text.contains("approve"));
 
-        // Everything else stays present in both views.
-        for hint in ["j/k move", "t view", "v select", "c comment", "x delete", "a approve"] {
-            assert!(diff.contains(hint), "diff footer missing {hint:?}");
-            assert!(source.contains(hint), "source footer missing {hint:?}");
-        }
+        // Too narrow even for the bare context: tail_fit keeps its end.
+        let text = slim_footer_text("src/very/long/nested/path/file.rs:123", 10);
+        assert!(str_cols(&text) <= 10, "footer must never exceed the pane width: {text:?}");
+    }
+
+    #[test]
+    fn help_overlay_notes_n_p_inactive_only_in_source_view() {
+        // `handle_nav_key` makes n/p no-ops outside diff view (hunk jumps
+        // don't mean anything there); the overlay's Diff section rows must
+        // say so precisely when that's the active view, not otherwise.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+
+        app.view = ViewMode::Diff;
+        let diff_text: String =
+            app.help_lines(200).iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(diff_text.contains("next / prev hunk"));
+        assert!(!diff_text.contains("inactive"));
+
+        app.view = ViewMode::Source;
+        let source_text: String =
+            app.help_lines(200).iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(source_text.contains("next / prev hunk \u{2014} inactive in source view"));
     }
 
     #[test]
@@ -3995,6 +4310,101 @@ mod tests {
             .expect("q cancels");
         assert_eq!(outcome.verdict, Verdict::Cancelled);
         assert!(outcome.annotations.is_empty());
+    }
+
+    #[test]
+    fn question_mark_opens_the_help_overlay_and_question_mark_or_esc_close_it() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+        assert!(!app.help_open);
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), size).is_none());
+        assert!(app.help_open, "`?` must open the overlay");
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), size).is_none());
+        assert!(!app.help_open, "`?` must close the overlay again");
+
+        app.help_open = true;
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), size).is_none());
+        assert!(!app.help_open, "Esc must close the overlay");
+    }
+
+    #[test]
+    fn q_closes_the_overlay_without_cancelling_but_cancels_normally_once_closed() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+
+        app.help_open = true;
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), size);
+        assert!(outcome.is_none(), "q inside the overlay must not produce an outcome");
+        assert!(!app.help_open, "q inside the overlay must close it");
+
+        // The SAME key, now that the overlay is closed, cancels as usual.
+        let outcome = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), size)
+            .expect("q cancels once the overlay is closed");
+        assert_eq!(outcome.verdict, Verdict::Cancelled);
+    }
+
+    #[test]
+    fn question_mark_types_into_an_open_comment_input_instead_of_opening_the_overlay() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.input = Some(InputMode::Comment {
+            buf: String::new(),
+            tag: None,
+            editing: None,
+            row_start: 0,
+            row_end: 0,
+        });
+        let size = Size::new(120, 40);
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), size).is_none());
+        assert!(!app.help_open, "`?` must not open the overlay while an input bar is open");
+        assert!(
+            matches!(&app.input, Some(InputMode::Comment { buf, .. }) if buf == "?"),
+            "expected the literal `?` to land in the still-open comment buffer"
+        );
+    }
+
+    #[test]
+    fn help_overlay_rows_fit_the_overlay_width_at_a_narrow_terminal_size() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let app = App::new(&request, &model);
+        let term_size = Size::new(40, 24);
+
+        let (width, _) = help_overlay_geometry(term_size, 0);
+        let inner_width = width.saturating_sub(2).max(1) as usize;
+        for line in app.help_lines(inner_width) {
+            let text = line_text(&line);
+            assert!(
+                str_cols(&text) <= inner_width,
+                "row {text:?} ({} cols) exceeds the overlay's inner width ({inner_width})",
+                str_cols(&text)
+            );
+        }
+    }
+
+    #[test]
+    fn diff_focus_footer_text_carries_the_position_and_the_help_hint() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff; // App::new defaults to Focus::Navigator
+        let width = 80usize;
+
+        let context = app.cursor_position().expect("cursor sits on a line");
+        let text = slim_footer_text(&context, width);
+        assert!(text.contains("? help"), "footer must advertise the new help overlay: {text:?}");
+        assert!(text.contains(&context), "footer must still show the position: {text:?}");
+        assert!(str_cols(&text) <= width, "footer must fit the pane: {text:?}");
     }
 
     #[test]
