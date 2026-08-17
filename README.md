@@ -136,7 +136,7 @@ Verdict result (JSON in the tool response from `review_changes`, or from a
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "verdict": "request_changes",
   "summary": "retry loop still swallows the error",
   "annotations": [
