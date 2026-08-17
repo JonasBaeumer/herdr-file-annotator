@@ -211,6 +211,13 @@ impl OpenReview {
 
     /// Wait for the verdict, polling the mailbox. `None` waits forever; a
     /// lapsed deadline yields a `Cancelled` verdict ("review timed out").
+    ///
+    /// The background reader spawned by `open` owns the other half of this
+    /// socket and blocks in a read until the pane answers or the connection
+    /// closes. On a lapsed deadline nothing has told the pane the caller
+    /// gave up, so that read would otherwise block forever (and the pane
+    /// stays connected to a review nobody is waiting on) — shutting the
+    /// socket down here unblocks the reader with an EOF so it can exit.
     pub fn wait(&self, timeout: Option<Duration>) -> ReviewResult {
         let start = std::time::Instant::now();
         loop {
@@ -219,6 +226,7 @@ impl OpenReview {
             }
             if let Some(deadline) = timeout {
                 if start.elapsed() >= deadline {
+                    let _ = self.writer.shutdown(std::net::Shutdown::Both);
                     return ReviewResult::cancelled("review timed out");
                 }
             }
@@ -486,5 +494,53 @@ mod tests {
         // Don't join `pane` — it's asleep for several seconds and we don't
         // need it to finish to consider this test done.
         drop(pane);
+    }
+
+    #[test]
+    fn timeout_shuts_the_socket_down_so_the_pane_sees_it_close() {
+        use std::io::Read;
+
+        let dir = std::env::temp_dir().join(format!("annot-test-timeout-shutdown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let sock_client = sock.clone();
+        let pane = std::thread::spawn(move || {
+            // Connect and read the request, then hold the connection open
+            // without answering — the timeout is what has to close things,
+            // not the pane hanging up on its own.
+            let mut conn = PaneConnection::connect(&sock_client).unwrap();
+            let _ = conn.receive_request().unwrap();
+            // A bounded read timeout so an unfixed server (socket left
+            // open, reader thread blocked forever) fails this test instead
+            // of hanging it: the read should observe EOF well within this
+            // window once `wait` shuts the socket down on its own timeout.
+            conn.stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut buf = [0u8; 1];
+            conn.stream.read(&mut buf)
+        });
+
+        let handoff = Handoff::accept(listener, Duration::from_secs(5)).unwrap();
+        let result = handoff
+            .exchange(
+                &ReviewRequest {
+                    version: PROTOCOL_VERSION,
+                    working_dir: "/".into(),
+                    baseline: None,
+                    note: None,
+                },
+                Some(Duration::from_millis(200)),
+            )
+            .unwrap();
+        assert_eq!(result.verdict, Verdict::Cancelled);
+
+        // The pane's read must observe EOF (0 bytes) once the caller's
+        // deadline passes, proving the server closed the socket rather than
+        // leaving the background reader (and this connection) hanging.
+        let n = pane.join().unwrap().unwrap();
+        assert_eq!(n, 0, "pane's read must see EOF once the timed-out review shuts the socket down");
+        let _ = std::fs::remove_file(&sock);
     }
 }
