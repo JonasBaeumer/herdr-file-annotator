@@ -199,6 +199,9 @@ pub struct OpenReview {
     result: std::sync::Arc<std::sync::Mutex<Option<ReviewResult>>>,
 }
 
+// TEMPORARY allow: see OpenReview — consumed by the MCP server's
+// non-blocking tools in the next commit on this branch.
+#[allow(dead_code)]
 impl OpenReview {
     /// Push navigation to the open pane (advisory; the pane clamps/ignores
     /// unknown targets).
