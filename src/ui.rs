@@ -1023,12 +1023,22 @@ impl<'a> App<'a> {
                 self.visual_anchor = None;
                 self.diff.reset();
             }
-            Some("source") if self.view != ViewMode::Source => {
+            Some("source") => {
+                // The usability check must run for EVERY source request, not
+                // only when entering source view: a pane already in source
+                // mode steered to a deleted/binary/unreadable file would
+                // otherwise show the placeholder instead of keeping the
+                // useful diff, breaking the documented "ignored" contract.
+                let started_in_source = self.view == ViewMode::Source;
                 self.view = ViewMode::Source;
                 self.ensure_source_loaded();
                 if matches!(self.source_cache.get(&self.nav.selected), Some(Err(_))) {
                     self.view = ViewMode::Diff; // no usable source: request ignored
-                } else {
+                }
+                // Clear the selection only when the EFFECTIVE view changed
+                // relative to where this push started — that's when the row
+                // space under a live anchor shifts.
+                if started_in_source != (self.view == ViewMode::Source) {
                     self.visual_anchor = None;
                     self.diff.reset();
                 }
@@ -3000,7 +3010,9 @@ mod tests {
             baseline: None,
             note: None,
         };
-        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut ghost = sample_file();
+        ghost.path = "src/gone.rs".to_string(); // in the diff, never on disk
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file(), ghost] });
         let mut app = App::new(&request, &model);
         app.focus = Focus::Diff;
         let size = Size::new(120, 40);
@@ -3036,6 +3048,29 @@ mod tests {
         );
         assert!(app.visual_anchor.is_none(), "view switch must clear the visual anchor");
 
+        // The same contract while ALREADY in source view: enter source on a
+        // usable file, then steer to one whose source side never existed —
+        // the pane must fall back to diff, not show the placeholder, and the
+        // effective source→diff change clears a live selection.
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            size,
+        );
+        assert!(app.view == ViewMode::Source);
+        app.visual_anchor = Some(1);
+        app.apply_goto(
+            &GotoTarget { file: "src/gone.rs".into(), line: 2, view: Some("source".into()) },
+            size,
+        );
+        assert!(
+            app.view == ViewMode::Diff,
+            "already-in-source steering to an unusable file must fall back to diff"
+        );
+        assert!(
+            app.visual_anchor.is_none(),
+            "the effective source→diff change must clear the selection"
+        );
+
         // A source request for a file with no usable source is IGNORED —
         // the diff stays on screen, per the documented contract.
         app.apply_goto(
@@ -3052,6 +3087,7 @@ mod tests {
             app.view == ViewMode::Diff,
             "unusable source must keep the diff visible, not show a placeholder"
         );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
