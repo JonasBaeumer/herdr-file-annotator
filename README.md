@@ -148,8 +148,10 @@ Verdict result (JSON in the tool response from `review_changes`, or from a
 
 `review_changes` blocks for as long as the config's `review_timeout` allows
 (unset = forever). The non-blocking tools have no such timeout — nothing is
-blocked, so there's nothing to time out; the review just stays open until the
-reviewer finishes in the pane or the agent calls `collect_review`.
+blocked, so there's nothing to time out; the review stays open until the
+reviewer finishes in the pane (or closes it). `collect_review` only ends the
+review when a verdict has actually landed — a `pending` result leaves the
+pane open, and the agent simply collects again later.
 
 ## Guided walkthroughs
 

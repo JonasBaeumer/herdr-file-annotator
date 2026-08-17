@@ -176,11 +176,11 @@ fn tool_descriptors() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "wait_seconds": {
-                        "type": "integer",
+                        "type": ["integer", "null"],
                         "minimum": 0,
                         "maximum": 120,
                         "default": 0,
-                        "description": "How long to poll for a verdict before reporting pending. 0 = single check, no wait."
+                        "description": "How long to poll for a verdict before reporting pending. 0 = single check, no wait. Omitted or null both mean the default — some MCP clients serialize omitted optionals as null."
                     }
                 },
                 "required": []
