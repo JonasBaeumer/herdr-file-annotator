@@ -32,6 +32,7 @@ harness failures. The server's stderr is inherited (passed through to our
 stderr) so protocol/debug logs are visible directly.
 """
 import json
+import select
 import subprocess
 import sys
 import time
@@ -48,12 +49,27 @@ def send(proc, obj):
 
 
 def read_response(proc, want_id, timeout):
-    """Block reading lines from proc.stdout until one has "id" == want_id."""
+    """Block reading lines from proc.stdout until one has "id" == want_id.
+
+    Unlike mcp_client.py's review_changes wait (which is meant to block for
+    however long a human review takes), every tool call here — show_changes,
+    goto, collect_review — is documented to return quickly, so a hang past
+    READ_TIMEOUT is a real bug, not a legitimate wait. A bare readline()
+    can't honor that: it blocks until the child writes something, so a
+    child that goes fully silent (crash, deadlock) never gives the deadline
+    check below a chance to run and this call — and the whole harness —
+    would hang past READ_TIMEOUT despite it. select() on the underlying fd
+    bounds each wait to the remaining budget so the deadline is always
+    re-checked, even against total silence.
+    """
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError(f"no response with id={want_id} within {timeout}s")
+        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not ready:
+            continue  # remaining has elapsed; the deadline check above will fire
         line = proc.stdout.readline()
         if line == "":
             raise RuntimeError("server closed stdout before responding")
