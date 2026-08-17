@@ -191,17 +191,11 @@ impl Handoff {
 /// A review in flight: write half for navigation pushes, mailbox for the
 /// verdict. Dropping it abandons the review (the pane's eventual reply lands
 /// in the reader thread and is discarded).
-// TEMPORARY allow: `goto`/`try_take` are consumed by the MCP server's
-// non-blocking tools, the next commit on this branch — remove the allow there.
-#[allow(dead_code)]
 pub struct OpenReview {
     writer: UnixStream,
     result: std::sync::Arc<std::sync::Mutex<Option<ReviewResult>>>,
 }
 
-// TEMPORARY allow: see OpenReview — consumed by the MCP server's
-// non-blocking tools in the next commit on this branch.
-#[allow(dead_code)]
 impl OpenReview {
     /// Push navigation to the open pane (advisory; the pane clamps/ignores
     /// unknown targets).
