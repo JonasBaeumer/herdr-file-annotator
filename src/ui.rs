@@ -742,8 +742,8 @@ fn trailing_cell_width(line: &Line) -> usize {
 /// width (1 or 2 cols, not a flat worst-case 2) — otherwise the marker
 /// replaces the last visible character, and on narrow panes a wasted
 /// reserve column can put the true final character permanently out of
-/// reach (Codex P1: a flat -3 reservation cost narrow panes exactly the
-/// one column a single-width trailing glyph didn't need reserved).
+/// reach. A flat worst-case reservation of 3 would cost narrow panes the
+/// one column a single-width trailing glyph didn't need reserved.
 /// When several rows tie for the widest, reserves for whichever of THEM
 /// has the widest trailing glyph, so panning to this cap is safe for all.
 fn pan_cap_for_rows(rows: &[Line]) -> usize {
@@ -1611,7 +1611,7 @@ fn summary_footer_text(buf: &str, width: usize) -> String {
     let suffix = " \u{23ce} send \u{b7} esc cancel";
     // Display columns, not chars: a CJK buffer can "fit" by char count while
     // its real rendered width (2 columns/char) already overflows the footer
-    // once the hint suffix is appended (Codex P0).
+    // once the hint suffix is appended.
     let avail = width.saturating_sub(str_cols(label));
     if str_cols(buf) + str_cols(suffix) <= avail {
         format!("{label}{buf}{suffix}")
@@ -2032,7 +2032,7 @@ fn editing_box_height(buf: &str, inner_width: usize) -> usize {
 fn editing_box_lines(buf: &str, tag: Option<Tag>, inner_width: usize) -> Vec<Line<'static>> {
     // NOT `.max(4)`: the box must fit the pane it's actually drawn into, not
     // a hypothetical wider one — forcing a wider width here just moves the
-    // overflow from "rows too wide" to "box wider than the pane" (Codex P2).
+    // overflow from "rows too wide" to "box wider than the pane".
     let width = inner_width.max(1);
     let rule_style = Style::default().fg(EDIT_RULE_FG).bg(COMMENT_BG);
     let text_style = Style::default().fg(Color::White).bg(COMMENT_BG);
@@ -2057,7 +2057,7 @@ fn editing_box_lines(buf: &str, tag: Option<Tag>, inner_width: usize) -> Vec<Lin
         // Display columns, not chars: a chunk of wide (e.g. CJK) glyphes has
         // fewer chars than the columns it renders as, so char-counting here
         // under-pads and pushes the closing border past the box's actual
-        // width (Codex P0).
+        // width.
         let mut used = str_cols(&middle);
         if i == last {
             middle.push('\u{258f}'); // typing caret
@@ -2614,12 +2614,12 @@ mod tests {
 
     #[test]
     fn inline_comment_continuation_rows_align_under_the_first_row_marker() {
-        // Regression (Codex P1): `comment_height_matches_rendered_line_count`
-        // only reads spans[1] (the wrapped text), never spans[0] (the lead),
-        // so a regression in the `┃ [tag] ` marker or its continuation
-        // indent would still pass. Pin the lead on both the first row and
-        // continuation rows, and that they render at equal display width so
-        // continuation text visually lines up under the first row's text.
+        // `comment_height_matches_rendered_line_count` only reads spans[1]
+        // (the wrapped text), never spans[0] (the lead), so a break in the
+        // `┃ [tag] ` marker or its continuation indent would still pass.
+        // Pin the lead on both the first row and continuation rows, and
+        // that they render at equal display width so continuation text
+        // visually lines up under the first row's text.
         let tag = Some("fix");
         let text = "a fairly long review comment that will definitely need wrapping at a narrow width";
         let width = 30;
@@ -2652,10 +2652,10 @@ mod tests {
 
     #[test]
     fn diff_focus_footer_hides_the_hunk_hint_outside_diff_view() {
-        // Regression (Codex P1): the footer kept advertising `n/p hunk` in
-        // source view even though handle_nav_key makes both keys no-ops
-        // there (hunk jumps only mean something in the diff) — stale,
-        // misleading key help in the newly added mode.
+        // The footer must not advertise `n/p hunk` in source view:
+        // handle_nav_key makes both keys no-ops there (hunk jumps only mean
+        // something in the diff), so showing the hint would be stale,
+        // misleading key help.
         let diff = diff_focus_footer(ViewMode::Diff, "a.txt:1");
         assert!(diff.contains("n/p hunk"), "diff view must still advertise the hunk hint");
 
@@ -2671,9 +2671,8 @@ mod tests {
 
     #[test]
     fn summary_footer_shows_the_hint_only_when_it_fits() {
-        // Regression (Codex P1): the width-dependent `<=` boundary that
-        // decides whether the "⏎ send · esc cancel" hint shows at all had
-        // no test coverage — pin both sides of it.
+        // Pin both sides of the width-dependent `<=` boundary that decides
+        // whether the "⏎ send · esc cancel" hint shows at all.
         let label = " request changes \u{2014} summary: ";
         let suffix = " \u{23ce} send \u{b7} esc cancel";
         let buf = "short summary";
@@ -2701,18 +2700,17 @@ mod tests {
 
     #[test]
     fn summary_footer_measures_the_fit_in_display_columns_not_chars() {
-        // Regression (Codex P0): the fit decision compared
-        // `buf.chars().count()` to the available width, so a CJK buffer (2
-        // display columns per char) could "fit" by char count while its
-        // real rendered width already overflowed the footer once the hint
-        // suffix was appended.
+        // The fit decision must compare display columns, not
+        // `buf.chars().count()`, to the available width: a CJK buffer (2
+        // display columns per char) can "fit" by char count while its real
+        // rendered width already overflows the footer once the hint suffix
+        // is appended.
         let label = " request changes \u{2014} summary: ";
         let suffix = " \u{23ce} send \u{b7} esc cancel";
         let cjk: String = "\u{56fd}".repeat(10); // 10 chars, 20 display columns
 
-        // Sized so the OLD char-count check (10 + suffix_chars <= avail)
-        // would pass, but the real column width (20 + suffix_chars) does
-        // not — the exact mismatch the finding describes.
+        // Sized so a char-count check (10 + suffix_chars <= avail) would
+        // pass, but the real column width (20 + suffix_chars) does not.
         let avail_chars = cjk.chars().count() + suffix.chars().count() + 5;
         let width = label.chars().count() + avail_chars;
 
@@ -2754,11 +2752,11 @@ mod tests {
 
     #[test]
     fn typing_in_the_comment_box_re_follows_the_caret_as_it_grows() {
-        // Regression (Codex P0): the active-input arm of `handle_key`
-        // returned before `ensure_cursor_visible` ran, so growing the
-        // editing box past the viewport bottom while typing left the scroll
-        // offset stuck — the caret and bottom controls slid off-screen
-        // instead of staying visible like every other row-count change does.
+        // The active-input arm of `handle_key` must run
+        // `ensure_cursor_visible` before returning: growing the editing box
+        // past the viewport bottom while typing must scroll to keep the
+        // caret and bottom controls visible, like every other row-count
+        // change does.
         let request = sample_request();
         let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
         let mut app = App::new(&request, &model);
@@ -2819,9 +2817,9 @@ mod tests {
 
     #[test]
     fn blank_changed_lines_keep_their_gutter_under_panning() {
-        // Regression (Codex P1): an empty added line rendered only gutter +
-        // marker spans, so the "3+ spans → pin 2" rule failed and panning
-        // consumed the line numbers.
+        // An empty added line must still carry a content span alongside
+        // gutter + marker: with only two spans, the "3+ spans → pin 2" rule
+        // fails and panning consumes the line numbers.
         let file = FileDiff {
             path: "src/lib.rs".to_string(),
             old_path: None,
@@ -2850,8 +2848,9 @@ mod tests {
 
     #[test]
     fn panning_reaches_the_end_of_very_long_lines() {
-        // Regression (Codex P1): a literal .min(1000) ceiling made columns
-        // past ~1000 permanently unreachable on generated/minified files.
+        // Panning must have no fixed ceiling: a literal .min(1000) cap
+        // would make columns past ~1000 permanently unreachable on
+        // generated/minified files.
         let long = "x".repeat(1500);
         let request = ReviewRequest {
             version: 1,
@@ -2902,13 +2901,13 @@ mod tests {
 
     #[test]
     fn narrow_panes_can_still_reach_the_final_ascii_character() {
-        // Regression (Codex P1): pan_cap reserved a flat 3 columns (marker +
-        // a HYPOTHETICAL double-width final glyph) even when the actual
-        // trailing glyph is single-width, wasting a column of pan reach that
+        // pan_cap must not reserve a flat 3 columns (marker + a
+        // HYPOTHETICAL double-width final glyph) when the actual trailing
+        // glyph is single-width: that wastes a column of pan reach that
         // narrow panes cannot spare. A short ASCII line in a pane with only
-        // two content columns after the pinned gutter could reach pan_cap
-        // and still have its final character swallowed by the right-clip's
-        // "…" marker — permanently unreachable, not just off by one frame.
+        // two content columns after the pinned gutter must still be able to
+        // reach pan_cap without its final character being swallowed by the
+        // right-clip's "…" marker.
         let short = "abcde".to_string();
         let request = ReviewRequest {
             version: 1,
@@ -2945,7 +2944,7 @@ mod tests {
         }
 
         // 11 pinned gutter/marker columns in a 13-column pane leaves 2
-        // content columns — exactly the narrow case from the report.
+        // content columns — the narrow case this test isolates.
         let mut row = app.row_cache.get(&0).unwrap()[1].clone();
         pan_and_clip(&mut row, app.diff.hscroll, 13, 2);
         let tail: String = row.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
@@ -2957,14 +2956,13 @@ mod tests {
 
     #[test]
     fn short_rows_stay_reachable_when_a_longer_row_sets_a_big_pan_cap() {
-        // Regression (Codex P1): the fixed 8-column HSCROLL_STEP could jump
-        // straight past a short row's entire remaining content in one press
-        // when a much longer row (elsewhere in the same file) supplied a
-        // big file-wide pan_cap. A 6-char row's middle/final characters
-        // became permanently unreachable: Right skipped from "showing the
-        // first couple of chars" to "fully panned off, empty" without ever
-        // passing through the offsets that would reveal the rest, and Left
-        // only ever returns to 0 (same fixed step).
+        // A fixed 8-column HSCROLL_STEP must not jump straight past a short
+        // row's entire remaining content in one press when a much longer
+        // row (elsewhere in the same file) supplies a big file-wide
+        // pan_cap: a 6-char row's middle/final characters must stay
+        // reachable, not skip from "showing the first couple of chars" to
+        // "fully panned off, empty" without ever passing through the
+        // offsets that would reveal the rest.
         let request = ReviewRequest {
             version: 1,
             working_dir: "/tmp".to_string(),
@@ -3002,8 +3000,9 @@ mod tests {
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
 
         // 11 pinned gutter/marker columns in a 14-column pane leaves 2
-        // content columns — the narrow case from the report. Every one of
-        // the short row's characters must surface in some frame as we step.
+        // content columns — the same narrow case as the diff-row version of
+        // this test. Every one of the short row's characters must surface
+        // in some frame as we step.
         let mut seen = std::collections::HashSet::new();
         for _ in 0..6 {
             app.handle_key(right, term);
@@ -3026,20 +3025,20 @@ mod tests {
 
     #[test]
     fn source_view_short_rows_stay_reachable_when_a_longer_row_sets_a_big_pan_cap() {
-        // Regression (Codex P1): `next_pan_stop`'s overshoot check always
-        // scanned `row_cache` — the DIFF rows — even in source view. A
-        // source file's line widths have nothing to do with the diff's, so
-        // a short SOURCE row's overshoot went undetected there and Right
-        // jumped the full step straight past it: the same bug
+        // `next_pan_stop`'s overshoot check must scan the rows of the
+        // ACTIVE view, not always `row_cache` (the diff rows): a source
+        // file's line widths have nothing to do with the diff's, so a short
+        // SOURCE row's overshoot must be detected too, or Right jumps the
+        // full step straight past it — the same reachability invariant
         // `short_rows_stay_reachable_when_a_longer_row_sets_a_big_pan_cap`
-        // pinned for diff rows, reappearing in the other view.
+        // pins for diff rows, here pinned for source rows.
         let dir = std::env::temp_dir()
             .join(format!("herdr-annotator-source-pan-reach-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         // On disk: a short row and a much longer one — deliberately
         // DIFFERENT from the diff's own (uniformly wide) lines below, so a
-        // next_pan_stop that (bugfully) checks diff rows instead sees no
-        // short row at all and never fine-steps.
+        // next_pan_stop that checks diff rows instead of source rows would
+        // see no short row at all and never fine-step.
         std::fs::write(dir.join("a.txt"), format!("abcdef\n{}\n", "y".repeat(200)))
             .expect("write source");
 
@@ -3118,12 +3117,12 @@ mod tests {
 
     #[test]
     fn short_rows_stay_reachable_at_an_exact_step_boundary() {
-        // Regression (Codex P1): `next_pan_stop`'s overshoot check used a
-        // strict `cols < target`, excluding a row whose pannable width
-        // lands EXACTLY on the step boundary (an 8-char row against the
-        // default HSCROLL_STEP=8). The first Right press still jumped
-        // straight from offset 0 to offset 8 — where that row is already
-        // fully panned off, empty — skipping every offset that would have
+        // `next_pan_stop`'s overshoot check must include a row whose
+        // pannable width lands EXACTLY on the step boundary (an 8-char row
+        // against the default HSCROLL_STEP=8), not only `cols < target`: a
+        // strict-less-than check lets the first Right press jump straight
+        // from offset 0 to offset 8 — where that row is already fully
+        // panned off, empty — skipping every offset that would have
         // revealed its middle/tail characters.
         let request = ReviewRequest {
             version: 1,
@@ -3174,15 +3173,15 @@ mod tests {
 
     #[test]
     fn pan_cap_protects_a_trailing_flag_pair_whole() {
-        // Regression (Codex P1, thread 3792439091): trailing_cell_width
-        // sized the reserve from only the row's LAST scalar. For a row
-        // ending in a regional-indicator flag, that scalar is one RI (1
-        // col) — but a flag is an atomic 2-scalar pair (fixed elsewhere in
-        // this file). Reserving for only the last scalar let pan_cap land
+        // trailing_cell_width must size the reserve from the row's whole
+        // trailing CLUSTER, not only its last scalar. For a row ending in a
+        // regional-indicator flag, the last scalar alone is one RI (1 col)
+        // — but a flag is an atomic 2-scalar pair (protected elsewhere in
+        // this file). Reserving for only the last scalar lets pan_cap land
         // the boundary cleanly BEFORE the flag, where the marker-
         // replacement step (which only ever protects trailing zero-width
         // marks on the char it overwrites, not a whole second cluster
-        // scalar) ate the flag's first RI and left the second standing
+        // scalar) eats the flag's first RI and leaves the second standing
         // alone.
         let content = "abcdef\u{1f1fa}\u{1f1f8}"; // 6 letters + US flag (2 RI scalars)
         let request = ReviewRequest {
@@ -3225,10 +3224,10 @@ mod tests {
 
     #[test]
     fn narrow_panes_pan_by_fine_steps() {
-        // Regression (Codex P1, thread 3792516905): in a pane exposing only
-        // a couple of code columns, whole 8-column jumps skip offsets that
-        // were never on screen, hiding short rows' middles forever. The
-        // step now caps at half the visible code columns (min 1).
+        // In a pane exposing only a couple of code columns, whole 8-column
+        // jumps must not skip offsets that were never on screen — that
+        // would hide short rows' middles forever. The step caps at half the
+        // visible code columns (min 1).
         let request = ReviewRequest {
             version: 1,
             working_dir: "/tmp".to_string(),
@@ -3274,8 +3273,9 @@ mod tests {
 
     #[test]
     fn focusing_files_from_a_collapsed_navigator_reveals_it() {
-        // Regression (Codex P2): h/Tab focused the hidden navigator, so j/k
-        // switched files invisibly and diff keys went dead.
+        // h/Tab must reveal the navigator before focusing it: focusing a
+        // hidden navigator would let j/k switch files invisibly and leave
+        // diff keys dead.
         let request = ReviewRequest {
             version: 1,
             working_dir: "/tmp".to_string(),
@@ -3311,8 +3311,9 @@ mod tests {
 
     #[test]
     fn pan_and_clip_counts_display_columns_not_chars() {
-        // Regression (Codex P1): chars().count() made CJK/emoji content pan
-        // double the columns and evade right-clipping.
+        // Panning and clipping must count display columns, not chars: a
+        // chars().count() measure would let CJK/emoji content pan double
+        // the columns and evade right-clipping.
         let mk = |content: &str| {
             Line::from(vec![
                 Span::raw("   1    2  "),
@@ -3383,12 +3384,12 @@ mod tests {
         let visible: String = line.spans.iter().skip(2).map(|s| s.content.as_ref()).collect();
         assert!(!visible.trim_end_matches('\u{2026}').ends_with('\u{200d}'));
 
-        // Regression (Codex P1, thread 3792159813): a right clip must never
-        // render a partial family (a COUPLE is a genuinely different emoji).
-        // Under the render model the whole family is one narrow cluster, so
-        // it either fits entirely or drops entirely — assert exactly that
-        // invariant at a budget that cuts within the following text, and at
-        // one too small for the cluster at all.
+        // A right clip must never render a partial family (a COUPLE is a
+        // genuinely different emoji). Under the render model the whole
+        // family is one narrow cluster, so it either fits entirely or drops
+        // entirely — assert exactly that invariant at a budget that cuts
+        // within the following text, and at one too small for the cluster
+        // at all.
         let mut line = mk(&content);
         pan_and_clip(&mut line, 0, 17, 2);
         let visible = line.spans[2].content.as_ref().to_string();
@@ -3408,11 +3409,10 @@ mod tests {
         assert!(visible.is_empty(), "cluster over budget must drop whole, got {visible:?}");
         assert_eq!(line.spans.last().unwrap().content.as_ref(), "\u{2026}");
 
-        // Regression (Codex P1, thread 3792495132): Indic conjuncts. KA +
-        // virama + SSA is ONE cluster (UAX #29 GB9c); the old zero-width
-        // heuristics dropped the virama but kept SSA, rendering "‹ष" — a
-        // bare consonant instead of the source conjunct. The marker must
-        // consume the conjunct whole.
+        // Indic conjuncts: KA + virama + SSA is ONE cluster (UAX #29 GB9c).
+        // A zero-width heuristic that drops the virama but keeps SSA
+        // renders "‹ष" — a bare consonant instead of the source conjunct.
+        // The marker must consume the conjunct whole.
         let conjunct = "\u{915}\u{94d}\u{937}"; // क्ष
         let mut line = mk(&format!("a{conjunct}b"));
         pan_and_clip(&mut line, 1, 100, 2); // pan off the 'a'
@@ -3426,12 +3426,11 @@ mod tests {
 
     #[test]
     fn pan_and_clip_keeps_regional_indicator_flags_atomic() {
-        // Regression (Codex P1, thread 3792368958): a flag is exactly two
-        // regional-indicator scalars with NO joiner between them (unlike
-        // every other cluster this file protects) — pairing is purely
-        // positional. A pan or clip boundary landing between the two used
-        // to drop only one, leaving the other to render alone as an
-        // orphaned boxed letter instead of the source flag.
+        // A flag is exactly two regional-indicator scalars with NO joiner
+        // between them (unlike every other cluster this file protects) —
+        // pairing is purely positional. A pan or clip boundary landing
+        // between the two must drop both, not leave one to render alone as
+        // an orphaned boxed letter instead of the source flag.
         let mk = |content: &str| {
             Line::from(vec![
                 Span::raw("   1    2  "), // 11-col mock gutter (pinned)
@@ -3479,14 +3478,15 @@ mod tests {
 
     #[test]
     fn pan_marker_replaces_the_whole_leading_cluster_not_just_its_first_scalar() {
-        // Regression (Codex P1): the pan boundary can land immediately
-        // before an intact multi-scalar cluster (not cut through it — that
-        // atomicity is handled elsewhere). The marker-replacement step
-        // itself only ever swapped the first SCALAR for "‹" (plus trailing
-        // zero-width marks), splitting a cluster the pan logic upstream
-        // deliberately kept whole. Codex's exact example: panning
-        // "abcdefgh🇺🇸xyz" by 8 lands right at the flag — the old code
-        // rendered "‹🇸xyz", orphaning the second regional indicator.
+        // The pan boundary can land immediately before an intact
+        // multi-scalar cluster (not cut through it — that atomicity is
+        // handled elsewhere). The marker-replacement step must swap the
+        // whole leading cluster for "‹", not just its first SCALAR (plus
+        // trailing zero-width marks): swapping only the first scalar splits
+        // a cluster the pan logic upstream deliberately kept whole. Example:
+        // panning "abcdefgh🇺🇸xyz" by 8 lands right at the flag, so the
+        // marker must consume both regional indicators, not orphan the
+        // second one as "‹🇸xyz".
         let mk = |content: &str| {
             Line::from(vec![
                 Span::raw("   1    2  "),
@@ -3514,10 +3514,10 @@ mod tests {
 
     #[test]
     fn navigator_toggle_reflows_the_viewport() {
-        // Regression (Codex P1): 'b' early-returned without
-        // ensure_cursor_visible, so re-showing the navigator in a stacked
-        // (narrow) layout could shrink the diff viewport and strand the
-        // cursor off-screen until the next navigation key.
+        // 'b' must run ensure_cursor_visible before returning: re-showing
+        // the navigator in a stacked (narrow) layout can shrink the diff
+        // viewport, and without that call the cursor would be stranded
+        // off-screen until the next navigation key.
         let request = ReviewRequest {
             version: 1,
             working_dir: "/tmp".to_string(),
@@ -3850,12 +3850,12 @@ mod tests {
 
     #[test]
     fn editing_box_pads_by_display_columns_not_chars_for_wide_glyphs() {
-        // Regression (Codex P0): content-row padding measured
-        // `chars().count()` instead of display columns, so a row of CJK
-        // text (2 display columns per glyph, 1 char) was padded as if every
-        // glyph were 1 column wide — undercounting the row's real rendered
-        // width and pushing the closing `┆` border past the box's actual
-        // width despite the documented never-overflow invariant.
+        // Content-row padding must measure display columns, not
+        // `chars().count()`: counting chars would pad a row of CJK text (2
+        // display columns per glyph, 1 char) as if every glyph were 1
+        // column wide, undercounting the row's real rendered width and
+        // pushing the closing `┆` border past the box's actual width,
+        // violating the documented never-overflow invariant.
         let cjk: String = "\u{56fd}".repeat(20); // 20x '国', 2 display columns each
         let width = 40;
         for (i, line) in editing_box_lines(&cjk, Some(Tag::Fix), width).into_iter().enumerate() {
@@ -3866,11 +3866,12 @@ mod tests {
 
     #[test]
     fn editing_box_never_exceeds_a_pathologically_narrow_pane() {
-        // Regression (Codex P2): forcing the box to a minimum width of 4
-        // rendered it wider than panes with fewer inner columns, and even
-        // at exactly 4 the forced one-column wrap width plus prefix, caret,
-        // and closing border made each content row 5 columns wide — both
-        // violate the documented never-overflow invariant.
+        // The box must never be forced to a minimum width: forcing it to 4
+        // would render it wider than panes with fewer inner columns, and
+        // even at exactly 4 the forced one-column wrap width plus prefix,
+        // caret, and closing border would make each content row 5 columns
+        // wide — both would violate the documented never-overflow
+        // invariant.
         for width in 1..=6usize {
             for buf in ["", "hi", "a longer note than the pane can hold"] {
                 for (i, line) in editing_box_lines(buf, Some(Tag::Fix), width).into_iter().enumerate() {
@@ -3886,10 +3887,10 @@ mod tests {
 
     #[test]
     fn editing_annotation_idx_matches_the_comment_input_mode() {
-        // Regression (Codex P1): "which pending annotation is being edited"
-        // was implemented twice, verbatim, in App::disp_map and draw_diff —
-        // centralized into one method so the rendered rows and the
-        // scroll/mouse display map can't drift apart from each other.
+        // "Which pending annotation is being edited" must be computed in
+        // one place, not duplicated in App::disp_map and draw_diff: a
+        // single method keeps the rendered rows and the scroll/mouse
+        // display map from drifting apart from each other.
         let request = sample_request();
         let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
         let mut app = App::new(&request, &model);
@@ -4138,14 +4139,14 @@ mod tests {
 
     #[test]
     fn editing_across_views_keeps_the_original_range_not_the_current_views_anchor() {
-        // Regression (Codex P1): saving an edit re-derived the annotation's
-        // protocol range from the CURRENT view's row span instead of keeping
-        // the one it was originally saved with. An annotation created in
-        // source view can cover lines that are only PARTLY present in the
-        // diff (most of the file isn't in any hunk); editing it from diff
-        // view then narrowed lines 4..=10 down to whatever subset of that
-        // range the diff actually shows — silently corrupting the range
-        // even when the edit changes nothing but hits Enter.
+        // Saving an edit must keep the annotation's original protocol
+        // range, not re-derive it from the CURRENT view's row span. An
+        // annotation created in source view can cover lines that are only
+        // PARTLY present in the diff (most of the file isn't in any hunk);
+        // re-deriving the range from diff view would narrow lines 4..=10
+        // down to whatever subset the diff actually shows — silently
+        // corrupting the range even when the edit changes nothing but hits
+        // Enter.
         let dir = std::env::temp_dir()
             .join(format!("herdr-annotator-cross-view-edit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -4297,14 +4298,14 @@ mod tests {
 
     #[test]
     fn scroll_row_u16_clamps_past_the_line_cap_margin_instead_of_wrapping() {
-        // Regression (Codex P1): MAX_SOURCE_LINES's margin bounds the
-        // source's BASE rows, but saved comments and the open editing box
-        // add unbounded extra display rows on top — a source near the line
-        // cap with enough wrapped comments can still push `scroll` past
-        // `u16::MAX`. A bare `as u16` cast would wrap that back down to a
-        // small offset and render unrelated earlier rows while the
-        // cursor/footer still report the true, later position; clamping
-        // instead just stops scrolling further, which is the safe failure.
+        // MAX_SOURCE_LINES's margin bounds the source's BASE rows, but
+        // saved comments and the open editing box add unbounded extra
+        // display rows on top — a source near the line cap with enough
+        // wrapped comments can still push `scroll` past `u16::MAX`. A bare
+        // `as u16` cast would wrap that back down to a small offset and
+        // render unrelated earlier rows while the cursor/footer still
+        // report the true, later position; clamping instead just stops
+        // scrolling further, which is the safe failure.
         assert_eq!(scroll_row_u16(0), 0);
         assert_eq!(scroll_row_u16(65_535), 65_535, "must reach the real max exactly");
         assert_eq!(scroll_row_u16(65_536), 65_535, "one past the max clamps, not wraps");
@@ -4348,12 +4349,12 @@ mod tests {
 
     #[test]
     fn source_view_refuses_a_file_that_changed_since_the_review_started() {
-        // Regression (Codex P1): the diff is a snapshot of the moment the
-        // review began, but source view reads the worktree fresh the first
-        // time `t` is pressed — which can be much later. If something
-        // touches the file in between, the two views could silently show
-        // different revisions, and a source-view annotation's line numbers
-        // would no longer describe the diff the agent receives.
+        // The diff is a snapshot of the moment the review began, but
+        // source view reads the worktree fresh the first time `t` is
+        // pressed — which can be much later. If something touches the file
+        // in between, the two views must not silently show different
+        // revisions: a source-view annotation's line numbers would no
+        // longer describe the diff the agent receives.
         let dir = std::env::temp_dir()
             .join(format!("herdr-annotator-source-drift-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
