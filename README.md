@@ -91,12 +91,14 @@ Optional `config.toml` in the plugin's config dir (find it with `herdr plugin co
 
 ## Controls
 
+Press `?` in the pane for the full context-aware key reference.
+
 | Where | Keys | Mouse |
 |---|---|---|
 | File list | `j`/`k` move · `g`/`G` ends · `l`/`Enter`/`Tab` → diff | wheel moves selection, click opens a file |
 | Diff | `j`/`k` cursor · `←`/`→` (or `H`/`L`) pan wide lines, `0` resets · `d`/`u` half page · `n`/`p` hunks · `g`/`G` ends · `h`/`Tab` → files | wheel scrolls, horizontal wheel pans, click places the cursor, drag selects a range |
 | Annotate | `v` select range · `c` comment (Ctrl-T cycles tag, `Enter` saves, `Esc` backs out) · `c` on an annotated line edits · `x` deletes | drag then `c` |
-| Layout | `b` hide/show the file list · `z` zoom the pane full-screen · `t` diff/source view | — |
+| Layout | `b` hide/show the file list · `z` zoom the pane full-screen · `t` diff/source view · `?` key help | — |
 | Finish | `a` approve · `r` request changes + summary · `q` cancel | — |
 
 Long lines clip with `‹`/`…` markers; pan to see the rest. Annotations ride
