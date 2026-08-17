@@ -102,7 +102,24 @@ Optional `config.toml` in the plugin's config dir (find it with `herdr plugin co
 Long lines clip with `‹`/`…` markers; pan to see the rest. Annotations ride
 back to the agent on both `a` and `r` verdicts.
 
-## The `review_changes` tool
+## MCP tools
+
+Four tools, one shared review protocol. `review_changes` blocks the agent until
+a verdict lands. `show_changes` + `goto` + `collect_review` don't: they let the
+agent open the pane, narrate the diff in chat while pushing navigation, and
+come back for the verdict whenever it's ready. Annotations work exactly the
+same way in both modes, and the reviewer can also just finish the review in
+the pane at any time, without waiting to be asked.
+
+| Tool | Blocks? | Arguments | Returns |
+|------|---------|-----------|---------|
+| `review_changes` | Yes | `baseline?`, `note?`, `working_dir?` | Verdict + annotations (below), once the human decides. |
+| `show_changes` | No | `baseline?`, `note?`, `working_dir?` | `{"opened": true, "working_dir": "..."}` immediately. |
+| `goto` | No | `file` (repo-relative, new/post-change side), `line` (1-based) | Confirmation text; navigation is advisory. |
+| `collect_review` | No, polls | `wait_seconds?` (0–120, default 0) | Verdict + annotations once landed, else `{"status": "pending", "open_for_secs": N}`. |
+
+`baseline`, `note`, and `working_dir` mean the same thing for `review_changes`
+and `show_changes`:
 
 | Argument      | Type   | Meaning                                                            |
 |---------------|--------|--------------------------------------------------------------------|
@@ -110,7 +127,12 @@ back to the agent on both `a` and `r` verdicts.
 | `note`        | string | Message shown to the reviewer ("please check the retry logic").    |
 | `working_dir` | string | Repo to review. Defaults to the server's working directory.        |
 
-Result (JSON in the tool response):
+Only one review — blocking or guided — can be open at a time: `review_changes`
+and `show_changes` each refuse to start a second one, and `goto` / `collect_review`
+refuse to run without one already open.
+
+Verdict result (JSON in the tool response from `review_changes`, or from a
+`collect_review` call once a verdict has landed):
 
 ```json
 {
@@ -123,6 +145,29 @@ Result (JSON in the tool response):
   ]
 }
 ```
+
+`review_changes` blocks for as long as the config's `review_timeout` allows
+(unset = forever). The non-blocking tools have no such timeout — nothing is
+blocked, so there's nothing to time out; the review just stays open until the
+reviewer finishes in the pane or the agent calls `collect_review`.
+
+## Guided walkthroughs
+
+Use `show_changes` instead of `review_changes` when you want to talk the
+reviewer through a diff rather than hand it over cold and wait:
+
+1. **Open it, non-blocking.** `show_changes(working_dir=..., note="new retry
+   logic")` opens the review pane and returns immediately — you keep talking
+   in chat instead of freezing on a verdict.
+2. **Navigate while you explain.** Call `goto(file="src/retry.rs", line=42)`
+   as you describe each piece; the pane jumps to follow along. The reviewer
+   annotates as usual — annotations work exactly as they do in blocking mode.
+3. **Collect the verdict when you're ready.** `collect_review()` checks once;
+   pass `wait_seconds` to poll for a bit instead of hand-rolling a retry loop.
+   Nothing landed yet returns `{"status": "pending", ...}` — that's normal,
+   just call it again later. The reviewer can also finish in the pane on
+   their own schedule at any point; a pane closed without a decision surfaces
+   here as a normal `cancelled` verdict, not an error.
 
 ## Status
 
