@@ -266,11 +266,22 @@ fn handle_collect_review(args: &Value, active: &mut Option<ActiveReview>) -> Val
     if active.is_none() {
         return tool_error("no open review".to_string());
     }
-    let wait_seconds = args
-        .get("wait_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(120);
+    // Absent or explicit null means "use the documented default" (0, single
+    // check); anything else that isn't a 0..=120 integer is a malformed
+    // argument, not a value to silently coerce — matching goto's strict
+    // rejection of an invalid "line" rather than guessing at intent.
+    let wait_seconds = match args.get("wait_seconds") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v.as_u64() {
+            Some(n) if n <= 120 => n,
+            _ => {
+                return tool_error(
+                    "collect_review requires \"wait_seconds\" to be an integer between 0 and 120"
+                        .to_string(),
+                )
+            }
+        },
+    };
     let deadline = Instant::now() + Duration::from_secs(wait_seconds);
 
     loop {
@@ -508,6 +519,34 @@ mod tests {
         // Unblock and drain the fake pane so the test doesn't leak a thread.
         release_tx.send(()).unwrap();
         let _ = handle_collect_review(&json!({ "wait_seconds": 5 }), &mut active);
+        pane.join().unwrap();
+    }
+
+    #[test]
+    fn collect_review_rejects_a_malformed_wait_seconds_instead_of_coercing_it() {
+        let (active_review, pane, release_tx) = open_fake_review();
+        let mut active = Some(active_review);
+
+        // A negative value used to silently become 0 (single check, no
+        // error) via as_u64() failing and unwrap_or(0) swallowing that.
+        let negative = handle_collect_review(&json!({ "wait_seconds": -5 }), &mut active);
+        assert_eq!(negative["isError"], true);
+        assert!(active.is_some(), "a rejected argument must not disturb the open review");
+
+        // Above the documented 0..=120 range used to silently clamp to 120
+        // rather than telling the caller their argument was out of range.
+        let too_large = handle_collect_review(&json!({ "wait_seconds": 999 }), &mut active);
+        assert_eq!(too_large["isError"], true);
+
+        // A non-integer is just as malformed as a negative one.
+        let not_a_number = handle_collect_review(&json!({ "wait_seconds": "soon" }), &mut active);
+        assert_eq!(not_a_number["isError"], true);
+
+        // Omitted and explicit null are both legitimate ways to ask for the
+        // documented default (0, single check) and must not error.
+        release_tx.send(()).unwrap();
+        let omitted = handle_collect_review(&json!({}), &mut active);
+        assert_eq!(omitted["isError"], false);
         pane.join().unwrap();
     }
 }
