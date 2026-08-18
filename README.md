@@ -1,37 +1,37 @@
 # herdr-file-annotator
 
-**Maximize agentic development — without losing touch with the actual codebase.**
+**Maximize agentic development but dont lose touch with the actual codebase.**
 
 Working with coding agents usually forces a choice: adopt an IDE-style tool
 and leave your terminal workflow behind, or stay in the terminal and squint
 at raw diffs and verbose agent prose in chat. This [herdr](https://herdr.dev)
-plugin removes the choice — when you and your agent need to meet over actual
+plugin removes the choice, when you and your agent need to meet over actual
 code, a review pane opens right in your workspace, and closes when you're
 done.
 
 ![Demo: the agent opens a review pane, walks through the diff while the pane follows, and collects two line-anchored annotations](docs/demo.gif)
 
-**Annotate the code, not the chat.** No more dictating "change file X, line
+**Annotate the code, not the prompt.** No more dictating "change file X, line
 Z…" into the prompt. Select the lines in the pane, write the note, tag it
 (`fix` / `verify` / `question` / `nit`) — it flows back to the agent as
 structured, line-anchored output it acts on directly.
 
 **Let the agent walk you through its changes.** In the era of 1000-line
-diffs, reading everything doesn't scale — and agent prose summaries are a
+diffs, reading everything doesn't scale, and agent prose summaries are a
 poor substitute for the code itself. Here the agent drives the pane: it
 jumps you to exactly the parts worth seeing while explaining in chat. Ask
 questions, ask for the next spot — you only see what you need to see.
 
-**Diff or finished state — one key.** Reviewing the changes is the default;
+**Diff or finished state, just a toggle away.** Reviewing the changes is the default;
 press `t` when you just want to read the final version of the file, no diff
 noise.
 
-**A real sign-off gate, when you want one.** In blocking mode the agent is
-*frozen* until your verdict — approve, request changes, or cancel — so
+**A real sign-off gate, if you need it.** In blocking mode the agent is
+*frozen* until your verdict (approve, request changes, or cancel) so
 nothing runs past your review.
 
 Also in the box: full mouse support, syntax-highlighted diffs, a `?`
-key-reference overlay, one-command install with checksum-verified binaries —
+key-reference overlay, one-command install with checksum-verified binaries,
 and an agent that can never be wedged by a closed pane or timeout.
 
 ## Quick start
