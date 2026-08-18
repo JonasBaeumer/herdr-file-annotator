@@ -8,6 +8,8 @@ The agent is **frozen** until you scroll the diff, leave feedback, and pick a
 verdict. The tool call then returns your review as structured JSON the agent can
 act on.
 
+![Demo: the agent opens a review pane, walks through the diff while the pane follows, and collects two line-anchored annotations](docs/demo.gif)
+
 This is the inverse of [herdr-reviewr](https://github.com/persiyanov/herdr-reviewr)
 (human-initiated, agent keeps running); both can coexist. The interaction model
 is inspired by [annot](https://github.com/denolehov/annot), rebuilt as a native
