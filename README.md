@@ -1,34 +1,38 @@
 # herdr-file-annotator
 
-**Code review for AI agents, inside your terminal.** The agent stops and asks
-*you* — in a real review pane, on real diffs, with feedback it can act on.
+**Maximize agentic development — without losing touch with the actual codebase.**
+
+Working with coding agents usually forces a choice: adopt an IDE-style tool
+and leave your terminal workflow behind, or stay in the terminal and squint
+at raw diffs and verbose agent prose in chat. This [herdr](https://herdr.dev)
+plugin removes the choice — when you and your agent need to meet over actual
+code, a review pane opens right in your workspace, and closes when you're
+done.
 
 ![Demo: the agent opens a review pane, walks through the diff while the pane follows, and collects two line-anchored annotations](docs/demo.gif)
 
-Your coding agent reaches a checkpoint and calls one MCP tool. A review pane
-opens beside it in your [herdr](https://herdr.dev) workspace showing only what
-changed. You scroll, annotate lines, pick a verdict — and your review flows
-back to the agent as structured JSON it acts on. No context switch, no
-copy-pasting feedback into chat, no rubber-stamping.
+**Annotate the code, not the chat.** No more dictating "change file X, line
+Z…" into the prompt. Select the lines in the pane, write the note, tag it
+(`fix` / `verify` / `question` / `nit`) — it flows back to the agent as
+structured, line-anchored output it acts on directly.
 
-## Core features
+**Let the agent walk you through its changes.** In the era of 1000-line
+diffs, reading everything doesn't scale — and agent prose summaries are a
+poor substitute for the code itself. Here the agent drives the pane: it
+jumps you to exactly the parts worth seeing while explaining in chat. Ask
+questions, ask for the next spot — you only see what you need to see.
 
-- **A real sign-off gate** — `review_changes` *freezes* the agent until you
-  approve, request changes, or cancel. The agent cannot run past your review.
-- **Guided walkthroughs** — or flip it: the agent opens the pane without
-  blocking, explains the diff in chat while the pane follows its pointer
-  (`show_changes` + `goto`), and collects your verdict when you're done.
-- **Line-anchored annotations** — select a range, comment, tag it
-  (`fix` / `verify` / `question` / `nit`). Notes render inline under the code
-  and return to the agent with exact file/line anchors.
-- **A reviewer's editor, not a toy pane** — syntax-highlighted diffs, a
-  diff ↔ full-source toggle, full mouse support, horizontal panning for wide
-  code, a `?` key-reference overlay, and Unicode-correct rendering down to
-  emoji and Indic conjuncts.
-- **Never wedges your agent** — closed panes, timeouts, and disconnects all
-  resolve to a clean `cancelled` verdict, never a hang.
-- **One-command install** — prebuilt, SHA-256-verified binaries for macOS and
-  Linux; listed on the herdr marketplace.
+**Diff or finished state — one key.** Reviewing the changes is the default;
+press `t` when you just want to read the final version of the file, no diff
+noise.
+
+**A real sign-off gate, when you want one.** In blocking mode the agent is
+*frozen* until your verdict — approve, request changes, or cancel — so
+nothing runs past your review.
+
+Also in the box: full mouse support, syntax-highlighted diffs, a `?`
+key-reference overlay, one-command install with checksum-verified binaries —
+and an agent that can never be wedged by a closed pane or timeout.
 
 ## Quick start
 
