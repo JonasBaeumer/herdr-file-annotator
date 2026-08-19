@@ -64,9 +64,10 @@ see your notes in place while you keep reading:
 | `t` | toggle diff view ↔ full source view of the file |
 | `?` | key-reference overlay |
 
-The `t` toggle is per file: reviewing the diff is the default, the source
-view shows the finished state of the file with no diff noise. Annotations
-work in both views.
+The `t` toggle is global: it switches the reading mode for the whole
+review, so files you navigate to open in the same view. Reviewing the diff
+is the default; the source view shows the finished state of the file with
+no diff noise. Annotations work in both views.
 
 ![Source view: the full finished file with syntax highlighting and no diff markers](img/source-view.png)
 
