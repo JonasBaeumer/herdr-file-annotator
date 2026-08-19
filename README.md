@@ -42,12 +42,18 @@ Requires herdr ≥ 0.8.0.
 # 1. Install the plugin
 herdr plugin install JonasBaeumer/herdr-file-annotator
 
-# 2. Register the MCP server with your agent (Claude Code shown) —
+# 2. Register the MCP server with your agent —
 #    find <plugin_root> via: herdr plugin list --plugin jonasbaeumer.file-annotator --json
-claude mcp add annotator -- "<plugin_root>/bin/herdr-annotator" mcp
+claude mcp add annotator -- "<plugin_root>/bin/herdr-annotator" mcp        # Claude Code
+codex mcp add annotator -- "<plugin_root>/bin/herdr-annotator" mcp        # Codex CLI
+gemini mcp add annotator "<plugin_root>/bin/herdr-annotator" mcp          # Gemini CLI
 ```
 
-Then tell the agent when to ask for review — e.g. in `CLAUDE.md`:
+Cursor and any other MCP-capable agent work too — see
+[Agent setup](docs/agents.md).
+
+Then tell the agent when to ask for review — e.g. in `CLAUDE.md` /
+`AGENTS.md` / `GEMINI.md`:
 
 > Before marking any task complete, call the `review_changes` tool and act on
 > the returned annotations. Do not proceed on a `request_changes` or `reject`
@@ -57,6 +63,8 @@ That's the whole setup.
 
 ## Docs
 
+- [Agent setup](docs/agents.md) — registering the MCP server with Claude
+  Code, Codex, Gemini CLI, Cursor, and others
 - [Controls](docs/controls.md) — every key and mouse action in the pane
 - [MCP tools](docs/mcp-tools.md) — the four tools, the verdict format, and
   guided walkthroughs

@@ -27,7 +27,7 @@ cd herdr-file-annotator
 ```
 
 Register the MCP server with your agent to test the full loop end to end
-(see the README's Install section), or run the protocol-level harness:
+(see [docs/agents.md](docs/agents.md)), or run the protocol-level harness:
 
 ```sh
 python3 tests/e2e/mcp_client.py <some-git-repo-with-changes> "test note"
@@ -43,8 +43,10 @@ JSON when you close it.
   functions with focused tests, no TUI snapshot tests).
 - The handoff protocol (`src/protocol.rs`) is versioned; changing the wire
   format needs a `PROTOCOL_VERSION` bump and a compatibility note in the PR.
-- User-facing behavior changes should update the README (keybindings,
-  config keys, tool schema).
+- User-facing behavior changes should update the docs (keybindings in
+  [docs/controls.md](docs/controls.md), config keys in
+  [docs/configuration.md](docs/configuration.md), tool schema in
+  [docs/mcp-tools.md](docs/mcp-tools.md)).
 - The pane must never wedge the agent: every new failure path needs to
   resolve to a returned verdict (see the cancelled/timeout handling).
 
