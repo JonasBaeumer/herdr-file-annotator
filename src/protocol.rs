@@ -605,21 +605,21 @@ mod tests {
     }
 
     #[test]
-    fn readme_example_verdict_matches_the_current_protocol_version() {
-        // README.md documents review_changes/collect_review's response shape
-        // with a literal example ReviewResult. It's prose, not code, so
-        // nothing else catches it drifting out of sync with a future
-        // PROTOCOL_VERSION bump the way this one did (the example was still
-        // showing v1 after the wire format moved to v2) — parse it for real
-        // and pin its version field to the constant.
-        let readme = include_str!("../README.md");
-        let start = readme.find("```json\n").expect("README's example verdict block") + "```json\n".len();
-        let end = start + readme[start..].find("```").expect("closing fence for the example block");
-        let example: ReviewResult = serde_json::from_str(readme[start..end].trim())
-            .expect("README's example verdict must itself be valid ReviewResult JSON");
+    fn docs_example_verdict_matches_the_current_protocol_version() {
+        // docs/mcp-tools.md documents review_changes/collect_review's
+        // response shape with a literal example ReviewResult. It's prose,
+        // not code, so nothing else catches it drifting out of sync with a
+        // future PROTOCOL_VERSION bump the way this one did (the example was
+        // still showing v1 after the wire format moved to v2) — parse it for
+        // real and pin its version field to the constant.
+        let docs = include_str!("../docs/mcp-tools.md");
+        let start = docs.find("```json\n").expect("docs' example verdict block") + "```json\n".len();
+        let end = start + docs[start..].find("```").expect("closing fence for the example block");
+        let example: ReviewResult = serde_json::from_str(docs[start..end].trim())
+            .expect("docs' example verdict must itself be valid ReviewResult JSON");
         assert_eq!(
             example.version, PROTOCOL_VERSION,
-            "README's documented example verdict is stale — update it alongside any PROTOCOL_VERSION bump"
+            "docs/mcp-tools.md's documented example verdict is stale — update it alongside any PROTOCOL_VERSION bump"
         );
     }
 }
