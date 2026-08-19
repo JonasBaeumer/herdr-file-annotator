@@ -38,7 +38,7 @@ Long lines clip with `‹` / `…` markers at the edges; pan to see the rest.
 |---|---|
 | `v` | start a line-range selection (extend with `j` / `k`) |
 | `c` | open the comment box for the selection (or the cursor line) |
-| `Ctrl-T` | cycle the tag: `fix` / `verify` / `question` / `nit` |
+| `Ctrl-T` | cycle the tag: none / `fix` / `verify` / `question` / `nit` |
 | `Enter` | save the annotation |
 | `Esc` | back out without saving |
 | `c` on an annotated line | edit the existing annotation |

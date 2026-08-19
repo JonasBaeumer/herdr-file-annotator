@@ -49,8 +49,9 @@ The pane's finish keys produce `approve`, `request_changes`, and
 `cancelled`; `reject` is also part of the wire schema, so consumers must
 accept it and should treat it as a hard no — do not proceed with the
 change. Each annotation carries the file, an inclusive 1-based line range,
-the diff side, one of the four tags (`fix` / `verify` / `question` /
-`nit`), and the reviewer's comment.
+the diff side, an optional tag (`fix` / `verify` / `question` / `nit`), and
+the reviewer's comment. A note saved without choosing a tag omits the `tag`
+field entirely — treat it as an untagged comment.
 
 ## Timeouts
 
