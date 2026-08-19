@@ -78,6 +78,13 @@ no diff noise. Annotations work in both views.
 | `a` | approve |
 | `r` | request changes — opens a summary box first |
 | `q` | cancel the review |
+| `Esc` | clear an active selection; with nothing selected, **cancel the review** |
+| `Ctrl-C` | cancel the review — works everywhere, even while typing in a box |
+
+Cancelling is destructive: pending annotations are discarded and the agent
+receives a plain `cancelled` verdict. `Esc` only cancels from the normal
+browsing state — inside a comment or summary box it just closes the box (see
+the annotate table above); `Ctrl-C` cancels from anywhere.
 
 Annotations ride back to the agent on both `a` and `r` verdicts. Closing the
 pane without a verdict surfaces to the agent as a normal `cancelled` result,
