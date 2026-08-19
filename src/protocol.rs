@@ -82,6 +82,8 @@ pub enum Side {
     Old,
 }
 
+/// 1-based line range; `end` is inclusive, so a single-line annotation has
+/// `start == end`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineRange {
     pub start: u32,
@@ -369,7 +371,10 @@ mod tests {
 
         assert_eq!(result.verdict, Verdict::RequestChanges);
         assert_eq!(result.annotations.len(), 1);
+        // Both endpoints: the range is documented as inclusive, so end must
+        // arrive as the last annotated line (5), not one past it.
         assert_eq!(result.annotations[0].lines.start, 3);
+        assert_eq!(result.annotations[0].lines.end, 5);
         let _ = std::fs::remove_file(&sock);
     }
 
