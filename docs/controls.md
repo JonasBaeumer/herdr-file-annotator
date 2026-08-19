@@ -1,8 +1,10 @@
 # Controls
 
 Everything in the review pane is keyboard-driven, with full mouse support as
-an alternative. Press `?` in the pane at any time for the context-aware key
-reference — it shows exactly the keys that work in your current view.
+an alternative. Press `?` in the pane for the context-aware key reference —
+it shows exactly the keys that work in your current view. (While a comment
+or summary box is open, `?` is typed as text like any other character; close
+the box first.)
 
 ![The ? key reference overlay, listing finish, file-list, and diff keys](img/help-overlay.png)
 
@@ -38,7 +40,7 @@ Long lines clip with `‹` / `…` markers at the edges; pan to see the rest.
 |---|---|
 | `v` | start a line-range selection (extend with `j` / `k`) |
 | `c` | open the comment box for the selection (or the cursor line) |
-| `Ctrl-T` | cycle the tag: none / `fix` / `verify` / `question` / `nit` |
+| `Ctrl-T` | cycle the tag: none / `verify` / `fix` / `question` / `nit` |
 | `Enter` | save the annotation |
 | `Esc` | back out without saving |
 | `c` on an annotated line | edit the existing annotation |
