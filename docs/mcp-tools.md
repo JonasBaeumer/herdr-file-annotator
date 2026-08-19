@@ -81,6 +81,8 @@ talk you through a diff rather than hand it over cold and wait:
    your own schedule at any point; a pane closed without a decision surfaces
    as a normal `cancelled` verdict, not an error.
 
+![The review pane mid-walkthrough: agent-driven navigation landed on the retry loop, with two annotations already left inline](img/annotations-inline.png)
+
 A prompt that triggers this end to end, with no special setup:
 
 > Open the changes with show_changes and walk me through them file by file —

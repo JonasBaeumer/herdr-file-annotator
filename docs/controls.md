@@ -4,6 +4,8 @@ Everything in the review pane is keyboard-driven, with full mouse support as
 an alternative. Press `?` in the pane at any time for the context-aware key
 reference — it shows exactly the keys that work in your current view.
 
+![The ? key reference overlay, listing finish, file-list, and diff keys](img/help-overlay.png)
+
 ## File list
 
 | Keys | Action |
@@ -44,8 +46,12 @@ Long lines clip with `‹` / `…` markers at the edges; pan to see the rest.
 
 Mouse: drag over the lines, then press `c`.
 
+![The comment box open on a selected line, with commit, tag, and cancel chips](img/annotate-box.png)
+
 Saved annotations appear inline, woven between the code lines, so you can
-see your notes in place while you keep reading.
+see your notes in place while you keep reading:
+
+![Two saved annotations rendered inline between diff lines, one tagged fix and one tagged question](img/annotations-inline.png)
 
 ## Layout and views
 
@@ -60,6 +66,8 @@ The `t` toggle is per file: reviewing the diff is the default, the source
 view shows the finished state of the file with no diff noise. Annotations
 work in both views.
 
+![Source view: the full finished file with syntax highlighting and no diff markers](img/source-view.png)
+
 ## Finishing the review
 
 | Keys | Action |
@@ -71,3 +79,5 @@ work in both views.
 Annotations ride back to the agent on both `a` and `r` verdicts. Closing the
 pane without a verdict surfaces to the agent as a normal `cancelled` result,
 never an error or a hang.
+
+![Requesting changes: the summary input in the status bar before sending the verdict](img/verdict-summary.png)
