@@ -465,6 +465,9 @@ fn indent_block_below(lines: &[String], row: usize) -> Option<(usize, usize)> {
             Some(line.len() - trimmed.len())
         }
     }
+    fn starts_closing(line: &str) -> bool {
+        matches!(line.trim_start().chars().next(), Some(')' | ']' | '}'))
+    }
     let base = indent_of(lines.get(row)?)?;
     let mut end = row; // last row CONFIRMED to belong to the block
     let mut i = row + 1;
@@ -474,6 +477,14 @@ fn indent_block_below(lines: &[String], row: usize) -> Option<(usize, usize)> {
             // deeper-indented line follows, otherwise it trails and trims.
             None => {}
             Some(ind) if ind > base => end = i,
+            // A base-indent line that OPENS with a closing delimiter still
+            // belongs to the block it closes — the `):` ending a multi-line
+            // def, the `}` ending a braced body, a `} else {` chain link.
+            // Without this the scan breaks at the closing delimiter of the
+            // header's own signature and folds only the parameter lines.
+            // (Only at exactly base indent: shallower means an OUTER scope
+            // is closing, and that block this row does not belong to.)
+            Some(ind) if ind == base && starts_closing(&lines[i]) => end = i,
             Some(_) => break,
         }
         i += 1;
@@ -3887,6 +3898,51 @@ mod tests {
         assert_eq!(indent_block_below(&lines, 99), None);
         // The last def's body runs to the end of the file.
         assert_eq!(indent_block_below(&lines, 8), Some((9, 9)));
+    }
+
+    #[test]
+    fn indent_block_below_carries_past_closing_delimiters_at_base_indent() {
+        // The Codex-reported case: a multi-line signature's closing `):`
+        // (or `) {` / `}`) sits at the HEADER's indent — it belongs to the
+        // block, it doesn't end it.
+        let python: Vec<String> = [
+            "def fetch(",       // 0
+            "    url,",         // 1
+            "    attempts=3,",  // 2
+            "):",               // 3 — closing delimiter at base indent
+            "    body()",       // 4
+            "    more()",       // 5
+            "next_stmt()",      // 6
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(indent_block_below(&python, 0), Some((1, 5)));
+
+        let rust: Vec<String> = [
+            "fn fetch(",             // 0
+            "    url: &str,",        // 1
+            ") -> Result<()> {",     // 2
+            "    body();",           // 3
+            "}",                     // 4 — the whole body folds, brace included
+            "fn next_fn() {}",       // 5
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(indent_block_below(&rust, 0), Some((1, 4)));
+
+        // A closing delimiter SHALLOWER than the header closes an outer
+        // scope — that ends the block, it doesn't extend it.
+        let nested: Vec<String> = [
+            "    if a {",   // 0 (base indent 4)
+            "        b();", // 1
+            "}",            // 2 — outer scope's brace, indent 0
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(indent_block_below(&nested, 0), Some((1, 1)));
     }
 
     #[test]
