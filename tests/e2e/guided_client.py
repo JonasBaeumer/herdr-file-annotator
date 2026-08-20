@@ -11,7 +11,11 @@ show_changes returns immediately (it does not wait for a verdict), so from
 there this script reads commands from stdin, one per line, until EOF or a
 `quit` line:
 
-    goto <file> <line>   -> tools/call goto {file, line}
+    goto <file> <line> [view]      -> tools/call goto {file, line[, view]}
+                                      view: diff | source
+    focus <file> [start-end ...]   -> tools/call focus {file, regions}
+                                      e.g. focus src/a.rs 10-22 40-51
+                                      no ranges = clear the focus
     collect [seconds]    -> tools/call collect_review {wait_seconds: seconds or 0}
     quit                 -> stop reading commands and exit
 
@@ -159,8 +163,11 @@ def main():
                 break
 
             if verb == "goto":
-                if len(parts) != 3:
-                    print(f"### goto\nusage: goto <file> <line>, got: {command!r}", file=sys.stderr)
+                if len(parts) not in (3, 4):
+                    print(
+                        f"### goto\nusage: goto <file> <line> [view], got: {command!r}",
+                        file=sys.stderr,
+                    )
                     continue
                 file_arg, line_arg = parts[1], parts[2]
                 try:
@@ -168,8 +175,37 @@ def main():
                 except ValueError:
                     print(f"### goto\n\"line\" must be an integer, got {line_arg!r}", file=sys.stderr)
                     continue
+                arguments = {"file": file_arg, "line": line_no}
+                if len(parts) == 4:
+                    arguments["view"] = parts[3]
                 call_id += 1
-                call_tool(proc, call_id, "goto", {"file": file_arg, "line": line_no})
+                call_tool(proc, call_id, "goto", arguments)
+                continue
+
+            if verb == "focus":
+                if len(parts) < 2:
+                    print(
+                        f"### focus\nusage: focus <file> [start-end ...], got: {command!r}",
+                        file=sys.stderr,
+                    )
+                    continue
+                regions = []
+                bad = None
+                for spec in parts[2:]:
+                    try:
+                        start_s, end_s = spec.split("-", 1)
+                        regions.append({"start": int(start_s), "end": int(end_s)})
+                    except ValueError:
+                        bad = spec
+                        break
+                if bad is not None:
+                    print(
+                        f"### focus\nregions must look like start-end, got {bad!r}",
+                        file=sys.stderr,
+                    )
+                    continue
+                call_id += 1
+                call_tool(proc, call_id, "focus", {"file": parts[1], "regions": regions})
                 continue
 
             if verb == "collect":
