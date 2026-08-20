@@ -89,6 +89,13 @@ already shows just its hunks.
 
 Mouse: clicking a pill expands it.
 
+The block detection is indentation-based and language-agnostic (a
+base-indent line opening with `)`, `]`, or `}` still belongs to the block,
+so multi-line signatures fold correctly). It deliberately doesn't track any
+language's real grammar — for a layout it doesn't recognize, such as a Rust
+`where` clause at the header's own indent, select the lines yourself and
+fold with `v` + `f`.
+
 Pills are real cursor stops; movement skips the hidden lines. Very short
 stretches (one or two lines) never fold — a pill would cost as much space
 as it saves. Annotations hidden by a fold aren't lost: the pill shows a

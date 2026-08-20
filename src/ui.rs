@@ -456,6 +456,14 @@ fn merge_runs(mut runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// leading whitespace characters — comparisons stay within one file, where
 /// indentation style is consistent, so tabs-vs-spaces width games don't
 /// change any ordering this cares about.
+///
+/// DELIBERATE boundary (PR #17 review): the heuristic is structural, never
+/// grammatical — it recognizes closing delimiters at base indent (below)
+/// but no language keywords, so e.g. a rustfmt-style `where` clause at the
+/// header's own indent ends the block early. Recognizing it would mean
+/// hardcoding per-language keywords and invite endless special-casing;
+/// the documented fallback for unrecognized layouts is selecting the rows
+/// and folding with `v` + `f`.
 fn indent_block_below(lines: &[String], row: usize) -> Option<(usize, usize)> {
     fn indent_of(line: &str) -> Option<usize> {
         let trimmed = line.trim_start();
