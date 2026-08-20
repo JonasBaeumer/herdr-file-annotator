@@ -804,13 +804,14 @@ struct App<'a> {
     /// Some(mode) while the "request changes" summary prompt or the
     /// annotation comment prompt is open.
     input: Option<InputMode>,
-    /// The latest agent-pushed goto that arrived while an input bar was
-    /// open, held for replay once it closes. `apply_goto` never disturbs an
-    /// open input, but the target itself is still valid and shouldn't be
-    /// silently lost — only the latest matters, since an earlier one it
-    /// displaced was never shown either. Cleared (and applied) the moment
-    /// `input` goes back to `None`.
-    pending_goto: Option<GotoTarget>,
+    /// Agent-pushed gotos that arrived while an input bar was open, held in
+    /// arrival order and replayed in that order the moment `input` goes back
+    /// to `None`. `apply_goto` never disturbs an open input, but the targets
+    /// are still valid and must not be silently lost. A queue, not a
+    /// latest-only slot: goto pushes are stateFUL now that they can carry
+    /// `focus` regions — an earlier held focus for one file must survive a
+    /// later held goto for another, which replay-in-order gives for free.
+    pending_gotos: Vec<GotoTarget>,
     /// Set by `v` in diff focus at the cursor row; the active selection is
     /// `min(anchor, cursor)..=max(anchor, cursor)` and grows/shrinks as the
     /// cursor moves. Diff-focus only; cleared by a second `v`, by `Esc`, or
@@ -972,7 +973,7 @@ impl<'a> App<'a> {
             nav: NavState::default(),
             diff: DiffViewState::default(),
             input: None,
-            pending_goto: None,
+            pending_gotos: Vec::new(),
             visual_anchor: None,
             drag_origin: None,
             show_navigator: true,
@@ -1158,23 +1159,16 @@ impl<'a> App<'a> {
     /// outside the hunks lands on the nearest following changed/context row,
     /// or the last new-side row if none follows (never wraps to the top).
     /// Never disturbs an open input bar — while one is open the target is
-    /// held in `pending_goto` and replayed once it closes, rather than lost.
+    /// queued in `pending_gotos` and replayed once it closes, rather than
+    /// lost.
     fn apply_goto(&mut self, target: &GotoTarget, term_size: Size) {
         if self.input.is_some() {
-            // A later push for the same file while the input is still open
-            // replaces the held target outright — but its own `focus: None`
-            // means "don't touch", not "cancel the focus an earlier held
-            // push carried". Without carrying that forward, a focus push
-            // followed by a same-file goto before the input closes would
-            // silently lose the focus: only the last pushed target survives
-            // the single `pending_goto` slot.
-            let mut target = target.clone();
-            if target.focus.is_none() {
-                if let Some(prev) = self.pending_goto.as_ref().filter(|p| p.file == target.file) {
-                    target.focus = prev.focus.clone();
-                }
-            }
-            self.pending_goto = Some(target);
+            // Queued and replayed in arrival order once the input closes.
+            // Order matters because pushes are stateful: a held focus for
+            // one file must survive a later held goto for any file, and
+            // replaying the sequence exactly as the agent sent it needs no
+            // special-casing of what each push carries.
+            self.pending_gotos.push(target.clone());
             return;
         }
         let Ok(model) = self.model else { return };
@@ -1435,10 +1429,12 @@ impl<'a> App<'a> {
             }
             if !close {
                 self.input = Some(mode);
-            } else if let Some(target) = self.pending_goto.take() {
-                // The input just closed: catch up to whatever navigation
-                // arrived (and was held) while the reviewer was typing.
-                self.apply_goto(&target, term_size);
+            } else if !self.pending_gotos.is_empty() {
+                // The input just closed: catch up, in arrival order, to
+                // whatever navigation was held while the reviewer typed.
+                for target in std::mem::take(&mut self.pending_gotos) {
+                    self.apply_goto(&target, term_size);
+                }
             }
             // Typing can grow the editing box (more wrapped rows) or close
             // it back down to nothing — either way the set of display rows
@@ -4054,7 +4050,7 @@ mod tests {
         app.apply_goto(&GotoTarget { file: "src/lib.rs".into(), line: 12, view: None, focus: None }, size);
         assert_eq!(app.diff.cursor, 1, "an open input bar must not be disturbed");
         assert!(app.input.is_some(), "the input bar must stay open");
-        assert!(app.pending_goto.is_some(), "the target must be held, not dropped");
+        assert_eq!(app.pending_gotos.len(), 1, "the target must be held, not dropped");
 
         // Esc cancels the summary prompt and closes the input bar; the held
         // goto should be applied as part of that close, not lost.
@@ -4064,7 +4060,7 @@ mod tests {
             app.diff.cursor, 7,
             "the deferred goto must be applied once the input bar closes"
         );
-        assert!(app.pending_goto.is_none(), "the held target must be consumed, not replayed again");
+        assert!(app.pending_gotos.is_empty(), "the held target must be consumed, not replayed again");
     }
 
     #[test]
@@ -4082,8 +4078,7 @@ mod tests {
         );
         // ...then a plain goto for the SAME file lands before the input
         // closes. Its own focus is None ("don't touch"), so the earlier
-        // held focus must survive, not be dropped when this later push
-        // replaces the single pending_goto slot.
+        // held focus must survive — the queue replays both in order.
         app.apply_goto(
             &GotoTarget { file: "src/lib.rs".into(), line: 2, view: None, focus: None },
             size,
@@ -4096,6 +4091,42 @@ mod tests {
             Some(&vec![lr(10, 15)]),
             "the first push's focus must not be dropped by the queued goto"
         );
+    }
+
+    #[test]
+    fn a_pending_focus_survives_a_cross_file_goto_queued_before_the_input_closes() {
+        // The cross-file variant of the test above: focus for file A, then a
+        // goto for file B, both held while an input is open. A latest-only
+        // slot dropped A's focus entirely; the queue replays both in order,
+        // so A's regions are stored AND the pane ends up where the last
+        // push pointed.
+        let request = sample_request();
+        let mut other = sample_file();
+        other.path = "src/other.rs".to_string();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file(), other] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(80, 24);
+        app.input = Some(InputMode::Summary { buf: String::new() });
+
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 10, view: None, focus: Some(vec![lr(10, 15)]) },
+            size,
+        );
+        app.apply_goto(
+            &GotoTarget { file: "src/other.rs".into(), line: 12, view: None, focus: None },
+            size,
+        );
+        assert_eq!(app.pending_gotos.len(), 2, "both pushes must be held");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), size);
+        assert!(app.input.is_none());
+        assert_eq!(
+            app.focus_regions.get(&0),
+            Some(&vec![lr(10, 15)]),
+            "file A's focus must survive the cross-file goto"
+        );
+        assert_eq!(app.nav.selected, 1, "the pane follows the last held push");
+        assert_eq!(app.diff.cursor, 7, "…to file B's target row");
     }
 
     #[test]
