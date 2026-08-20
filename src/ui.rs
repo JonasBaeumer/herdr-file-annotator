@@ -433,6 +433,54 @@ fn fold_run_containing(runs: &[(usize, usize)], base: usize) -> Option<(usize, u
     runs.iter().copied().find(|&(s, e)| s <= base && base <= e)
 }
 
+/// Normalize a bag of fold runs into the sorted, disjoint form the display
+/// math needs: overlapping and directly adjacent runs merge into one
+/// (adjacent because two touching pills read as one collapsed stretch and
+/// should cost one row, not two).
+fn merge_runs(mut runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    runs.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in runs {
+        match merged.last_mut() {
+            Some((_, le)) if s <= *le + 1 => *le = (*le).max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+}
+
+/// The foldable block UNDER `row`: the run of following lines strictly more
+/// indented than `row`'s line, with interior blank lines belonging to the
+/// block and trailing blank lines trimmed off it. `None` when `row` is
+/// blank, out of range, or heads no block. Indentation is measured in
+/// leading whitespace characters — comparisons stay within one file, where
+/// indentation style is consistent, so tabs-vs-spaces width games don't
+/// change any ordering this cares about.
+fn indent_block_below(lines: &[String], row: usize) -> Option<(usize, usize)> {
+    fn indent_of(line: &str) -> Option<usize> {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            None // blank lines have no indent identity
+        } else {
+            Some(line.len() - trimmed.len())
+        }
+    }
+    let base = indent_of(lines.get(row)?)?;
+    let mut end = row; // last row CONFIRMED to belong to the block
+    let mut i = row + 1;
+    while i < lines.len() {
+        match indent_of(&lines[i]) {
+            // Blank: tentatively part of the block — confirmed only if a
+            // deeper-indented line follows, otherwise it trails and trims.
+            None => {}
+            Some(ind) if ind > base => end = i,
+            Some(_) => break,
+        }
+        i += 1;
+    }
+    (end > row).then_some((row + 1, end))
+}
+
 /// True when `base` is a fold HEAD: the row rendered as the pill.
 fn is_fold_head(runs: &[(usize, usize)], base: usize) -> bool {
     runs.iter().any(|&(s, _)| s == base)
@@ -882,6 +930,11 @@ struct App<'a> {
     /// new focus push replaces that file's regions — a fresh focus starts
     /// fresh.
     folds_expanded: HashMap<usize, Vec<(usize, usize)>>,
+    /// Folds the reviewer created by hand (`f` on a selection or on a
+    /// block header), per file: base-row runs collapsed in source view,
+    /// independent of any agent focus. Normalized (sorted, merged) on
+    /// insertion; `active_folds` unions them with the focus-derived runs.
+    manual_folds: HashMap<usize, Vec<(usize, usize)>>,
 }
 
 /// The file's current modification time, or `None` if it can't be stat'd
@@ -898,6 +951,10 @@ fn file_mtime(working_dir: &str, path: &str) -> Option<std::time::SystemTime> {
 struct SourceFile {
     lines: Vec<Line<'static>>,
     count: usize,
+    /// The raw source text, one entry per line — kept alongside the
+    /// rendered rows because fold-by-indentation needs to measure leading
+    /// whitespace, which the highlighted spans no longer expose cleanly.
+    raw: Vec<String>,
 }
 
 /// The pinned-span count `pan_and_clip` uses for a row (gutter + origin
@@ -987,6 +1044,7 @@ impl<'a> App<'a> {
             help_scroll: 0,
             focus_regions: HashMap::new(),
             folds_expanded: HashMap::new(),
+            manual_folds: HashMap::new(),
         }
     }
 
@@ -1110,7 +1168,7 @@ impl<'a> App<'a> {
                 Ok(lines) => {
                     let rows = highlight_source_rows(highlighter(), &path, &lines);
                     self.pan_limit.insert((idx, ViewMode::Source), pan_cap_for_rows(&rows));
-                    Ok(SourceFile { lines: rows, count: lines.len() })
+                    Ok(SourceFile { lines: rows, count: lines.len(), raw: lines })
                 }
                 Err(err) => Err(err.root_cause().to_string()),
             }
@@ -1287,10 +1345,11 @@ impl<'a> App<'a> {
         self.diff.cursor = row;
         // A goto into a folded stretch reveals it — the agent must never
         // point the reviewer at a row the pane is hiding (the pill head
-        // included: its own line's content is behind the pill too).
+        // included: its own line's content is behind the pill too). Manual
+        // folds count: hand-folded or agent-folded, hidden is hidden.
         let folds = self.active_folds();
         if let Some(run) = fold_run_containing(&folds, row) {
-            self.folds_expanded.entry(self.nav.selected).or_default().push(run);
+            self.expand_run(run);
         }
         self.focus = Focus::Diff;
         self.ensure_cursor_visible(term_size);
@@ -1580,18 +1639,30 @@ impl<'a> App<'a> {
         if self.view != ViewMode::Source {
             return Vec::new();
         }
-        let Some(regions) = self.focus_regions.get(&self.nav.selected) else {
-            return Vec::new();
-        };
         let count = self.source_line_count();
         if count == 0 {
             return Vec::new();
         }
-        let mut runs = fold_runs(regions, count);
-        if let Some(expanded) = self.folds_expanded.get(&self.nav.selected) {
-            runs.retain(|r| !expanded.contains(r));
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        if let Some(regions) = self.focus_regions.get(&self.nav.selected) {
+            let mut derived = fold_runs(regions, count);
+            if let Some(expanded) = self.folds_expanded.get(&self.nav.selected) {
+                derived.retain(|r| !expanded.contains(r));
+            }
+            runs.extend(derived);
         }
-        runs
+        if let Some(manual) = self.manual_folds.get(&self.nav.selected) {
+            runs.extend(manual.iter().copied());
+        }
+        merge_runs(runs)
+    }
+
+    /// The selected file's raw source lines, when its source is usable.
+    fn source_raw(&self) -> Option<&[String]> {
+        match self.source_cache.get(&self.nav.selected) {
+            Some(Ok(source)) => Some(&source.raw),
+            _ => None,
+        }
     }
 
     /// After a cursor move landed inside a fold's hidden tail: moving down
@@ -1614,7 +1685,94 @@ impl<'a> App<'a> {
         let folds = self.active_folds();
         if let Some(run) = fold_run_containing(&folds, self.diff.cursor) {
             if run.0 == self.diff.cursor {
-                self.folds_expanded.entry(self.nav.selected).or_default().push(run);
+                self.expand_run(run);
+            }
+        }
+    }
+
+    /// Reveal one displayed run. A displayed run can be a merger of manual
+    /// folds and focus-derived folds, so expansion dismantles every
+    /// constituent it intersects: manual runs are deleted outright, derived
+    /// runs go onto the expanded list `active_folds` subtracts.
+    fn expand_run(&mut self, run: (usize, usize)) {
+        let idx = self.nav.selected;
+        let count = self.source_line_count();
+        if let Some(manual) = self.manual_folds.get_mut(&idx) {
+            manual.retain(|&(s, e)| e < run.0 || run.1 < s);
+        }
+        if self.manual_folds.get(&idx).is_some_and(|m| m.is_empty()) {
+            self.manual_folds.remove(&idx);
+        }
+        if let Some(regions) = self.focus_regions.get(&idx) {
+            let derived = fold_runs(regions, count);
+            let expanded = self.folds_expanded.entry(idx).or_default();
+            for d in derived.into_iter().filter(|&(s, e)| s <= run.1 && run.0 <= e) {
+                if !expanded.contains(&d) {
+                    expanded.push(d);
+                }
+            }
+        }
+    }
+
+    /// `f` in source view: fold the visual selection if one is active,
+    /// otherwise the indentation block UNDER the cursor line (the header
+    /// line itself stays visible — `f` on a `def`/`fn` line tucks the body
+    /// away). Runs shorter than `MIN_FOLD_LINES` don't fold, same as the
+    /// focus path. No-op in diff view and on files with no usable source.
+    fn fold_at_cursor_or_selection(&mut self) {
+        if self.view != ViewMode::Source {
+            return;
+        }
+        let count = self.source_line_count();
+        if count == 0 {
+            return;
+        }
+        let run = match self.visual_anchor {
+            Some(anchor) => {
+                let s = anchor.min(self.diff.cursor);
+                let e = anchor.max(self.diff.cursor).min(count - 1);
+                (s, e)
+            }
+            None => {
+                let Some(raw) = self.source_raw() else { return };
+                match indent_block_below(raw, self.diff.cursor) {
+                    Some(run) => run,
+                    None => return,
+                }
+            }
+        };
+        if run.1 - run.0 + 1 < MIN_FOLD_LINES {
+            return;
+        }
+        self.visual_anchor = None;
+        let entry = self.manual_folds.entry(self.nav.selected).or_default();
+        entry.push(run);
+        *entry = merge_runs(std::mem::take(entry));
+        // A cursor inside the new fold's tail lands on its pill — for a
+        // selection fold that's the collapsed range's head; a block fold
+        // leaves the cursor on the still-visible header line above it.
+        if let Some(r) = fold_run_containing(&self.active_folds(), self.diff.cursor) {
+            self.diff.cursor = r.0;
+        }
+    }
+
+    /// `F` in source view: reveal everything in this file — manual folds
+    /// are deleted, focus-derived folds are all marked expanded. The stored
+    /// focus regions survive, so a fresh agent push starts from its own
+    /// clean slate rather than resurrecting what the reviewer dismissed.
+    fn unfold_all(&mut self) {
+        if self.view != ViewMode::Source {
+            return;
+        }
+        let idx = self.nav.selected;
+        self.manual_folds.remove(&idx);
+        if let Some(regions) = self.focus_regions.get(&idx) {
+            let derived = fold_runs(regions, self.source_line_count());
+            let expanded = self.folds_expanded.entry(idx).or_default();
+            for d in derived {
+                if !expanded.contains(&d) {
+                    expanded.push(d);
+                }
             }
         }
     }
@@ -1997,6 +2155,8 @@ impl<'a> App<'a> {
                     KeyCode::Char('x') => self.delete_pending_at_cursor(),
                     KeyCode::Char('t') => self.toggle_view(term_size),
                     KeyCode::Enter => self.expand_fold_at_cursor(),
+                    KeyCode::Char('f') => self.fold_at_cursor_or_selection(),
+                    KeyCode::Char('F') => self.unfold_all(),
                     _ => {}
                 }
                 // Any move that landed inside a fold's hidden tail continues
@@ -2097,8 +2257,12 @@ impl<'a> App<'a> {
                         HelpRow::new("h / tab", "focus the files"),
                         HelpRow::new("t", "toggle diff / source view"),
                     ];
-                    // Only meaningful while the agent has folded this file
-                    // down to its focus regions.
+                    // Folding lives in source view only: the diff already
+                    // shows just its hunks.
+                    if self.view == ViewMode::Source {
+                        rows.push(HelpRow::new("f", "fold the selection / the block under the cursor"));
+                        rows.push(HelpRow::new("F", "unfold everything in this file"));
+                    }
                     if !self.active_folds().is_empty() {
                         rows.push(HelpRow::new("enter", "expand the fold under the cursor"));
                     }
@@ -3689,6 +3853,189 @@ mod tests {
         let visible_comment_rows =
             comment_height(None, "note", 80);
         assert_eq!(map.total(40), 40 - 8 - 13 - 4 + visible_comment_rows);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indent_block_below_finds_the_body_and_trims_trailing_blanks() {
+        let lines: Vec<String> = [
+            "def outer():",      // 0
+            "    a = 1",         // 1
+            "    if a:",         // 2
+            "        b = 2",     // 3
+            "",                  // 4 (interior blank)
+            "        c = 3",     // 5
+            "    return a",      // 6
+            "",                  // 7 (trailing blank)
+            "def next_fn():",    // 8
+            "    pass",          // 9
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // The whole body under the def, interior blank included, trailing
+        // blank trimmed.
+        assert_eq!(indent_block_below(&lines, 0), Some((1, 6)));
+        // A nested block: everything deeper than the `if`.
+        assert_eq!(indent_block_below(&lines, 2), Some((3, 5)));
+        // A leaf line heads no block.
+        assert_eq!(indent_block_below(&lines, 1), None);
+        // Blank lines and out-of-range rows head nothing.
+        assert_eq!(indent_block_below(&lines, 4), None);
+        assert_eq!(indent_block_below(&lines, 99), None);
+        // The last def's body runs to the end of the file.
+        assert_eq!(indent_block_below(&lines, 8), Some((9, 9)));
+    }
+
+    #[test]
+    fn merge_runs_unions_overlapping_and_adjacent_runs() {
+        assert_eq!(merge_runs(vec![(10, 20), (0, 5)]), vec![(0, 5), (10, 20)]);
+        assert_eq!(merge_runs(vec![(0, 8), (9, 12)]), vec![(0, 12)]); // adjacent
+        assert_eq!(merge_runs(vec![(0, 8), (5, 12), (12, 20)]), vec![(0, 20)]);
+        assert_eq!(merge_runs(vec![]), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn manual_selection_fold_collapses_and_enter_expands_it() {
+        let (dir, request, model) = fold_fixture("manual");
+        let request: &'static ReviewRequest = Box::leak(Box::new(request.clone()));
+        let model: &'static Result<DiffModel> = Box::leak(Box::new(match &model {
+            Ok(m) => Ok(DiffModel { files: m.files.clone() }),
+            Err(_) => unreachable!(),
+        }));
+        let mut app = App::new(request, model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+        // Into source view with NO agent focus: manual folding stands alone.
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 11, view: Some("source".into()), focus: None },
+            size,
+        );
+        assert!(app.active_folds().is_empty());
+
+        // v, five rows down, f: rows 10..=15 fold.
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), size);
+        for _ in 0..5 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), size);
+        assert_eq!(app.active_folds(), vec![(10, 15)]);
+        assert_eq!(app.diff.cursor, 10, "the cursor lands on the new pill");
+        assert!(app.visual_anchor.is_none(), "folding consumes the selection");
+
+        // Movement treats it like any fold; Enter dismantles it for good.
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        assert_eq!(app.diff.cursor, 16);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), size);
+        assert_eq!(app.diff.cursor, 10);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+        assert!(app.active_folds().is_empty());
+        assert!(app.manual_folds.is_empty(), "an expanded manual fold is deleted, not parked");
+
+        // A too-short selection folds nothing (same MIN_FOLD_LINES floor as
+        // the focus path); on this flat file `f` without a selection heads
+        // no indent block, so it's a no-op too.
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), size);
+        assert!(app.active_folds().is_empty());
+        app.visual_anchor = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), size);
+        assert!(app.active_folds().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn block_fold_hides_the_body_and_keeps_the_header_visible() {
+        let dir = std::env::temp_dir()
+            .join(format!("herdr-annotator-fold-block-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).expect("temp dir");
+        let body = "def outer():\n    a = 1\n    b = 2\n    c = 3\n    return a\n\ndef next_fn():\n    pass\n";
+        std::fs::write(dir.join("src/lib.rs"), body).expect("write source");
+        let request: &'static ReviewRequest = Box::leak(Box::new(ReviewRequest {
+            version: 1,
+            working_dir: dir.to_string_lossy().into_owned(),
+            baseline: None,
+            note: None,
+        }));
+        let model: &'static Result<DiffModel> =
+            Box::leak(Box::new(Ok(DiffModel { files: vec![sample_file()] })));
+        let mut app = App::new(request, model);
+        app.focus = Focus::Diff;
+        let size = Size::new(120, 40);
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 1, view: Some("source".into()), focus: None },
+            size,
+        );
+
+        // f on the def line: the body (rows 1..=4) folds, the header stays.
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), size);
+        assert_eq!(app.active_folds(), vec![(1, 4)]);
+        assert_eq!(app.diff.cursor, 0, "the header line keeps the cursor");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unfold_all_clears_manual_folds_and_expands_the_focus_ones() {
+        let (dir, request, model) = fold_fixture("unfoldall");
+        let mut app = focused_app(&request, &model);
+        let size = Size::new(120, 40);
+        assert_eq!(app.active_folds(), vec![(0, 8), (15, 28), (35, 39)]);
+
+        // Add a manual fold in the visible region: rows 10..=12.
+        app.diff.cursor = 10;
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), size);
+        assert_eq!(app.active_folds(), vec![(0, 8), (10, 12), (15, 28), (35, 39)]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE), size);
+        assert!(app.active_folds().is_empty(), "F reveals the whole file");
+        assert!(
+            app.focus_regions.contains_key(&0),
+            "the stored focus survives — a fresh agent push starts clean"
+        );
+        // And a fresh push does re-fold.
+        app.apply_goto(
+            &GotoTarget {
+                file: "src/lib.rs".into(),
+                line: 10,
+                view: None,
+                focus: Some(vec![lr(10, 15)]),
+            },
+            size,
+        );
+        assert_eq!(app.active_folds(), vec![(0, 8), (15, 39)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expanding_a_merged_manual_and_focus_run_dismantles_both() {
+        let (dir, request, model) = fold_fixture("merged");
+        let mut app = focused_app(&request, &model);
+        let size = Size::new(120, 40);
+
+        // Manual fold rows 9..=15 (six j's — the sixth stops on the (15,28)
+        // pill head): adjacent to the (0,8) focus fold and touching the
+        // (15,28) one — the display shows ONE merged pill spanning (0,28).
+        app.diff.cursor = 9;
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), size);
+        for _ in 0..6 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), size);
+        assert_eq!(app.active_folds(), vec![(0, 28), (35, 39)]);
+        assert_eq!(app.diff.cursor, 0, "cursor snaps to the merged pill's head");
+
+        // Enter dismantles every constituent the merged run covers.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+        assert_eq!(app.active_folds(), vec![(35, 39)]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
