@@ -1,17 +1,19 @@
 # MCP tools
 
-Four tools, one shared review protocol. `review_changes` blocks the agent
-until a verdict lands. `show_changes` + `goto` + `collect_review` don't:
-they let the agent open the pane, narrate the diff in chat while pushing
-navigation, and come back for the verdict whenever it's ready. Annotations
-work exactly the same way in both modes, and the reviewer can also just
-finish the review in the pane at any time, without waiting to be asked.
+Five tools, one shared review protocol. `review_changes` blocks the agent
+until a verdict lands. `show_changes` + `goto` + `focus` + `collect_review`
+don't: they let the agent open the pane, narrate the diff in chat while
+pushing navigation, and come back for the verdict whenever it's ready.
+Annotations work exactly the same way in both modes, and the reviewer can
+also just finish the review in the pane at any time, without waiting to be
+asked.
 
 | Tool | Blocks? | Arguments | Returns |
 |------|---------|-----------|---------|
 | `review_changes` | Yes | `baseline?`, `note?`, `working_dir?` | Verdict + annotations (below), once the human decides. |
 | `show_changes` | No | `baseline?`, `note?`, `working_dir?` | `{"opened": true, "working_dir": "..."}` immediately. |
 | `goto` | No | `file` (repo-relative, new/post-change side), `line` (1-based), `view` (optional: `diff` or `source`) | Confirmation text; navigation is advisory. |
+| `focus` | No | `file`, `regions` (array of 1-based inclusive `{start, end}`; empty clears) | Confirmation text; advisory like `goto`. |
 | `collect_review` | No, polls | `wait_seconds?` (0–120, default 0) | Verdict + annotations once landed, else `{"status": "pending", "open_for_secs": N}`. |
 
 `baseline`, `note`, and `working_dir` mean the same thing for `review_changes`
@@ -24,7 +26,7 @@ and `show_changes`:
 | `working_dir` | string | Repo to review. Defaults to the server's working directory.        |
 
 Only one review — blocking or guided — can be open at a time: `review_changes`
-and `show_changes` each refuse to start a second one, and `goto` /
+and `show_changes` each refuse to start a second one, and `goto` / `focus` /
 `collect_review` refuse to run without one already open.
 
 ## Verdict result
@@ -76,8 +78,9 @@ talk you through a diff rather than hand it over cold and wait:
 2. **Navigate while explaining.** The agent calls
    `goto(file="src/retry.rs", line=42)` as it describes each piece; the pane
    jumps to follow along. Passing `view: "source"` shows the full file for
-   context, `view: "diff"` returns to the change. You annotate as usual —
-   annotations work exactly as they do in blocking mode.
+   context, `view: "diff"` returns to the change. For a long file, `focus`
+   (below) folds it down to just the regions under discussion. You annotate
+   as usual — annotations work exactly as they do in blocking mode.
 3. **Collect the verdict when ready.** `collect_review()` checks once;
    `wait_seconds` polls for a bit instead of hand-rolling a retry loop.
    Nothing landed yet returns `{"status": "pending", ...}` — that's normal,
@@ -92,3 +95,26 @@ A prompt that triggers this end to end, with no special setup:
 > Open the changes with show_changes and walk me through them file by file —
 > use goto to jump me to each part as you explain it, then collect my review
 > at the end.
+
+## Focus: fold a file to what matters
+
+`focus(file, regions)` folds the source view of one file down to just the
+named line regions — for walkthroughs of long files where only a few
+functions matter. Everything between the regions collapses into
+`⋯ N lines folded ⋯` pills; the pane switches to that file's source view
+and lands on the first region.
+
+- `regions` is an array of 1-based inclusive `{start, end}` ranges on the
+  post-change file, in the order the agent wants to discuss them. Gaps of
+  one or two lines between regions stay visible.
+- Calling `focus` again with new regions refocuses; an **empty** `regions`
+  array clears the focus (whole file visible again, the reviewer's cursor
+  stays put).
+- The reviewer is never trapped: pills expand with `Enter` or a click, `F`
+  reveals the whole file, and a later `goto` into a folded stretch expands
+  it automatically. The reviewer can also fold regions by hand with `f` —
+  see [Controls — folding](controls.md#folding-source-view).
+- Advisory like `goto`: unknown files and out-of-range regions are
+  normalized or ignored by the pane, never an error. Annotations hidden by
+  a fold surface as a note badge on the pill and ride back with the verdict
+  regardless.

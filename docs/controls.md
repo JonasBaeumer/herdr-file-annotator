@@ -71,6 +71,31 @@ no diff noise. Annotations work in both views.
 
 ![Source view: the full finished file with syntax highlighting and no diff markers](img/source-view.png)
 
+## Folding (source view)
+
+Long file, but only a few parts matter right now? Collapse the rest into
+`⋯ N lines folded ⋯` pills — by hand with the keys below, or agent-driven:
+during a guided walkthrough the agent can call its `focus` tool to fold a
+file down to the regions it's explaining (see
+[MCP tools](mcp-tools.md#focus-fold-a-file-to-what-matters)). Both kinds
+share the same behavior, and folding only exists in source view — the diff
+already shows just its hunks.
+
+| Keys | Action |
+|---|---|
+| `f` | fold the selection (`v` + movement first), or — with no selection — the indentation block under the cursor line: `f` on a `def`/`fn` header tucks the body away, the header stays visible |
+| `Enter` (on a pill) | expand that fold |
+| `F` | unfold everything in this file |
+
+Mouse: clicking a pill expands it.
+
+Pills are real cursor stops; movement skips the hidden lines. Very short
+stretches (one or two lines) never fold — a pill would cost as much space
+as it saves. Annotations hidden by a fold aren't lost: the pill shows a
+note badge (`⋯ 24 lines folded · 1 note ⋯`), and expanding brings them
+back inline. An agent `goto` into a folded stretch expands it
+automatically, so you can never be pointed at something you can't see.
+
 ## Finishing the review
 
 | Keys | Action |
