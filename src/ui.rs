@@ -3289,7 +3289,7 @@ mod tests {
         let size = Size::new(80, 24);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(GotoTarget { file: "src/lib.rs".into(), line: 12, view: None }).unwrap();
+        tx.send(GotoTarget { file: "src/lib.rs".into(), line: 12, view: None, focus: None }).unwrap();
         assert!(!drain_navigation(&mut app, &rx, size), "live channel: not a disconnect");
         assert_eq!(app.diff.cursor, 7, "the pending goto was applied while draining");
 
@@ -3308,7 +3308,7 @@ mod tests {
                               // wrap-to-top bug is visible either way.
 
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 999, view: None },
+            &GotoTarget { file: "src/lib.rs".into(), line: 999, view: None, focus: None },
             Size::new(80, 24),
         );
 
@@ -3344,7 +3344,7 @@ mod tests {
         assert!(app.view == ViewMode::Diff);
 
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(app.view == ViewMode::Source, "explicit source view request must switch");
@@ -3352,13 +3352,13 @@ mod tests {
 
         // Unknown view strings are ignored (advisory), current view kept.
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 1, view: Some("hexdump".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 1, view: Some("hexdump".into()), focus: None },
             size,
         );
         assert!(app.view == ViewMode::Source);
 
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()), focus: None },
             size,
         );
         assert!(app.view == ViewMode::Diff, "explicit diff view request must switch back");
@@ -3368,7 +3368,7 @@ mod tests {
         // save an unrelated range (same rule as the manual toggle).
         app.visual_anchor = Some(3);
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(app.visual_anchor.is_none(), "view switch must clear the visual anchor");
@@ -3378,13 +3378,13 @@ mod tests {
         // the pane must fall back to diff, not show the placeholder, and the
         // effective source→diff change clears a live selection.
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(app.view == ViewMode::Source);
         app.visual_anchor = Some(1);
         app.apply_goto(
-            &GotoTarget { file: "src/gone.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/gone.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(
@@ -3399,13 +3399,13 @@ mod tests {
         // A source request for a file with no usable source is IGNORED —
         // the diff stays on screen, per the documented contract.
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()), focus: None },
             size,
         );
         std::fs::remove_file(dir.join("src/lib.rs")).expect("delete source");
         app.source_cache.clear(); // force a fresh load attempt
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(
@@ -3428,7 +3428,7 @@ mod tests {
 
         // A goto arrives while typing — must not move the cursor or disturb
         // the open input, but must not be lost either.
-        app.apply_goto(&GotoTarget { file: "src/lib.rs".into(), line: 12, view: None }, size);
+        app.apply_goto(&GotoTarget { file: "src/lib.rs".into(), line: 12, view: None, focus: None }, size);
         assert_eq!(app.diff.cursor, 1, "an open input bar must not be disturbed");
         assert!(app.input.is_some(), "the input bar must stay open");
         assert!(app.pending_goto.is_some(), "the target must be held, not dropped");

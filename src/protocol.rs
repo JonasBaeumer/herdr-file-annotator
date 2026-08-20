@@ -53,6 +53,10 @@ pub enum ServerMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GotoTarget {
     pub file: String,
+    /// 1-based new-side line to land on. `0` is the "don't move the cursor"
+    /// sentinel: the push still applies its `view`/`focus` parts, but the
+    /// cursor stays where the reviewer left it (used when an agent clears a
+    /// focus without wanting to yank the pane to the top).
     pub line: u32,
     /// Which view the pane should show the target in: "diff" or "source".
     /// `None` keeps the pane's current view. Advisory like the rest of the
@@ -61,6 +65,17 @@ pub struct GotoTarget {
     /// with v2 peers that don't send it (per the protocol-change policy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<String>,
+    /// Agent-driven focus for source view: keep only these 1-based line
+    /// regions of `file` visible and collapse everything between them into
+    /// fold pills. `Some(vec![])` clears the file's focus (everything
+    /// visible again); `None` leaves any existing focus untouched — a plain
+    /// goto never disturbs a focus in force. Advisory and self-normalizing
+    /// like the rest of the target: regions are clamped to the file, merged
+    /// when they touch, and never an error. `#[serde(default)]` keeps the
+    /// wire format compatible with v2 peers that don't send it (same policy
+    /// as `view`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<Vec<LineRange>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,7 +97,7 @@ pub enum Side {
     Old,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineRange {
     pub start: u32,
     pub end: u32,
@@ -412,12 +427,42 @@ mod tests {
             .unwrap();
         // Nothing delivered yet: the mailbox is empty, not blocking.
         assert!(open.try_take().is_none());
-        open.goto(&GotoTarget { file: "src/a.rs".into(), line: 10, view: None }).unwrap();
-        open.goto(&GotoTarget { file: "src/b.rs".into(), line: 3, view: None }).unwrap();
+        open.goto(&GotoTarget { file: "src/a.rs".into(), line: 10, view: None, focus: None }).unwrap();
+        open.goto(&GotoTarget { file: "src/b.rs".into(), line: 3, view: None, focus: None }).unwrap();
         let result = open.wait(Some(Duration::from_secs(5))).unwrap();
         pane.join().unwrap();
         assert_eq!(result.verdict, Verdict::Approve);
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn goto_focus_regions_round_trip_and_absent_focus_stays_none() {
+        // The focus field must survive the wire exactly (the pane folds on
+        // these numbers), and a frame WITHOUT it — what a peer built before
+        // the field existed sends — must parse with `focus: None` rather
+        // than erroring, per the serde-default compatibility policy.
+        let target = GotoTarget {
+            file: "src/retry.rs".into(),
+            line: 14,
+            view: Some("source".into()),
+            focus: Some(vec![
+                LineRange { start: 14, end: 22 },
+                LineRange { start: 40, end: 51 },
+            ]),
+        };
+        let wire = serde_json::to_string(&ServerMsg::Goto(target)).unwrap();
+        let back: ServerMsg = serde_json::from_str(&wire).unwrap();
+        let ServerMsg::Goto(back) = back else { panic!("expected a goto frame") };
+        assert_eq!(
+            back.focus,
+            Some(vec![LineRange { start: 14, end: 22 }, LineRange { start: 40, end: 51 }])
+        );
+
+        let legacy: ServerMsg =
+            serde_json::from_str(r#"{"type":"goto","file":"src/a.rs","line":3}"#).unwrap();
+        let ServerMsg::Goto(legacy) = legacy else { panic!("expected a goto frame") };
+        assert_eq!(legacy.focus, None);
+        assert_eq!(legacy.view, None);
     }
 
     #[test]

@@ -266,7 +266,7 @@ fn handle_goto(args: &Value, active: &mut Option<ActiveReview>) -> Value {
     };
 
     let view_note = view.as_deref().map(|v| format!(" in {v} view")).unwrap_or_default();
-    match active_review.open.goto(&GotoTarget { file: file.clone(), line, view }) {
+    match active_review.open.goto(&GotoTarget { file: file.clone(), line, view, focus: None }) {
         Ok(()) => {
             let text = format!(
                 "navigated the review pane to {file}:{line}{view_note} (advisory — if the pane doesn't recognize that file, it ignores the push)"
