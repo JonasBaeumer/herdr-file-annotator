@@ -1146,7 +1146,20 @@ impl<'a> App<'a> {
     /// held in `pending_goto` and replayed once it closes, rather than lost.
     fn apply_goto(&mut self, target: &GotoTarget, term_size: Size) {
         if self.input.is_some() {
-            self.pending_goto = Some(target.clone());
+            // A later push for the same file while the input is still open
+            // replaces the held target outright — but its own `focus: None`
+            // means "don't touch", not "cancel the focus an earlier held
+            // push carried". Without carrying that forward, a focus push
+            // followed by a same-file goto before the input closes would
+            // silently lose the focus: only the last pushed target survives
+            // the single `pending_goto` slot.
+            let mut target = target.clone();
+            if target.focus.is_none() {
+                if let Some(prev) = self.pending_goto.as_ref().filter(|p| p.file == target.file) {
+                    target.focus = prev.focus.clone();
+                }
+            }
+            self.pending_goto = Some(target);
             return;
         }
         let Ok(model) = self.model else { return };
@@ -4006,6 +4019,37 @@ mod tests {
             "the deferred goto must be applied once the input bar closes"
         );
         assert!(app.pending_goto.is_none(), "the held target must be consumed, not replayed again");
+    }
+
+    #[test]
+    fn a_pending_focus_survives_a_same_file_goto_queued_before_the_input_closes() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(80, 24);
+        app.input = Some(InputMode::Summary { buf: String::new() });
+
+        // The agent's focus push arrives first and is held...
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 10, view: None, focus: Some(vec![lr(10, 15)]) },
+            size,
+        );
+        // ...then a plain goto for the SAME file lands before the input
+        // closes. Its own focus is None ("don't touch"), so the earlier
+        // held focus must survive, not be dropped when this later push
+        // replaces the single pending_goto slot.
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: None, focus: None },
+            size,
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), size);
+        assert!(app.input.is_none());
+        assert_eq!(
+            app.focus_regions.get(&0),
+            Some(&vec![lr(10, 15)]),
+            "the first push's focus must not be dropped by the queued goto"
+        );
     }
 
     #[test]
