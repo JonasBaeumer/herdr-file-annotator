@@ -108,8 +108,8 @@ and lands on the first region.
   post-change file, in the order the agent wants to discuss them. Gaps of
   one or two lines between regions stay visible.
 - Calling `focus` again with new regions refocuses; an **empty** `regions`
-  array clears the focus (whole file visible again, the reviewer's cursor
-  stays put).
+  array clears the agent's focus (the reviewer's cursor stays put). Folds the
+  reviewer made by hand with `f` are untouched by this — `F` clears those.
 - The reviewer is never trapped: pills expand with `Enter` or a click, `F`
   reveals the whole file, and a later `goto` into a folded stretch expands
   it automatically. The reviewer can also fold regions by hand with `f` —
