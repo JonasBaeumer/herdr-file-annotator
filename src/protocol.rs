@@ -57,6 +57,16 @@ pub struct GotoTarget {
     /// sentinel: the push still applies its `view`/`focus` parts, but the
     /// cursor stays where the reviewer left it (used when an agent clears a
     /// focus without wanting to yank the pane to the top).
+    ///
+    /// Version-skew note (deliberate tradeoff, reviewed on PR #16): the
+    /// sentinel gives new meaning to a value v2 servers never sent (the
+    /// MCP layer has always rejected `line < 1`), so it rides the same
+    /// no-bump policy as the `focus` field itself. A pane older than the
+    /// sentinel — reachable only when a plugin upgrade lands mid-session
+    /// under a still-running older server's pane — would treat a
+    /// focus-clear as "goto line 0" and jump to the file's top: a cosmetic
+    /// cursor hop on one rare call, accepted over a `PROTOCOL_VERSION`
+    /// bump that would hard-fail EVERY review against a stale pane.
     pub line: u32,
     /// Which view the pane should show the target in: "diff" or "source".
     /// `None` keeps the pane's current view. Advisory like the rest of the
