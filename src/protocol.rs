@@ -82,6 +82,8 @@ pub enum Side {
     Old,
 }
 
+/// 1-based line range; `end` is inclusive, so a single-line annotation has
+/// `start == end`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineRange {
     pub start: u32,
@@ -369,7 +371,10 @@ mod tests {
 
         assert_eq!(result.verdict, Verdict::RequestChanges);
         assert_eq!(result.annotations.len(), 1);
+        // Both endpoints: the range is documented as inclusive, so end must
+        // arrive as the last annotated line (5), not one past it.
         assert_eq!(result.annotations[0].lines.start, 3);
+        assert_eq!(result.annotations[0].lines.end, 5);
         let _ = std::fs::remove_file(&sock);
     }
 
@@ -605,21 +610,21 @@ mod tests {
     }
 
     #[test]
-    fn readme_example_verdict_matches_the_current_protocol_version() {
-        // README.md documents review_changes/collect_review's response shape
-        // with a literal example ReviewResult. It's prose, not code, so
-        // nothing else catches it drifting out of sync with a future
-        // PROTOCOL_VERSION bump the way this one did (the example was still
-        // showing v1 after the wire format moved to v2) — parse it for real
-        // and pin its version field to the constant.
-        let readme = include_str!("../README.md");
-        let start = readme.find("```json\n").expect("README's example verdict block") + "```json\n".len();
-        let end = start + readme[start..].find("```").expect("closing fence for the example block");
-        let example: ReviewResult = serde_json::from_str(readme[start..end].trim())
-            .expect("README's example verdict must itself be valid ReviewResult JSON");
+    fn docs_example_verdict_matches_the_current_protocol_version() {
+        // docs/mcp-tools.md documents review_changes/collect_review's
+        // response shape with a literal example ReviewResult. It's prose,
+        // not code, so nothing else catches it drifting out of sync with a
+        // future PROTOCOL_VERSION bump the way this one did (the example was
+        // still showing v1 after the wire format moved to v2) — parse it for
+        // real and pin its version field to the constant.
+        let docs = include_str!("../docs/mcp-tools.md");
+        let start = docs.find("```json\n").expect("docs' example verdict block") + "```json\n".len();
+        let end = start + docs[start..].find("```").expect("closing fence for the example block");
+        let example: ReviewResult = serde_json::from_str(docs[start..end].trim())
+            .expect("docs' example verdict must itself be valid ReviewResult JSON");
         assert_eq!(
             example.version, PROTOCOL_VERSION,
-            "README's documented example verdict is stale — update it alongside any PROTOCOL_VERSION bump"
+            "docs/mcp-tools.md's documented example verdict is stale — update it alongside any PROTOCOL_VERSION bump"
         );
     }
 }
