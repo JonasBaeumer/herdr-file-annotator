@@ -1235,18 +1235,43 @@ impl<'a> App<'a> {
             self.ensure_cursor_visible(term_size);
             return;
         }
+        // A focus push lands on its first listed region AS NORMALIZED by
+        // this pane, not as sent: `fold_runs` drops regions that miss the
+        // file entirely, so landing on a dropped region's start would clamp
+        // to the file's end and — worse — auto-expand the trailing fold the
+        // surviving regions just created. Land on the first region that
+        // intersects the file instead; a focus whose regions ALL miss the
+        // file is the same ignored advisory input `fold_runs` already
+        // treats it as — it folds nothing and moves nothing.
+        let mut line = target.line;
+        if let Some(regions) = &target.focus {
+            if !regions.is_empty() && self.view == ViewMode::Source {
+                let count = self.source_line_count() as u32;
+                match regions.iter().find(|r| r.start >= 1 && r.start <= r.end && r.start <= count)
+                {
+                    Some(first) => line = first.start,
+                    None => {
+                        self.snap_cursor_out_of_folds(true);
+                        self.focus = Focus::Diff;
+                        self.ensure_cursor_visible(term_size);
+                        return;
+                    }
+                }
+            }
+        }
         let row = match self.view {
-            ViewMode::Source => (target.line.saturating_sub(1) as usize)
-                .min(self.source_row_count().saturating_sub(1)),
+            ViewMode::Source => {
+                (line.saturating_sub(1) as usize).min(self.source_row_count().saturating_sub(1))
+            }
             ViewMode::Diff => {
                 let rows = self.diff_rows();
                 rows.iter()
                     .position(
-                        |r| matches!(r, DiffRow::Line(l) if l.new_no == Some(target.line)),
+                        |r| matches!(r, DiffRow::Line(l) if l.new_no == Some(line)),
                     )
                     .or_else(|| {
                         rows.iter().position(
-                            |r| matches!(r, DiffRow::Line(l) if l.new_no.is_some_and(|n| n >= target.line)),
+                            |r| matches!(r, DiffRow::Line(l) if l.new_no.is_some_and(|n| n >= line)),
                         )
                     })
                     // Past the last new-side line: clamp to it, matching
@@ -3590,6 +3615,51 @@ mod tests {
         assert_eq!(app.diff.cursor, 12, "the reviewer's cursor must not reset");
         assert!(!app.focus_regions.contains_key(&1), "src/other.rs's stale focus must be cleared");
         assert_eq!(app.active_folds().len(), 3, "src/lib.rs's own focus, still selected, must remain");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn focus_lands_on_the_first_surviving_region_not_a_dropped_one() {
+        // fold_runs DROPS a region past the file's end; the landing must
+        // follow the same normalization. Landing on the dropped region's
+        // start used to clamp the cursor to the last row — inside the
+        // trailing fold the surviving region just created — and auto-expand
+        // it away.
+        let (dir, request, model) = fold_fixture("surviving");
+        let mut app = focused_app(&request, &model);
+        let size = Size::new(120, 40);
+
+        app.apply_goto(
+            &GotoTarget {
+                file: "src/lib.rs".into(),
+                line: 100, // what the tool would send: first LISTED region's start
+                view: Some("source".into()),
+                focus: Some(vec![lr(100, 110), lr(10, 15)]),
+            },
+            size,
+        );
+        assert_eq!(
+            app.active_folds(),
+            vec![(0, 8), (15, 39)],
+            "the trailing fold must survive — landing must not auto-expand it"
+        );
+        assert_eq!(app.diff.cursor, 9, "land on the first region that intersects the file");
+
+        // All regions miss the file: folds nothing (fold_runs) and moves
+        // nothing (landing) — one consistent "ignored advisory" outcome.
+        app.diff.cursor = 20;
+        app.apply_goto(
+            &GotoTarget {
+                file: "src/lib.rs".into(),
+                line: 100,
+                view: Some("source".into()),
+                focus: Some(vec![lr(100, 110)]),
+            },
+            size,
+        );
+        assert!(app.active_folds().is_empty());
+        assert_eq!(app.diff.cursor, 20, "a fully out-of-file focus must not move the cursor");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
