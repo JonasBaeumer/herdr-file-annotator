@@ -290,19 +290,64 @@ impl DiffViewState {
 struct DispMap {
     /// One entry per inline comment row: the base row it hangs under.
     /// Sorted ascending; duplicates mean several comments under one row.
+    /// Every entry is a VISIBLE base row — the builder skips comments whose
+    /// anchor rows are folded away.
     ends: Vec<usize>,
+    /// Sorted, disjoint runs of base rows with NO display row at all: the
+    /// TAILS of collapsed folds. A fold's head row stays in the display as
+    /// its pill, so a run here never starts at row 0. Empty everywhere
+    /// except a fold-bearing source view.
+    hidden: Vec<(usize, usize)>,
 }
 
 impl DispMap {
-    fn new(mut ends: Vec<usize>) -> Self {
-        ends.sort_unstable();
-        DispMap { ends }
+    /// A map with no hidden rows — every view except a fold-bearing source
+    /// view. (Tests use it heavily; production goes through `disp_map`.)
+    #[cfg(test)]
+    fn new(ends: Vec<usize>) -> Self {
+        Self::with_hidden(ends, Vec::new())
     }
 
-    /// Display index of a base row: shifted down one for every comment row
-    /// hanging under an earlier base row.
+    fn with_hidden(mut ends: Vec<usize>, mut hidden: Vec<(usize, usize)>) -> Self {
+        ends.sort_unstable();
+        hidden.sort_unstable();
+        DispMap { ends, hidden }
+    }
+
+    /// The nearest base row at or before `base` that HAS a display row:
+    /// rows inside a hidden tail resolve to their fold's head (the pill).
+    fn normalize(&self, base: usize) -> usize {
+        for &(s, e) in &self.hidden {
+            if s <= base && base <= e {
+                return s.saturating_sub(1); // the fold head sits just above its tail
+            }
+        }
+        base
+    }
+
+    /// Hidden rows strictly before `base` (callers pass a normalized base,
+    /// so the partial-overlap arm is defensive only).
+    fn hidden_before(&self, base: usize) -> usize {
+        self.hidden
+            .iter()
+            .map(|&(s, e)| {
+                if e < base {
+                    e - s + 1
+                } else if s < base {
+                    base - s
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    /// Display index of a base row: shifted UP for every hidden row above
+    /// it and DOWN for every comment row hanging under an earlier base row.
+    /// A base row inside a hidden tail maps to its fold's pill row.
     fn disp(&self, base: usize) -> usize {
-        base + self.ends.iter().take_while(|&&e| e < base).count()
+        let b = self.normalize(base);
+        b - self.hidden_before(b) + self.ends.iter().take_while(|&&e| e < b).count()
     }
 
     /// Number of comment rows hanging directly under this base row.
@@ -311,23 +356,101 @@ impl DispMap {
     }
 
     fn total(&self, base_count: usize) -> usize {
-        base_count + self.ends.len()
+        let hidden: usize = self.hidden.iter().map(|&(s, e)| e - s + 1).sum();
+        base_count - hidden.min(base_count) + self.ends.len()
     }
 
     /// Inverse mapping for mouse hits: the base row rendered at (or hanging
     /// above) a display row — clicking an inline comment resolves to the
-    /// line it annotates. Returns the largest base row whose display index
-    /// is <= `disp_row`, clamped to the file's rows.
+    /// line it annotates, clicking a fold pill to the fold's head row.
+    /// Returns the largest base row whose display index is <= `disp_row`,
+    /// clamped to the file's rows. The walk starts from the LAST base row,
+    /// not from `disp_row`: with hidden rows in play `disp(b)` can be far
+    /// below `b`, so `disp_row` itself is no longer an upper bound for the
+    /// answer.
     fn base_at(&self, disp_row: usize, base_count: usize) -> usize {
         if base_count == 0 {
             return 0;
         }
-        let mut b = disp_row.min(base_count - 1);
+        let mut b = base_count - 1;
         while b > 0 && self.disp(b) > disp_row {
             b -= 1;
         }
-        b
+        self.normalize(b)
     }
+}
+
+/// Minimum collapsed-run length worth a fold pill. Shorter gaps between
+/// focus regions stay visible: a pill row that hides one or two rows saves
+/// almost nothing and costs a click to see past.
+const MIN_FOLD_LINES: usize = 3;
+
+/// Derive the collapsed base-row runs (0-based, inclusive, sorted) for a
+/// source file of `line_count` lines under agent-pushed focus `regions`
+/// (1-based, inclusive, any order). Advisory input by protocol contract, so
+/// this normalizes rather than errors: regions are clamped to the file,
+/// degenerate ones dropped, and regions whose gap is shorter than
+/// `MIN_FOLD_LINES` merge. The returned runs are the complement — the
+/// stretches between regions that actually collapse. No regions surviving
+/// the clamp folds nothing (the whole file stays visible).
+fn fold_runs(regions: &[LineRange], line_count: usize) -> Vec<(usize, usize)> {
+    if line_count == 0 || regions.is_empty() {
+        return Vec::new();
+    }
+    let mut vis: Vec<(usize, usize)> = regions
+        .iter()
+        .filter(|r| r.start >= 1 && r.start <= r.end && (r.start as usize) <= line_count)
+        .map(|r| ((r.start - 1) as usize, (r.end as usize).min(line_count) - 1))
+        .collect();
+    if vis.is_empty() {
+        return Vec::new();
+    }
+    vis.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in vis {
+        match merged.last_mut() {
+            Some((_, le)) if s <= *le + MIN_FOLD_LINES => *le = (*le).max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    let mut runs = Vec::new();
+    let mut next_unfolded = 0usize;
+    for &(s, e) in &merged {
+        if s > next_unfolded && s - next_unfolded >= MIN_FOLD_LINES {
+            runs.push((next_unfolded, s - 1));
+        }
+        next_unfolded = next_unfolded.max(e + 1);
+    }
+    if line_count > next_unfolded && line_count - next_unfolded >= MIN_FOLD_LINES {
+        runs.push((next_unfolded, line_count - 1));
+    }
+    runs
+}
+
+/// The fold run whose rows contain `base` — as its pill head or inside its
+/// hidden tail — if any.
+fn fold_run_containing(runs: &[(usize, usize)], base: usize) -> Option<(usize, usize)> {
+    runs.iter().copied().find(|&(s, e)| s <= base && base <= e)
+}
+
+/// True when `base` is a fold HEAD: the row rendered as the pill.
+fn is_fold_head(runs: &[(usize, usize)], base: usize) -> bool {
+    runs.iter().any(|&(s, _)| s == base)
+}
+
+/// The single display row standing in for a collapsed fold. `hidden_lines`
+/// counts the whole run (the head line's own content is behind the pill
+/// too); `notes` is how many pending annotations touch the folded stretch.
+fn fold_pill_line(hidden_lines: usize, notes: usize) -> Line<'static> {
+    let notes_part = match notes {
+        0 => String::new(),
+        1 => " · 1 note".to_string(),
+        n => format!(" · {n} notes"),
+    };
+    Line::from(Span::styled(
+        format!("⋯ {hidden_lines} lines folded{notes_part} — enter/click expands ⋯"),
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+    ))
 }
 
 /// Display-space scroll follow: keep the cursor row AND any comment rows
@@ -681,13 +804,14 @@ struct App<'a> {
     /// Some(mode) while the "request changes" summary prompt or the
     /// annotation comment prompt is open.
     input: Option<InputMode>,
-    /// The latest agent-pushed goto that arrived while an input bar was
-    /// open, held for replay once it closes. `apply_goto` never disturbs an
-    /// open input, but the target itself is still valid and shouldn't be
-    /// silently lost — only the latest matters, since an earlier one it
-    /// displaced was never shown either. Cleared (and applied) the moment
-    /// `input` goes back to `None`.
-    pending_goto: Option<GotoTarget>,
+    /// Agent-pushed gotos that arrived while an input bar was open, held in
+    /// arrival order and replayed in that order the moment `input` goes back
+    /// to `None`. `apply_goto` never disturbs an open input, but the targets
+    /// are still valid and must not be silently lost. A queue, not a
+    /// latest-only slot: goto pushes are stateFUL now that they can carry
+    /// `focus` regions — an earlier held focus for one file must survive a
+    /// later held goto for another, which replay-in-order gives for free.
+    pending_gotos: Vec<GotoTarget>,
     /// Set by `v` in diff focus at the cursor row; the active selection is
     /// `min(anchor, cursor)..=max(anchor, cursor)` and grows/shrinks as the
     /// cursor moves. Diff-focus only; cleared by a second `v`, by `Esc`, or
@@ -747,6 +871,17 @@ struct App<'a> {
     /// Scroll offset, in overlay content rows, for the help overlay. Reset
     /// to 0 every time the overlay opens so it never reopens mid-scroll.
     help_scroll: usize,
+    /// Agent-pushed focus per file (index into `model.files`): the raw
+    /// 1-based regions from the last goto push that carried a `focus`.
+    /// Fold runs derive from these lazily against the file's source line
+    /// count, so a focus can arrive before the source is ever loaded (or
+    /// for a file whose source never loads — it's simply inert there).
+    focus_regions: HashMap<usize, Vec<LineRange>>,
+    /// Folds the reviewer expanded by hand (Enter/click on a pill), per
+    /// file: the exact runs subtracted from the derived set. Cleared when a
+    /// new focus push replaces that file's regions — a fresh focus starts
+    /// fresh.
+    folds_expanded: HashMap<usize, Vec<(usize, usize)>>,
 }
 
 /// The file's current modification time, or `None` if it can't be stat'd
@@ -838,7 +973,7 @@ impl<'a> App<'a> {
             nav: NavState::default(),
             diff: DiffViewState::default(),
             input: None,
-            pending_goto: None,
+            pending_gotos: Vec::new(),
             visual_anchor: None,
             drag_origin: None,
             show_navigator: true,
@@ -850,6 +985,8 @@ impl<'a> App<'a> {
             source_baseline_mtime,
             help_open: false,
             help_scroll: 0,
+            focus_regions: HashMap::new(),
+            folds_expanded: HashMap::new(),
         }
     }
 
@@ -1001,26 +1138,57 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Apply a push's focus payload to file `idx`'s stored focus state:
+    /// `None` leaves it untouched, `Some(empty)` clears it, and
+    /// `Some(regions)` replaces it wholesale and resets any hand-expanded
+    /// folds — a fresh focus starts fresh.
+    fn apply_focus(&mut self, idx: usize, focus: &Option<Vec<LineRange>>) {
+        if let Some(regions) = focus {
+            if regions.is_empty() {
+                self.focus_regions.remove(&idx);
+            } else {
+                self.focus_regions.insert(idx, regions.clone());
+            }
+            self.folds_expanded.remove(&idx);
+        }
+    }
+
     /// Agent-pushed navigation: focus `target.file` at new-side line
     /// `target.line` in the CURRENT view. Advisory by contract — unknown
     /// files are ignored, out-of-range lines clamp, and in diff view a line
     /// outside the hunks lands on the nearest following changed/context row,
     /// or the last new-side row if none follows (never wraps to the top).
     /// Never disturbs an open input bar — while one is open the target is
-    /// held in `pending_goto` and replayed once it closes, rather than lost.
+    /// queued in `pending_gotos` and replayed once it closes, rather than
+    /// lost.
     fn apply_goto(&mut self, target: &GotoTarget, term_size: Size) {
         if self.input.is_some() {
-            self.pending_goto = Some(target.clone());
+            // Queued and replayed in arrival order once the input closes.
+            // Order matters because pushes are stateful: a held focus for
+            // one file must survive a later held goto for any file, and
+            // replaying the sequence exactly as the agent sent it needs no
+            // special-casing of what each push carries.
+            self.pending_gotos.push(target.clone());
             return;
         }
         let Ok(model) = self.model else { return };
         let Some(idx) = model.files.iter().position(|f| f.path == target.file) else {
             return;
         };
+        // A line-0 push against a file the reviewer isn't currently looking
+        // at only updates that file's stored focus (used to clear a stale
+        // focus after the reviewer has already moved elsewhere) — it must
+        // not steal the pane away to show that file, which file_changed()
+        // below would do by switching nav.selected and resetting the cursor.
+        if target.line == 0 && idx != self.nav.selected {
+            self.apply_focus(idx, &target.focus);
+            return;
+        }
         if idx != self.nav.selected {
             self.nav.selected = idx;
             self.file_changed();
         }
+        self.apply_focus(idx, &target.focus);
         // An explicit view request switches the pane before the line maps —
         // advisory like everything else: an unknown view string is ignored,
         // and a source request for a file with no usable source side
@@ -1057,18 +1225,53 @@ impl<'a> App<'a> {
             }
             _ => {}
         }
+        // `line: 0` is the don't-move-the-cursor sentinel (a focus-clearing
+        // push shouldn't yank the pane to the top). The view/focus parts
+        // above still applied; the cursor just stays put — snapped out of
+        // any fold the new focus put under it.
+        if target.line == 0 {
+            self.snap_cursor_out_of_folds(true);
+            self.focus = Focus::Diff;
+            self.ensure_cursor_visible(term_size);
+            return;
+        }
+        // A focus push lands on its first listed region AS NORMALIZED by
+        // this pane, not as sent: `fold_runs` drops regions that miss the
+        // file entirely, so landing on a dropped region's start would clamp
+        // to the file's end and — worse — auto-expand the trailing fold the
+        // surviving regions just created. Land on the first region that
+        // intersects the file instead; a focus whose regions ALL miss the
+        // file is the same ignored advisory input `fold_runs` already
+        // treats it as — it folds nothing and moves nothing.
+        let mut line = target.line;
+        if let Some(regions) = &target.focus {
+            if !regions.is_empty() && self.view == ViewMode::Source {
+                let count = self.source_line_count() as u32;
+                match regions.iter().find(|r| r.start >= 1 && r.start <= r.end && r.start <= count)
+                {
+                    Some(first) => line = first.start,
+                    None => {
+                        self.snap_cursor_out_of_folds(true);
+                        self.focus = Focus::Diff;
+                        self.ensure_cursor_visible(term_size);
+                        return;
+                    }
+                }
+            }
+        }
         let row = match self.view {
-            ViewMode::Source => (target.line.saturating_sub(1) as usize)
-                .min(self.source_row_count().saturating_sub(1)),
+            ViewMode::Source => {
+                (line.saturating_sub(1) as usize).min(self.source_row_count().saturating_sub(1))
+            }
             ViewMode::Diff => {
                 let rows = self.diff_rows();
                 rows.iter()
                     .position(
-                        |r| matches!(r, DiffRow::Line(l) if l.new_no == Some(target.line)),
+                        |r| matches!(r, DiffRow::Line(l) if l.new_no == Some(line)),
                     )
                     .or_else(|| {
                         rows.iter().position(
-                            |r| matches!(r, DiffRow::Line(l) if l.new_no.is_some_and(|n| n >= target.line)),
+                            |r| matches!(r, DiffRow::Line(l) if l.new_no.is_some_and(|n| n >= line)),
                         )
                     })
                     // Past the last new-side line: clamp to it, matching
@@ -1082,6 +1285,13 @@ impl<'a> App<'a> {
             }
         };
         self.diff.cursor = row;
+        // A goto into a folded stretch reveals it — the agent must never
+        // point the reviewer at a row the pane is hiding (the pill head
+        // included: its own line's content is behind the pill too).
+        let folds = self.active_folds();
+        if let Some(run) = fold_run_containing(&folds, row) {
+            self.folds_expanded.entry(self.nav.selected).or_default().push(run);
+        }
         self.focus = Focus::Diff;
         self.ensure_cursor_visible(term_size);
     }
@@ -1104,6 +1314,10 @@ impl<'a> App<'a> {
         // A live `v` selection is anchored in the OLD view's row space, so
         // it would paint an unrelated range here: drop it with the view.
         self.visual_anchor = None;
+        // Entering source view can land the mapped cursor inside a fold
+        // the agent focused earlier; continue past it rather than sit on a
+        // hidden row.
+        self.snap_cursor_out_of_folds(true);
         self.diff.hscroll = 0;
         self.diff.scroll = 0;
         self.ensure_cursor_visible(term_size);
@@ -1240,10 +1454,12 @@ impl<'a> App<'a> {
             }
             if !close {
                 self.input = Some(mode);
-            } else if let Some(target) = self.pending_goto.take() {
-                // The input just closed: catch up to whatever navigation
-                // arrived (and was held) while the reviewer was typing.
-                self.apply_goto(&target, term_size);
+            } else if !self.pending_gotos.is_empty() {
+                // The input just closed: catch up, in arrival order, to
+                // whatever navigation was held while the reviewer typed.
+                for target in std::mem::take(&mut self.pending_gotos) {
+                    self.apply_goto(&target, term_size);
+                }
             }
             // Typing can grow the editing box (more wrapped rows) or close
             // it back down to nothing — either way the set of display rows
@@ -1356,11 +1572,59 @@ impl<'a> App<'a> {
     /// One `ends` entry per DISPLAY row a comment occupies — wrapped
     /// comments push several — so the scroll math sees their real height.
     /// `inner_width` is the diff pane's inner width (wrap width source).
+    /// The collapsed fold runs (0-based base-row runs, sorted) for the
+    /// selected file in the CURRENT view. Always empty in diff view — the
+    /// diff already shows only its hunks — and for files whose source isn't
+    /// usable (the focus stays stored, just inert).
+    fn active_folds(&self) -> Vec<(usize, usize)> {
+        if self.view != ViewMode::Source {
+            return Vec::new();
+        }
+        let Some(regions) = self.focus_regions.get(&self.nav.selected) else {
+            return Vec::new();
+        };
+        let count = self.source_line_count();
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut runs = fold_runs(regions, count);
+        if let Some(expanded) = self.folds_expanded.get(&self.nav.selected) {
+            runs.retain(|r| !expanded.contains(r));
+        }
+        runs
+    }
+
+    /// After a cursor move landed inside a fold's hidden tail: moving down
+    /// continues to the first row past the fold (falling back to the pill
+    /// when the fold reaches the end of the file); moving up stops on the
+    /// pill. The pill head itself is a real cursor stop — that's how the
+    /// keyboard reaches Enter-to-expand.
+    fn snap_cursor_out_of_folds(&mut self, moved_down: bool) {
+        let folds = self.active_folds();
+        let Some((s, e)) = fold_run_containing(&folds, self.diff.cursor) else { return };
+        if self.diff.cursor == s {
+            return;
+        }
+        self.diff.cursor = if moved_down && e + 1 < self.view_row_count() { e + 1 } else { s };
+    }
+
+    /// Enter (or a click) on a fold pill: reveal that run. No-op anywhere
+    /// else.
+    fn expand_fold_at_cursor(&mut self) {
+        let folds = self.active_folds();
+        if let Some(run) = fold_run_containing(&folds, self.diff.cursor) {
+            if run.0 == self.diff.cursor {
+                self.folds_expanded.entry(self.nav.selected).or_default().push(run);
+            }
+        }
+    }
+
     fn disp_map(&self, inner_width: usize) -> DispMap {
         // While editing an existing annotation, its saved rows are replaced
         // by the box at the same anchor — count the box, not the saved text.
         let editing_idx = self.editing_annotation_idx();
 
+        let folds = self.active_folds();
         let anchors = self.view_anchors();
         let mut ends: Vec<usize> = Vec::new();
         for (i, p) in self.pending.iter().enumerate().filter(|(_, p)| p.file_idx == self.nav.selected)
@@ -1371,6 +1635,11 @@ impl<'a> App<'a> {
             // Annotations with no anchor in this view aren't drawn, so they
             // occupy no display rows either.
             let Some((_, row_end)) = anchors.anchor(&p.annotation) else { continue };
+            // Same for annotations whose anchor row is folded away — the
+            // pill's note badge stands in for them.
+            if fold_run_containing(&folds, row_end).is_some() {
+                continue;
+            }
             let h = comment_height(p.annotation.tag.as_deref(), &p.annotation.comment, inner_width);
             ends.extend(std::iter::repeat(row_end).take(h));
         }
@@ -1379,7 +1648,7 @@ impl<'a> App<'a> {
             let h = editing_box_height(buf, inner_width);
             ends.extend(std::iter::repeat(*row_end).take(h));
         }
-        DispMap::new(ends)
+        DispMap::with_hidden(ends, folds.iter().map(|&(s, e)| (s + 1, e)).collect())
     }
 
     /// Largest useful horizontal pan for the selected file IN THE CURRENT
@@ -1518,6 +1787,8 @@ impl<'a> App<'a> {
                     let base = self.diff_base_at(mouse.row, diff_rect);
                     self.diff.cursor = base;
                     self.drag_origin = Some(base);
+                    // Clicking a fold pill expands it in place.
+                    self.expand_fold_at_cursor();
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -1612,6 +1883,11 @@ impl<'a> App<'a> {
     /// (prefilled, replacing rather than duplicating on save).
     fn open_comment_input(&mut self) {
         let cursor = self.diff.cursor;
+        // A fold pill isn't a code row: a comment "on" it would silently
+        // anchor to the hidden line behind it. Expand first, then annotate.
+        if is_fold_head(&self.active_folds(), cursor) && self.visual_anchor.is_none() {
+            return;
+        }
         if let Some(anchor) = self.visual_anchor.take() {
             self.input = Some(InputMode::Comment {
                 buf: String::new(),
@@ -1676,6 +1952,7 @@ impl<'a> App<'a> {
             }
             Focus::Diff => {
                 let row_count = self.view_row_count();
+                let cursor_before = self.diff.cursor;
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count),
                     KeyCode::Char('k') | KeyCode::Up => self.diff.up(),
@@ -1719,7 +1996,13 @@ impl<'a> App<'a> {
                     KeyCode::Char('c') => self.open_comment_input(),
                     KeyCode::Char('x') => self.delete_pending_at_cursor(),
                     KeyCode::Char('t') => self.toggle_view(term_size),
+                    KeyCode::Enter => self.expand_fold_at_cursor(),
                     _ => {}
+                }
+                // Any move that landed inside a fold's hidden tail continues
+                // in its own direction: down past the fold, up onto the pill.
+                if self.diff.cursor != cursor_before {
+                    self.snap_cursor_out_of_folds(self.diff.cursor > cursor_before);
                 }
             }
         }
@@ -1803,16 +2086,24 @@ impl<'a> App<'a> {
             HelpSection {
                 name: "Diff",
                 current: diff_current,
-                rows: vec![
-                    HelpRow::new("j / k", "move cursor"),
-                    HelpRow::new("g / G", "top / bottom"),
-                    HelpRow::new("\u{2190} / \u{2192} (H/L)", "pan left / right"),
-                    HelpRow::new("0", "reset pan"),
-                    HelpRow::new("d / u", "half page down / up"),
-                    HelpRow { key: "n / p", desc: format!("next / prev hunk{hunk_note}") },
-                    HelpRow::new("h / tab", "focus the files"),
-                    HelpRow::new("t", "toggle diff / source view"),
-                ],
+                rows: {
+                    let mut rows = vec![
+                        HelpRow::new("j / k", "move cursor"),
+                        HelpRow::new("g / G", "top / bottom"),
+                        HelpRow::new("\u{2190} / \u{2192} (H/L)", "pan left / right"),
+                        HelpRow::new("0", "reset pan"),
+                        HelpRow::new("d / u", "half page down / up"),
+                        HelpRow { key: "n / p", desc: format!("next / prev hunk{hunk_note}") },
+                        HelpRow::new("h / tab", "focus the files"),
+                        HelpRow::new("t", "toggle diff / source view"),
+                    ];
+                    // Only meaningful while the agent has folded this file
+                    // down to its focus regions.
+                    if !self.active_folds().is_empty() {
+                        rows.push(HelpRow::new("enter", "expand the fold under the cursor"));
+                    }
+                    rows
+                },
             },
             HelpSection {
                 name: "Annotate",
@@ -2278,12 +2569,48 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
         pan_and_clip(line, app.diff.hscroll, inner_width, pinned);
     }
 
+    // Fold collapse (agent-focused source view): each run's head row becomes
+    // its pill and the tail rows disappear. Descending order keeps earlier
+    // indices valid. Must run AFTER the base-row patches above (they index
+    // base rows) and BEFORE comment weaving (whose splice indices below are
+    // fold-compressed). The cursor background is re-applied to the pill
+    // because replacing the head row discarded the patched line.
+    let folds = app.active_folds();
+    for &(s, e) in folds.iter().rev() {
+        if s >= lines.len() {
+            continue;
+        }
+        let notes = app
+            .pending
+            .iter()
+            .filter(|p| p.file_idx == app.nav.selected)
+            .filter(|p| {
+                matches!(anchors.anchor(&p.annotation), Some((rs, re)) if rs <= e && s <= re)
+            })
+            .count();
+        let mut pill = fold_pill_line(e - s + 1, notes);
+        if app.diff.cursor == s {
+            for span in &mut pill.spans {
+                span.style = span.style.bg(CURSOR_BG);
+            }
+        }
+        lines.drain(s + 1..(e + 1).min(lines.len()));
+        lines[s] = pill;
+    }
+    // Fold-compressed display index of a VISIBLE base row: what `row_end`
+    // means as an index into `lines` after the drain above (and before the
+    // comment insertion below).
+    let folded_row = |base: usize| -> usize {
+        base - folds.iter().map(|&(s, e)| if e < base { e - s } else { 0 }).sum::<usize>()
+    };
+
     // Inline comment rows, woven in directly under the lines they annotate
     // (GitHub-style) so feedback sits next to the code instead of living only
     // in the bottom bar. Long comments wrap to the pane width as continuation
     // rows. Must run AFTER all base-row patches above — the patches index
     // base rows, and insertion shifts everything below it. Groups are
     // inserted in descending anchor order to keep earlier indices valid.
+    // Anchors folded away aren't woven — their fold's note badge stands in.
     //
     // While the comment prompt is open (new or edit), the dashed editing box
     // is woven at its anchor instead of a plain preview; when editing an
@@ -2298,14 +2625,21 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
             continue;
         }
         let Some((_, row_end)) = anchors.anchor(&p.annotation) else { continue };
-        groups.entry(row_end).or_default().extend(inline_comment_lines(
+        if fold_run_containing(&folds, row_end).is_some() {
+            continue;
+        }
+        groups.entry(folded_row(row_end)).or_default().extend(inline_comment_lines(
             p.annotation.tag.as_deref(),
             &p.annotation.comment,
             inner_width,
         ));
     }
     if let Some(InputMode::Comment { buf, tag, row_end, .. }) = &app.input {
-        groups.entry(*row_end).or_default().extend(editing_box_lines(buf, *tag, inner_width));
+        groups.entry(folded_row(*row_end)).or_default().extend(editing_box_lines(
+            buf,
+            *tag,
+            inner_width,
+        ));
     }
     for (end, group) in groups.into_iter().rev() {
         let at = (end + 1).min(lines.len());
@@ -3016,6 +3350,361 @@ mod tests {
         assert_eq!(map.total(10), 13);
     }
 
+    fn lr(start: u32, end: u32) -> LineRange {
+        LineRange { start, end }
+    }
+
+    #[test]
+    fn fold_runs_complements_clamps_and_merges_focus_regions() {
+        // Two regions in a 60-line file: fold before, between, and after.
+        assert_eq!(
+            fold_runs(&[lr(10, 15), lr(40, 45)], 60),
+            vec![(0, 8), (15, 38), (45, 59)]
+        );
+        // Region order on the wire doesn't matter.
+        assert_eq!(
+            fold_runs(&[lr(40, 45), lr(10, 15)], 60),
+            fold_runs(&[lr(10, 15), lr(40, 45)], 60)
+        );
+        // A region starting at line 1 leaves no leading fold; one ending at
+        // the last line leaves no trailing fold.
+        assert_eq!(fold_runs(&[lr(1, 5)], 20), vec![(5, 19)]);
+        assert_eq!(fold_runs(&[lr(16, 20)], 20), vec![(0, 14)]);
+        // Whole-file (or over-long) region folds nothing; end clamps.
+        assert_eq!(fold_runs(&[lr(1, 999)], 20), Vec::<(usize, usize)>::new());
+        // No regions at all folds nothing — Some([]) is the "clear" wire form.
+        assert_eq!(fold_runs(&[], 20), Vec::<(usize, usize)>::new());
+        // Degenerate and out-of-file regions are dropped, not errors; if
+        // nothing survives, nothing folds (rather than folding everything).
+        assert_eq!(fold_runs(&[lr(9, 5), lr(0, 4), lr(30, 40)], 20), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn fold_runs_keeps_short_gaps_visible() {
+        // Gap of 2 rows (lines 6-7) between regions: shorter than
+        // MIN_FOLD_LINES, so it stays visible and the regions merge.
+        assert_eq!(fold_runs(&[lr(1, 5), lr(8, 10)], 30), vec![(10, 29)]);
+        // Gap of exactly MIN_FOLD_LINES rows folds.
+        assert_eq!(fold_runs(&[lr(1, 5), lr(9, 10)], 30), vec![(5, 7), (10, 29)]);
+        // Short leading/trailing gaps stay visible too.
+        assert_eq!(fold_runs(&[lr(3, 28)], 30), Vec::<(usize, usize)>::new());
+    }
+
+    #[test]
+    fn fold_aware_disp_map_maps_both_directions() {
+        // 40 base rows; fold runs (5,14) and (30,39): heads 5 and 30 render
+        // as pills, tails (6..=14) and (31..=39) have no display rows.
+        let map = DispMap::with_hidden(vec![], vec![(6, 14), (31, 39)]);
+        assert_eq!(map.disp(0), 0);
+        assert_eq!(map.disp(5), 5); // the pill row itself
+        // Rows inside a tail resolve to their pill.
+        assert_eq!(map.disp(6), 5);
+        assert_eq!(map.disp(14), 5);
+        // First row after the fold sits right under the pill.
+        assert_eq!(map.disp(15), 6);
+        assert_eq!(map.disp(30), 21);
+        assert_eq!(map.total(40), 40 - 9 - 9);
+        // Inverse: display rows land on visible base rows; the pill rows
+        // resolve to the fold heads.
+        assert_eq!(map.base_at(5, 40), 5);
+        assert_eq!(map.base_at(6, 40), 15);
+        assert_eq!(map.base_at(21, 40), 30);
+        for b in [0, 3, 5, 15, 20, 30] {
+            assert_eq!(map.base_at(map.disp(b), 40), b, "round trip for base {b}");
+        }
+    }
+
+    #[test]
+    fn fold_aware_disp_map_composes_with_comment_rows() {
+        // Fold tail (6,14); comments under visible rows 3 and 20; a comment
+        // anchored inside the fold is the BUILDER's job to skip, so the map
+        // never sees it.
+        let map = DispMap::with_hidden(vec![3, 20], vec![(6, 14)]);
+        assert_eq!(map.disp(3), 3);
+        assert_eq!(map.extra_at(3), 1);
+        assert_eq!(map.disp(4), 5); // +1 comment row
+        assert_eq!(map.disp(5), 6); // the pill
+        assert_eq!(map.disp(15), 7);
+        assert_eq!(map.disp(21), 14); // 21 - 9 hidden + 2 comment rows
+        assert_eq!(map.total(30), 30 - 9 + 2);
+        assert_eq!(map.base_at(map.disp(21), 30), 21);
+        // follow_display keeps working through the composed map: jumping the
+        // cursor below the fold scrolls by DISPLAY rows, not base rows.
+        assert_eq!(follow_display(0, 21, &map, 10), map.disp(21) + map.extra_at(21) + 1 - 10);
+    }
+
+    /// A 40-line file on disk plus the sample diff model, in source view
+    /// with an agent-pushed focus on lines 10..=15 and 30..=35 — fold runs
+    /// (0,8), (15,28), (35,39).
+    fn focused_app(request: &ReviewRequest, model: &Result<DiffModel>) -> App<'static> {
+        // Leaked so the test app can borrow 'static — test-only fixture.
+        let request: &'static ReviewRequest = Box::leak(Box::new(request.clone()));
+        let model: &'static Result<DiffModel> = Box::leak(Box::new(match model {
+            Ok(m) => Ok(DiffModel { files: m.files.clone() }),
+            Err(_) => unreachable!("fixture model is always Ok"),
+        }));
+        let mut app = App::new(request, model);
+        app.focus = Focus::Diff;
+        app.apply_goto(
+            &GotoTarget {
+                file: "src/lib.rs".into(),
+                line: 10,
+                view: Some("source".into()),
+                focus: Some(vec![lr(10, 15), lr(30, 35)]),
+            },
+            Size::new(120, 40),
+        );
+        app
+    }
+
+    fn fold_fixture(tag: &str) -> (std::path::PathBuf, ReviewRequest, Result<DiffModel>) {
+        let dir = std::env::temp_dir()
+            .join(format!("herdr-annotator-fold-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).expect("temp dir");
+        let body = (1..=40).map(|n| format!("line{n}();")).collect::<Vec<_>>().join("\n") + "\n";
+        std::fs::write(dir.join("src/lib.rs"), body).expect("write source");
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: dir.to_string_lossy().into_owned(),
+            baseline: None,
+            note: None,
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        (dir, request, model)
+    }
+
+    #[test]
+    fn focus_push_folds_the_source_view_and_lands_on_the_first_region() {
+        let (dir, request, model) = fold_fixture("land");
+        let app = focused_app(&request, &model);
+
+        assert!(app.view == ViewMode::Source);
+        assert_eq!(app.active_folds(), vec![(0, 8), (15, 28), (35, 39)]);
+        assert_eq!(app.diff.cursor, 9, "line 10 = base row 9, the first focused row");
+        // The display shrinks accordingly: 40 rows minus the fold tails.
+        let map = app.disp_map(80);
+        assert_eq!(map.total(40), 40 - 8 - 13 - 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn movement_skips_folded_tails_and_enter_expands_a_pill() {
+        let (dir, request, model) = fold_fixture("move");
+        let mut app = focused_app(&request, &model);
+        let size = Size::new(120, 40);
+
+        // Down from the last row of the first region: the pill head is a
+        // real stop, the tail behind it is not.
+        app.diff.cursor = 14;
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        assert_eq!(app.diff.cursor, 15, "the fold's pill row is a cursor stop");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        assert_eq!(app.diff.cursor, 29, "down through the pill continues past the fold");
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), size);
+        assert_eq!(app.diff.cursor, 15, "up from below the fold stops on the pill");
+
+        // G lands in the trailing fold's tail and falls back to its pill.
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE), size);
+        assert_eq!(app.diff.cursor, 35, "bottom inside a trailing fold stops on its pill");
+
+        // Enter on a pill reveals that run — and only that run.
+        app.diff.cursor = 15;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+        assert_eq!(app.active_folds(), vec![(0, 8), (35, 39)]);
+        // The revealed rows are ordinary cursor stops again.
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        assert_eq!(app.diff.cursor, 16);
+
+        // `c` on a pill is a no-op — a comment there would silently anchor
+        // to the hidden line behind it.
+        app.diff.cursor = 35;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), size);
+        assert!(app.input.is_none(), "no comment box may open on a fold pill");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn goto_into_a_folded_stretch_auto_expands_it() {
+        let (dir, request, model) = fold_fixture("goto");
+        let mut app = focused_app(&request, &model);
+        let size = Size::new(120, 40);
+
+        // Line 20 = base row 19, inside the (15,28) fold: the agent must
+        // never point the reviewer at a hidden row.
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 20, view: None, focus: None },
+            size,
+        );
+        assert_eq!(app.diff.cursor, 19);
+        assert_eq!(app.active_folds(), vec![(0, 8), (35, 39)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_goto_keeps_focus_and_line_zero_clears_without_moving_the_cursor() {
+        let (dir, request, model) = fold_fixture("clear");
+        let mut app = focused_app(&request, &model);
+        let size = Size::new(120, 40);
+
+        // A plain goto inside a focused region disturbs nothing.
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: None, focus: None },
+            size,
+        );
+        assert_eq!(app.active_folds().len(), 3, "a focus-less goto leaves the folds alone");
+
+        // Clearing with the line-0 sentinel unfolds everything and leaves
+        // the cursor where the reviewer had it.
+        app.diff.cursor = 12;
+        app.apply_goto(
+            &GotoTarget {
+                file: "src/lib.rs".into(),
+                line: 0,
+                view: None,
+                focus: Some(vec![]),
+            },
+            size,
+        );
+        assert!(app.active_folds().is_empty(), "Some([]) clears the focus");
+        assert_eq!(app.diff.cursor, 12, "the line-0 sentinel must not move the cursor");
+
+        // A fresh focus after hand-expanding starts fresh (expansions reset).
+        app.apply_goto(
+            &GotoTarget {
+                file: "src/lib.rs".into(),
+                line: 10,
+                view: None,
+                focus: Some(vec![lr(10, 15)]),
+            },
+            size,
+        );
+        assert_eq!(app.active_folds(), vec![(0, 8), (15, 39)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_focus_on_a_file_that_is_not_selected_does_not_steal_the_pane() {
+        let (dir, request, model) = fold_fixture("clear-other");
+        // A second file the reviewer never navigated to, carrying a stale
+        // focus from an earlier push.
+        let model = model.map(|mut m| {
+            let mut other = m.files[0].clone();
+            other.path = "src/other.rs".to_string();
+            m.files.push(other);
+            m
+        });
+        let mut app = focused_app(&request, &model);
+        let size = Size::new(120, 40);
+        app.focus_regions.insert(1, vec![lr(2, 5)]);
+        app.diff.cursor = 12;
+
+        // Agent clears the stale focus on src/other.rs (index 1) while the
+        // reviewer is still on src/lib.rs (index 0). The line-0 sentinel
+        // must only update src/other.rs's stored state — not switch the
+        // pane to it, which would reset the reviewer's cursor.
+        app.apply_goto(
+            &GotoTarget { file: "src/other.rs".into(), line: 0, view: None, focus: Some(vec![]) },
+            size,
+        );
+
+        assert_eq!(app.nav.selected, 0, "clearing another file's focus must not steal the pane");
+        assert_eq!(app.diff.cursor, 12, "the reviewer's cursor must not reset");
+        assert!(!app.focus_regions.contains_key(&1), "src/other.rs's stale focus must be cleared");
+        assert_eq!(app.active_folds().len(), 3, "src/lib.rs's own focus, still selected, must remain");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn focus_lands_on_the_first_surviving_region_not_a_dropped_one() {
+        // fold_runs DROPS a region past the file's end; the landing must
+        // follow the same normalization. Landing on the dropped region's
+        // start used to clamp the cursor to the last row — inside the
+        // trailing fold the surviving region just created — and auto-expand
+        // it away.
+        let (dir, request, model) = fold_fixture("surviving");
+        let mut app = focused_app(&request, &model);
+        let size = Size::new(120, 40);
+
+        app.apply_goto(
+            &GotoTarget {
+                file: "src/lib.rs".into(),
+                line: 100, // what the tool would send: first LISTED region's start
+                view: Some("source".into()),
+                focus: Some(vec![lr(100, 110), lr(10, 15)]),
+            },
+            size,
+        );
+        assert_eq!(
+            app.active_folds(),
+            vec![(0, 8), (15, 39)],
+            "the trailing fold must survive — landing must not auto-expand it"
+        );
+        assert_eq!(app.diff.cursor, 9, "land on the first region that intersects the file");
+
+        // All regions miss the file: folds nothing (fold_runs) and moves
+        // nothing (landing) — one consistent "ignored advisory" outcome.
+        app.diff.cursor = 20;
+        app.apply_goto(
+            &GotoTarget {
+                file: "src/lib.rs".into(),
+                line: 100,
+                view: Some("source".into()),
+                focus: Some(vec![lr(100, 110)]),
+            },
+            size,
+        );
+        assert!(app.active_folds().is_empty());
+        assert_eq!(app.diff.cursor, 20, "a fully out-of-file focus must not move the cursor");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folded_annotation_anchors_leave_the_disp_map_but_count_on_the_pill() {
+        let (dir, request, model) = fold_fixture("notes");
+        let mut app = focused_app(&request, &model);
+
+        // One annotation on a visible line (12), one inside the (15,28)
+        // fold (line 20 = row 19).
+        for (start, end) in [(12u32, 12u32), (20, 21)] {
+            app.pending.push(PendingAnnotation {
+                file_idx: 0,
+                annotation: Annotation {
+                    file: "src/lib.rs".into(),
+                    lines: LineRange { start, end },
+                    side: Side::New,
+                    tag: None,
+                    comment: "note".into(),
+                },
+            });
+        }
+        let map = app.disp_map(80);
+        // Only the visible annotation weaves comment rows; the folded one is
+        // represented by its pill's note badge instead.
+        let visible_comment_rows =
+            comment_height(None, "note", 80);
+        assert_eq!(map.total(40), 40 - 8 - 13 - 4 + visible_comment_rows);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fold_run_helpers_classify_heads_and_tails() {
+        let runs = vec![(5, 14), (30, 39)];
+        assert_eq!(fold_run_containing(&runs, 5), Some((5, 14)));
+        assert_eq!(fold_run_containing(&runs, 14), Some((5, 14)));
+        assert_eq!(fold_run_containing(&runs, 15), None);
+        assert!(is_fold_head(&runs, 5));
+        assert!(is_fold_head(&runs, 30));
+        assert!(!is_fold_head(&runs, 6));
+        assert!(!is_fold_head(&runs, 4));
+    }
+
     #[test]
     fn wrap_comment_wraps_at_words_and_hard_breaks_long_ones() {
         assert_eq!(wrap_comment("short note", 20), vec!["short note"]);
@@ -3289,7 +3978,7 @@ mod tests {
         let size = Size::new(80, 24);
 
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(GotoTarget { file: "src/lib.rs".into(), line: 12, view: None }).unwrap();
+        tx.send(GotoTarget { file: "src/lib.rs".into(), line: 12, view: None, focus: None }).unwrap();
         assert!(!drain_navigation(&mut app, &rx, size), "live channel: not a disconnect");
         assert_eq!(app.diff.cursor, 7, "the pending goto was applied while draining");
 
@@ -3308,7 +3997,7 @@ mod tests {
                               // wrap-to-top bug is visible either way.
 
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 999, view: None },
+            &GotoTarget { file: "src/lib.rs".into(), line: 999, view: None, focus: None },
             Size::new(80, 24),
         );
 
@@ -3344,7 +4033,7 @@ mod tests {
         assert!(app.view == ViewMode::Diff);
 
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(app.view == ViewMode::Source, "explicit source view request must switch");
@@ -3352,13 +4041,13 @@ mod tests {
 
         // Unknown view strings are ignored (advisory), current view kept.
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 1, view: Some("hexdump".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 1, view: Some("hexdump".into()), focus: None },
             size,
         );
         assert!(app.view == ViewMode::Source);
 
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()), focus: None },
             size,
         );
         assert!(app.view == ViewMode::Diff, "explicit diff view request must switch back");
@@ -3368,7 +4057,7 @@ mod tests {
         // save an unrelated range (same rule as the manual toggle).
         app.visual_anchor = Some(3);
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(app.visual_anchor.is_none(), "view switch must clear the visual anchor");
@@ -3378,13 +4067,13 @@ mod tests {
         // the pane must fall back to diff, not show the placeholder, and the
         // effective source→diff change clears a live selection.
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(app.view == ViewMode::Source);
         app.visual_anchor = Some(1);
         app.apply_goto(
-            &GotoTarget { file: "src/gone.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/gone.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(
@@ -3399,13 +4088,13 @@ mod tests {
         // A source request for a file with no usable source is IGNORED —
         // the diff stays on screen, per the documented contract.
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 12, view: Some("diff".into()), focus: None },
             size,
         );
         std::fs::remove_file(dir.join("src/lib.rs")).expect("delete source");
         app.source_cache.clear(); // force a fresh load attempt
         app.apply_goto(
-            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()) },
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: Some("source".into()), focus: None },
             size,
         );
         assert!(
@@ -3428,10 +4117,10 @@ mod tests {
 
         // A goto arrives while typing — must not move the cursor or disturb
         // the open input, but must not be lost either.
-        app.apply_goto(&GotoTarget { file: "src/lib.rs".into(), line: 12, view: None }, size);
+        app.apply_goto(&GotoTarget { file: "src/lib.rs".into(), line: 12, view: None, focus: None }, size);
         assert_eq!(app.diff.cursor, 1, "an open input bar must not be disturbed");
         assert!(app.input.is_some(), "the input bar must stay open");
-        assert!(app.pending_goto.is_some(), "the target must be held, not dropped");
+        assert_eq!(app.pending_gotos.len(), 1, "the target must be held, not dropped");
 
         // Esc cancels the summary prompt and closes the input bar; the held
         // goto should be applied as part of that close, not lost.
@@ -3441,7 +4130,73 @@ mod tests {
             app.diff.cursor, 7,
             "the deferred goto must be applied once the input bar closes"
         );
-        assert!(app.pending_goto.is_none(), "the held target must be consumed, not replayed again");
+        assert!(app.pending_gotos.is_empty(), "the held target must be consumed, not replayed again");
+    }
+
+    #[test]
+    fn a_pending_focus_survives_a_same_file_goto_queued_before_the_input_closes() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(80, 24);
+        app.input = Some(InputMode::Summary { buf: String::new() });
+
+        // The agent's focus push arrives first and is held...
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 10, view: None, focus: Some(vec![lr(10, 15)]) },
+            size,
+        );
+        // ...then a plain goto for the SAME file lands before the input
+        // closes. Its own focus is None ("don't touch"), so the earlier
+        // held focus must survive — the queue replays both in order.
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 2, view: None, focus: None },
+            size,
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), size);
+        assert!(app.input.is_none());
+        assert_eq!(
+            app.focus_regions.get(&0),
+            Some(&vec![lr(10, 15)]),
+            "the first push's focus must not be dropped by the queued goto"
+        );
+    }
+
+    #[test]
+    fn a_pending_focus_survives_a_cross_file_goto_queued_before_the_input_closes() {
+        // The cross-file variant of the test above: focus for file A, then a
+        // goto for file B, both held while an input is open. A latest-only
+        // slot dropped A's focus entirely; the queue replays both in order,
+        // so A's regions are stored AND the pane ends up where the last
+        // push pointed.
+        let request = sample_request();
+        let mut other = sample_file();
+        other.path = "src/other.rs".to_string();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file(), other] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(80, 24);
+        app.input = Some(InputMode::Summary { buf: String::new() });
+
+        app.apply_goto(
+            &GotoTarget { file: "src/lib.rs".into(), line: 10, view: None, focus: Some(vec![lr(10, 15)]) },
+            size,
+        );
+        app.apply_goto(
+            &GotoTarget { file: "src/other.rs".into(), line: 12, view: None, focus: None },
+            size,
+        );
+        assert_eq!(app.pending_gotos.len(), 2, "both pushes must be held");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), size);
+        assert!(app.input.is_none());
+        assert_eq!(
+            app.focus_regions.get(&0),
+            Some(&vec![lr(10, 15)]),
+            "file A's focus must survive the cross-file goto"
+        );
+        assert_eq!(app.nav.selected, 1, "the pane follows the last held push");
+        assert_eq!(app.diff.cursor, 7, "…to file B's target row");
     }
 
     #[test]
