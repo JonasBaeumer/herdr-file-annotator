@@ -30,9 +30,11 @@ noise.
 *frozen* until your verdict (approve, request changes, or cancel) so
 nothing runs past your review.
 
-Also in the box: full mouse support, syntax-highlighted diffs, a `?`
-key-reference overlay, one-command install with checksum-verified binaries,
-and an agent that can never be wedged by a closed pane or timeout.
+Also in the box: full mouse support, syntax-highlighted diffs, code folding
+(fold a long file to just the parts that matter — by hand, or driven by the
+agent as it explains), a `?` key-reference overlay, one-command install with
+checksum-verified binaries, and an agent that can never be wedged by a
+closed pane or timeout.
 
 ## Quick start
 
@@ -66,7 +68,7 @@ That's the whole setup.
 - [Agent setup](docs/agents.md) — registering the MCP server with Claude
   Code, Codex, Gemini CLI, Cursor, and others
 - [Controls](docs/controls.md) — every key and mouse action in the pane
-- [MCP tools](docs/mcp-tools.md) — the four tools, the verdict format, and
+- [MCP tools](docs/mcp-tools.md) — the five tools, the verdict format, and
   guided walkthroughs
 - [Configuration](docs/configuration.md) — pane placement, focus, timeouts
 - [How it works](docs/architecture.md) — the two-mode binary, install

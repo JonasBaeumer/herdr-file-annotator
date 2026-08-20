@@ -178,7 +178,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": FOCUS,
-            "description": "Fold the review pane's source view of one file down to just the line regions you name — for guided walkthroughs of long files where only a few parts matter. Everything between the regions collapses into '⋯ N lines folded ⋯' pills the reviewer can expand with Enter or a click; the pane switches to that file's source view and lands on the first region. Regions are 1-based inclusive {start, end} ranges on the new (post-change) side, listed in the order you'll discuss them; gaps of one or two lines between regions stay visible. Call again with new regions to refocus, or with an empty regions array to clear the focus (whole file visible again, cursor left where the reviewer had it). A later goto into a folded stretch expands it automatically, so you can never strand the reviewer behind a fold. Advisory like goto: unknown files and out-of-range regions are normalized or ignored by the pane, never an error here. Requires an open review — call show_changes first.",
+            "description": "Fold the review pane's source view of one file down to just the line regions you name — for guided walkthroughs of long files where only a few parts matter. Everything between the regions collapses into '⋯ N lines folded ⋯' pills the reviewer can expand with Enter or a click; the pane switches to that file's source view and lands on the first region. Regions are 1-based inclusive {start, end} ranges on the new (post-change) side, listed in the order you'll discuss them; gaps of one or two lines between regions stay visible. Call again with new regions to refocus, or with an empty regions array to clear the agent's focus (cursor left where the reviewer had it). This does not touch folds the reviewer made by hand with f — those stay in place until the reviewer expands them or presses F. A later goto into a folded stretch expands it automatically, so you can never strand the reviewer behind a fold. Advisory like goto: unknown files and out-of-range regions are normalized or ignored by the pane, never an error here. Requires an open review — call show_changes first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -358,7 +358,9 @@ fn handle_focus(args: &Value, active: &mut Option<ActiveReview>) -> Value {
         None => (0, None),
     };
     let summary = if regions.is_empty() {
-        format!("cleared the focus on {file} — the whole file is visible again, cursor untouched")
+        format!(
+            "cleared the focus on {file} — cursor untouched (folds the reviewer made by hand with f, if any, are unaffected)"
+        )
     } else {
         let list = regions
             .iter()
@@ -663,6 +665,26 @@ mod tests {
         assert!(
             cleared["content"][0]["text"].as_str().unwrap().contains("cleared"),
             "{cleared}"
+        );
+
+        release_tx.send(()).unwrap();
+        let _ = handle_collect_review(&json!({ "wait_seconds": 5 }), &mut active);
+        pane.join().unwrap();
+    }
+
+    // A reviewer-made manual fold (from `f`) isn't touched by clearing the
+    // agent's focus, so the reply must not claim the whole file becomes
+    // visible again — only that the agent's own focus is gone.
+    #[test]
+    fn focus_clear_message_does_not_overclaim_full_file_visibility() {
+        let (active_review, pane, release_tx) = open_fake_review();
+        let mut active = Some(active_review);
+
+        let cleared = handle_focus(&json!({ "file": "src/a.rs", "regions": [] }), &mut active);
+        let text = cleared["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("whole file is visible"),
+            "manual folds from f survive a focus clear, so this overclaims: {text}"
         );
 
         release_tx.send(()).unwrap();
