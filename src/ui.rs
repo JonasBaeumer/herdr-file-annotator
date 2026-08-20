@@ -1137,6 +1137,21 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Apply a push's focus payload to file `idx`'s stored focus state:
+    /// `None` leaves it untouched, `Some(empty)` clears it, and
+    /// `Some(regions)` replaces it wholesale and resets any hand-expanded
+    /// folds — a fresh focus starts fresh.
+    fn apply_focus(&mut self, idx: usize, focus: &Option<Vec<LineRange>>) {
+        if let Some(regions) = focus {
+            if regions.is_empty() {
+                self.focus_regions.remove(&idx);
+            } else {
+                self.focus_regions.insert(idx, regions.clone());
+            }
+            self.folds_expanded.remove(&idx);
+        }
+    }
+
     /// Agent-pushed navigation: focus `target.file` at new-side line
     /// `target.line` in the CURRENT view. Advisory by contract — unknown
     /// files are ignored, out-of-range lines clamp, and in diff view a line
@@ -1166,22 +1181,20 @@ impl<'a> App<'a> {
         let Some(idx) = model.files.iter().position(|f| f.path == target.file) else {
             return;
         };
+        // A line-0 push against a file the reviewer isn't currently looking
+        // at only updates that file's stored focus (used to clear a stale
+        // focus after the reviewer has already moved elsewhere) — it must
+        // not steal the pane away to show that file, which file_changed()
+        // below would do by switching nav.selected and resetting the cursor.
+        if target.line == 0 && idx != self.nav.selected {
+            self.apply_focus(idx, &target.focus);
+            return;
+        }
         if idx != self.nav.selected {
             self.nav.selected = idx;
             self.file_changed();
         }
-        // A push that carries focus regions replaces this file's focus
-        // wholesale (empty = clear), and resets any hand-expanded folds —
-        // a fresh focus starts fresh. `None` leaves focus untouched, so a
-        // plain goto never disturbs a focus in force.
-        if let Some(regions) = &target.focus {
-            if regions.is_empty() {
-                self.focus_regions.remove(&idx);
-            } else {
-                self.focus_regions.insert(idx, regions.clone());
-            }
-            self.folds_expanded.remove(&idx);
-        }
+        self.apply_focus(idx, &target.focus);
         // An explicit view request switches the pane before the line maps —
         // advisory like everything else: an unknown view string is ignored,
         // and a source request for a file with no usable source side
@@ -3548,6 +3561,39 @@ mod tests {
             size,
         );
         assert_eq!(app.active_folds(), vec![(0, 8), (15, 39)]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_focus_on_a_file_that_is_not_selected_does_not_steal_the_pane() {
+        let (dir, request, model) = fold_fixture("clear-other");
+        // A second file the reviewer never navigated to, carrying a stale
+        // focus from an earlier push.
+        let model = model.map(|mut m| {
+            let mut other = m.files[0].clone();
+            other.path = "src/other.rs".to_string();
+            m.files.push(other);
+            m
+        });
+        let mut app = focused_app(&request, &model);
+        let size = Size::new(120, 40);
+        app.focus_regions.insert(1, vec![lr(2, 5)]);
+        app.diff.cursor = 12;
+
+        // Agent clears the stale focus on src/other.rs (index 1) while the
+        // reviewer is still on src/lib.rs (index 0). The line-0 sentinel
+        // must only update src/other.rs's stored state — not switch the
+        // pane to it, which would reset the reviewer's cursor.
+        app.apply_goto(
+            &GotoTarget { file: "src/other.rs".into(), line: 0, view: None, focus: Some(vec![]) },
+            size,
+        );
+
+        assert_eq!(app.nav.selected, 0, "clearing another file's focus must not steal the pane");
+        assert_eq!(app.diff.cursor, 12, "the reviewer's cursor must not reset");
+        assert!(!app.focus_regions.contains_key(&1), "src/other.rs's stale focus must be cleared");
+        assert_eq!(app.active_folds().len(), 3, "src/lib.rs's own focus, still selected, must remain");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
