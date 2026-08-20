@@ -13,8 +13,9 @@
 //! - `show_changes` / `goto` / `collect_review` are the non-blocking
 //!   "guided review" trio: `show_changes` opens the pane and returns
 //!   immediately, `goto` pushes navigation to it while the agent narrates in
-//!   chat, and `collect_review` polls for the verdict whenever the agent is
-//!   ready to check.
+//!   chat, `focus` folds a long file down to the regions under discussion,
+//!   and `collect_review` polls for the verdict whenever the agent is ready
+//!   to check.
 //!
 //! At most one review — blocking or non-blocking — is in flight at a time;
 //! that's tracked by the `active: Option<ActiveReview>` state threaded
@@ -29,11 +30,12 @@ use serde_json::{json, Value};
 
 use crate::config::{self, Config};
 use crate::herdr;
-use crate::protocol::{GotoTarget, Handoff, OpenReview, ReviewRequest, ReviewResult, PROTOCOL_VERSION};
+use crate::protocol::{GotoTarget, Handoff, LineRange, OpenReview, ReviewRequest, ReviewResult, PROTOCOL_VERSION};
 
 const REVIEW_CHANGES: &str = "review_changes";
 const SHOW_CHANGES: &str = "show_changes";
 const GOTO: &str = "goto";
+const FOCUS: &str = "focus";
 const COLLECT_REVIEW: &str = "collect_review";
 
 /// A non-blocking review in flight: the open handoff (write half for
@@ -147,7 +149,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": SHOW_CHANGES,
-            "description": "Open a review pane beside this agent and return immediately — for a guided walkthrough where you explain the diff in chat while the human reads it at their own pace. Typical flow: call show_changes to open the pane, call goto once per point you want to highlight as you narrate it, then call collect_review to get the verdict and annotations once you're done (or whenever you want to check). Same arguments as review_changes: baseline, note, working_dir. Unlike review_changes this never blocks and has no timeout — nothing here is waiting on the human, so there's nothing to time out; the review stays open until the reviewer finishes in the pane or you call collect_review. Only one review may be open at a time: fails if one is already open.",
+            "description": "Open a review pane beside this agent and return immediately — for a guided walkthrough where you explain the diff in chat while the human reads it at their own pace. Typical flow: call show_changes to open the pane, call goto once per point you want to highlight as you narrate it (and focus to fold a long file down to just the regions you are discussing), then call collect_review to get the verdict and annotations once you're done (or whenever you want to check). Same arguments as review_changes: baseline, note, working_dir. Unlike review_changes this never blocks and has no timeout — nothing here is waiting on the human, so there's nothing to time out; the review stays open until the reviewer finishes in the pane or you call collect_review. Only one review may be open at a time: fails if one is already open.",
             "inputSchema": review_input_schema(),
         }),
         json!({
@@ -172,6 +174,40 @@ fn tool_descriptors() -> Vec<Value> {
                     }
                 },
                 "required": ["file", "line"]
+            },
+        }),
+        json!({
+            "name": FOCUS,
+            "description": "Fold the review pane's source view of one file down to just the line regions you name — for guided walkthroughs of long files where only a few parts matter. Everything between the regions collapses into '⋯ N lines folded ⋯' pills the reviewer can expand with Enter or a click; the pane switches to that file's source view and lands on the first region. Regions are 1-based inclusive {start, end} ranges on the new (post-change) side, listed in the order you'll discuss them; gaps of one or two lines between regions stay visible. Call again with new regions to refocus, or with an empty regions array to clear the focus (whole file visible again, cursor left where the reviewer had it). A later goto into a folded stretch expands it automatically, so you can never strand the reviewer behind a fold. Advisory like goto: unknown files and out-of-range regions are normalized or ignored by the pane, never an error here. Requires an open review — call show_changes first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Repo-relative path, new/post-change side."
+                    },
+                    "regions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "start": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "First visible line of the region (1-based, inclusive)."
+                                },
+                                "end": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "Last visible line of the region (inclusive)."
+                                }
+                            },
+                            "required": ["start", "end"]
+                        },
+                        "description": "Line regions to keep visible, in narrative order. An empty array clears the focus."
+                    }
+                },
+                "required": ["file", "regions"]
             },
         }),
         json!({
@@ -201,6 +237,7 @@ fn handle_tool_call(params: &Value, config: &Config, active: &mut Option<ActiveR
         REVIEW_CHANGES => handle_review_changes(&args, config, active),
         SHOW_CHANGES => handle_show_changes(&args, config, active),
         GOTO => handle_goto(&args, active),
+        FOCUS => handle_focus(&args, active),
         COLLECT_REVIEW => handle_collect_review(&args, active),
         other => tool_error(format!("unknown tool: {other}")),
     }
@@ -275,6 +312,70 @@ fn handle_goto(args: &Value, active: &mut Option<ActiveReview>) -> Value {
         }
         Err(err) => tool_error(format!(
             "could not push navigation ({err:#}) — the review pane may be gone; call collect_review to check for a verdict"
+        )),
+    }
+}
+
+/// The focus tool rides the same navigation channel as goto: it sends one
+/// GotoTarget whose `focus` carries the regions. A non-empty focus lands on
+/// the first listed region in source view; an empty one clears the focus
+/// with the line-0 "don't move the cursor" sentinel and leaves the current
+/// view alone.
+fn handle_focus(args: &Value, active: &mut Option<ActiveReview>) -> Value {
+    let Some(active_review) = active.as_mut() else {
+        return tool_error("no open review — call show_changes first".to_string());
+    };
+    let file = match args.get("file").and_then(Value::as_str) {
+        Some(f) if !f.is_empty() => f.to_string(),
+        _ => return tool_error("focus requires a non-empty \"file\" argument".to_string()),
+    };
+    let Some(raw) = args.get("regions").and_then(Value::as_array) else {
+        return tool_error(
+            "focus requires \"regions\": an array of {start, end} objects (empty clears the focus)"
+                .to_string(),
+        );
+    };
+    let mut regions = Vec::with_capacity(raw.len());
+    for r in raw {
+        let (Some(start), Some(end)) = (
+            r.get("start").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+            r.get("end").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+        ) else {
+            return tool_error(
+                "each focus region needs integer \"start\" and \"end\" line numbers >= 1"
+                    .to_string(),
+            );
+        };
+        if start < 1 || end < start {
+            return tool_error(format!(
+                "invalid focus region {start}-{end}: needs 1 <= start <= end"
+            ));
+        }
+        regions.push(LineRange { start, end });
+    }
+    let (line, view) = match regions.first() {
+        Some(first) => (first.start, Some("source".to_string())),
+        None => (0, None),
+    };
+    let summary = if regions.is_empty() {
+        format!("cleared the focus on {file} — the whole file is visible again, cursor untouched")
+    } else {
+        let list = regions
+            .iter()
+            .map(|r| format!("{}-{}", r.start, r.end))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "focused {file} on lines {list} in source view — everything between folds into pills the reviewer can expand"
+        )
+    };
+    match active_review.open.goto(&GotoTarget { file, line, view, focus: Some(regions) }) {
+        Ok(()) => json!({
+            "content": [{ "type": "text", "text": format!("{summary} (advisory — an unknown file is ignored by the pane)") }],
+            "isError": false
+        }),
+        Err(err) => tool_error(format!(
+            "could not push the focus ({err:#}) — the review pane may be gone; call collect_review to check for a verdict"
         )),
     }
 }
@@ -534,6 +635,66 @@ mod tests {
         assert_eq!(err["isError"], true);
 
         // Unblock and drain the fake pane so the test doesn't leak a thread.
+        release_tx.send(()).unwrap();
+        let _ = handle_collect_review(&json!({ "wait_seconds": 5 }), &mut active);
+        pane.join().unwrap();
+    }
+
+    #[test]
+    fn focus_pushes_regions_and_an_empty_list_clears_without_moving_the_cursor() {
+        let (active_review, pane, release_tx) = open_fake_review();
+        let mut active = Some(active_review);
+
+        // Regions land in source view on the first listed region.
+        let ok = handle_focus(
+            &json!({ "file": "src/a.rs", "regions": [
+                { "start": 10, "end": 22 }, { "start": 40, "end": 51 }
+            ]}),
+            &mut active,
+        );
+        assert_eq!(ok["isError"], false, "{ok}");
+        let text = ok["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("10-22, 40-51"), "{text}");
+
+        // Empty regions = clear; the reply says so rather than pretending a
+        // region was focused.
+        let cleared = handle_focus(&json!({ "file": "src/a.rs", "regions": [] }), &mut active);
+        assert_eq!(cleared["isError"], false);
+        assert!(
+            cleared["content"][0]["text"].as_str().unwrap().contains("cleared"),
+            "{cleared}"
+        );
+
+        release_tx.send(()).unwrap();
+        let _ = handle_collect_review(&json!({ "wait_seconds": 5 }), &mut active);
+        pane.join().unwrap();
+    }
+
+    #[test]
+    fn focus_validates_its_arguments() {
+        // No open review: same contract as goto.
+        let mut none: Option<ActiveReview> = None;
+        let err = handle_focus(&json!({ "file": "a.rs", "regions": [] }), &mut none);
+        assert_eq!(err["isError"], true);
+
+        let (active_review, pane, release_tx) = open_fake_review();
+        let mut active = Some(active_review);
+
+        // Missing regions, inverted region, and zero line are malformed —
+        // errors here, not values silently normalized (normalization is the
+        // PANE's job for semantically odd but well-formed input).
+        for bad in [
+            json!({ "file": "src/a.rs" }),
+            json!({ "file": "src/a.rs", "regions": [{ "start": 9, "end": 5 }] }),
+            json!({ "file": "src/a.rs", "regions": [{ "start": 0, "end": 5 }] }),
+            json!({ "file": "src/a.rs", "regions": [{ "start": 3 }] }),
+            json!({ "file": "", "regions": [] }),
+        ] {
+            let err = handle_focus(&bad, &mut active);
+            assert_eq!(err["isError"], true, "should reject {bad}");
+        }
+        assert!(active.is_some(), "rejected arguments must not disturb the open review");
+
         release_tx.send(()).unwrap();
         let _ = handle_collect_review(&json!({ "wait_seconds": 5 }), &mut active);
         pane.join().unwrap();
