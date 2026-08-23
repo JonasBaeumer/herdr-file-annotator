@@ -60,6 +60,7 @@ see your notes in place while you keep reading:
 | Keys | Action |
 |---|---|
 | `b` | hide / show the file list column |
+| `[` / `]` | shrink / widen the file list — more room for the code (side-by-side layout only; `0`-width isn't a thing, that's what `b` is for) |
 | `z` | zoom the review pane full-screen (and back) |
 | `t` | toggle diff view ↔ full source view of the file |
 | `?` | key-reference overlay |

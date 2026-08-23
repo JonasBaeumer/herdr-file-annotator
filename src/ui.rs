@@ -789,15 +789,15 @@ fn source_row_to_diff_row(rows: &[DiffRow], cursor: usize) -> usize {
 /// logic as the real layout (header + note + footer chrome, then body_split,
 /// then the diff pane's top/bottom border) — so cursor-following stays
 /// correct in both the side-by-side and stacked layouts.
-fn diff_viewport_rows(term_size: Size, show_navigator: bool) -> usize {
+fn diff_viewport_rows(term_size: Size, show_navigator: bool, nav_width: u16) -> usize {
     let body = Rect::new(0, 0, term_size.width, term_size.height.saturating_sub(3));
-    let (_, diff_area) = body_split(body, show_navigator);
+    let (_, diff_area) = body_split(body, show_navigator, nav_width);
     (diff_area.height.saturating_sub(2) as usize).max(1)
 }
 
 /// Half a screen's worth of diff rows.
-fn half_page(term_size: Size, show_navigator: bool) -> usize {
-    (diff_viewport_rows(term_size, show_navigator) / 2).max(1)
+fn half_page(term_size: Size, show_navigator: bool, nav_width: u16) -> usize {
+    (diff_viewport_rows(term_size, show_navigator, nav_width) / 2).max(1)
 }
 
 /// Display rows a wheel/trackpad tick scrolls the diff.
@@ -812,15 +812,15 @@ const GUTTER_AND_MARKER_COLS: usize = 12;
 
 /// The navigator/diff rects for mouse hit-testing, mirroring `draw`'s
 /// layout: header (1) + note (1) above the body, footer (1) below.
-fn body_rects(term_size: Size, show_navigator: bool) -> (Rect, Rect) {
+fn body_rects(term_size: Size, show_navigator: bool, nav_width: u16) -> (Rect, Rect) {
     let body = Rect::new(0, 2, term_size.width, term_size.height.saturating_sub(3));
-    body_split(body, show_navigator)
+    body_split(body, show_navigator, nav_width)
 }
 
 /// Inner (borderless) width of the diff pane — the wrap width for inline
 /// comments; must match what `draw_diff` derives from its render area.
-fn diff_inner_width(term_size: Size, show_navigator: bool) -> usize {
-    let (_, diff_rect) = body_rects(term_size, show_navigator);
+fn diff_inner_width(term_size: Size, show_navigator: bool, nav_width: u16) -> usize {
+    let (_, diff_rect) = body_rects(term_size, show_navigator, nav_width);
     (diff_rect.width.saturating_sub(2)).max(1) as usize
 }
 
@@ -889,6 +889,10 @@ struct App<'a> {
     drag_origin: Option<usize>,
     /// `b` collapses the file navigator to give the diff the full width.
     show_navigator: bool,
+    /// The reviewer's `[`/`]` navigator-width preference in columns; `0`
+    /// means auto (the 30% default). Clamped at layout time in
+    /// `body_split`, so it survives terminal resizes without going stale.
+    nav_width: u16,
     /// Annotations the reviewer has left so far, in creation order.
     pending: Vec<PendingAnnotation>,
     /// Fully syntax-highlighted body rows per file, keyed by index into
@@ -1053,6 +1057,7 @@ impl<'a> App<'a> {
             visual_anchor: None,
             drag_origin: None,
             show_navigator: true,
+            nav_width: 0,
             pending: Vec::new(),
             row_cache,
             view: ViewMode::Diff,
@@ -1855,7 +1860,7 @@ impl<'a> App<'a> {
     /// never on screen (middle of short rows, tails at the cap), so narrow
     /// panes fine-step down to single columns.
     fn pan_step(&self, term_size: Size) -> usize {
-        let code_cols = diff_inner_width(term_size, self.show_navigator)
+        let code_cols = diff_inner_width(term_size, self.show_navigator, self.nav_width)
             .saturating_sub(GUTTER_AND_MARKER_COLS);
         HSCROLL_STEP.min((code_cols / 2).max(1))
     }
@@ -1895,12 +1900,12 @@ impl<'a> App<'a> {
     /// Display-space scroll follow, run after every key that can move the
     /// cursor or change which comment rows exist.
     fn ensure_cursor_visible(&mut self, term_size: Size) {
-        let map = self.disp_map(diff_inner_width(term_size, self.show_navigator));
+        let map = self.disp_map(diff_inner_width(term_size, self.show_navigator, self.nav_width));
         self.diff.scroll = follow_display(
             self.diff.scroll,
             self.diff.cursor,
             &map,
-            diff_viewport_rows(term_size, self.show_navigator),
+            diff_viewport_rows(term_size, self.show_navigator, self.nav_width),
         );
     }
 
@@ -1924,7 +1929,7 @@ impl<'a> App<'a> {
         if self.input.is_some() {
             return;
         }
-        let (nav_rect, diff_rect) = body_rects(term_size, self.show_navigator);
+        let (nav_rect, diff_rect) = body_rects(term_size, self.show_navigator, self.nav_width);
         let in_nav = rect_contains(nav_rect, mouse.column, mouse.row);
         let in_diff = rect_contains(diff_rect, mouse.column, mouse.row);
 
@@ -2008,14 +2013,14 @@ impl<'a> App<'a> {
         if base_count == 0 {
             return;
         }
-        let map = self.disp_map(diff_inner_width(term_size, self.show_navigator));
+        let map = self.disp_map(diff_inner_width(term_size, self.show_navigator, self.nav_width));
         let max_scroll = map.total(base_count).saturating_sub(1);
         self.diff.scroll = if down {
             (self.diff.scroll + WHEEL_STEP).min(max_scroll)
         } else {
             self.diff.scroll.saturating_sub(WHEEL_STEP)
         };
-        let viewport = diff_viewport_rows(term_size, self.show_navigator);
+        let viewport = diff_viewport_rows(term_size, self.show_navigator, self.nav_width);
         let cursor_disp = map.disp(self.diff.cursor);
         if cursor_disp < self.diff.scroll {
             self.diff.cursor = map.base_at(self.diff.scroll, base_count);
@@ -2108,7 +2113,36 @@ impl<'a> App<'a> {
         }
     }
 
+    /// `[` / `]`: move the navigator/diff boundary by `NAV_RESIZE_STEP`
+    /// columns (shrink / widen the file list). No-op while the navigator is
+    /// hidden and in the stacked layout, where the navigator trades height,
+    /// not width. Starts from the RENDERED width, so the first press works
+    /// from the auto (30%) default too.
+    fn resize_navigator(&mut self, widen: bool, term_size: Size) {
+        if !self.show_navigator || term_size.width < STACK_THRESHOLD {
+            return;
+        }
+        let (nav_rect, _) = body_rects(term_size, true, self.nav_width);
+        let current = nav_rect.width;
+        let target = if widen {
+            current.saturating_add(NAV_RESIZE_STEP)
+        } else {
+            current.saturating_sub(NAV_RESIZE_STEP)
+        };
+        self.nav_width = target.clamp(NAV_MIN_WIDTH, nav_max_width(term_size.width));
+        // The code pane's width changed: comment wrap heights change with
+        // it, so re-follow the cursor against the new display map.
+        self.ensure_cursor_visible(term_size);
+    }
+
     fn handle_nav_key(&mut self, key: KeyEvent, term_size: Size) {
+        // Layout keys, valid from either focus (like `b`): resize the
+        // navigator/diff boundary.
+        match key.code {
+            KeyCode::Char('[') => return self.resize_navigator(false, term_size),
+            KeyCode::Char(']') => return self.resize_navigator(true, term_size),
+            _ => {}
+        }
         match self.focus {
             Focus::Navigator => {
                 let len = self.files().len();
@@ -2134,10 +2168,10 @@ impl<'a> App<'a> {
                     KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count),
                     KeyCode::Char('k') | KeyCode::Up => self.diff.up(),
                     KeyCode::Char('d') | KeyCode::PageDown => {
-                        self.diff.page_down(half_page(term_size, self.show_navigator), row_count)
+                        self.diff.page_down(half_page(term_size, self.show_navigator, self.nav_width), row_count)
                     }
                     KeyCode::Char('u') | KeyCode::PageUp => {
-                        self.diff.page_up(half_page(term_size, self.show_navigator))
+                        self.diff.page_up(half_page(term_size, self.show_navigator, self.nav_width))
                     }
                     // Hunk jumps only mean something in the diff view.
                     KeyCode::Char('n') if self.view == ViewMode::Diff => {
@@ -2306,6 +2340,7 @@ impl<'a> App<'a> {
                 current: false,
                 rows: vec![
                     HelpRow::new("b", "show / hide the files pane"),
+                    HelpRow::new("[ / ]", "shrink / widen the files pane"),
                     HelpRow::new("z", "zoom the pane"),
                     HelpRow::new("?", "toggle this help"),
                 ],
@@ -2587,7 +2622,23 @@ fn draw_empty_message(frame: &mut Frame, area: Rect) {
 /// stack: navigator strip on top, diff below.
 const STACK_THRESHOLD: u16 = 64;
 
-fn body_split(area: Rect, show_navigator: bool) -> (Rect, Rect) {
+/// Narrowest useful navigator: a short filename plus the +N -N counts.
+const NAV_MIN_WIDTH: u16 = 14;
+/// Columns one `[`/`]` press moves the navigator/diff boundary.
+const NAV_RESIZE_STEP: u16 = 4;
+
+/// The widest the navigator may grow in `area`: always leave the code pane
+/// its borders plus a readable stretch of content.
+fn nav_max_width(area_width: u16) -> u16 {
+    area_width.saturating_sub(40).max(NAV_MIN_WIDTH)
+}
+
+/// `nav_width` is the reviewer's `[`/`]` preference in columns; `0` means
+/// "auto" (the 30% default). Preferences are clamped here, at layout time,
+/// so a resize of the terminal re-clamps automatically. Width preferences
+/// only apply to the side-by-side layout — the stacked layout (narrow
+/// panes) keeps its height formula.
+fn body_split(area: Rect, show_navigator: bool, nav_width: u16) -> (Rect, Rect) {
     if !show_navigator {
         // Navigator collapsed (`b`): the diff gets the whole body.
         return (Rect::new(area.x, area.y, 0, 0), area);
@@ -2600,10 +2651,12 @@ fn body_split(area: Rect, show_navigator: bool) -> (Rect, Rect) {
             .split(area);
         return (rows[0], rows[1]);
     }
-    let nav_width = ((area.width as u32 * 30 / 100) as u16).max(24).min(area.width);
+    let auto = ((area.width as u32 * 30 / 100) as u16).max(24);
+    let chosen = if nav_width == 0 { auto } else { nav_width };
+    let nav_cols = chosen.clamp(NAV_MIN_WIDTH, nav_max_width(area.width)).min(area.width);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(nav_width), Constraint::Min(0)])
+        .constraints([Constraint::Length(nav_cols), Constraint::Min(0)])
         .split(area);
     (cols[0], cols[1])
 }
@@ -2619,7 +2672,7 @@ fn pane_block(title: impl std::fmt::Display, focused: bool) -> Block<'static> {
 }
 
 fn draw_panes(frame: &mut Frame, area: Rect, app: &App, files: &[FileDiff]) {
-    let (nav_area, diff_area) = body_split(area, app.show_navigator);
+    let (nav_area, diff_area) = body_split(area, app.show_navigator, app.nav_width);
     if app.show_navigator {
         draw_navigator(frame, nav_area, app, files);
     }
@@ -2627,7 +2680,7 @@ fn draw_panes(frame: &mut Frame, area: Rect, app: &App, files: &[FileDiff]) {
 }
 
 fn draw_panes_with_error(frame: &mut Frame, area: Rect, app: &App, err: &anyhow::Error) {
-    let (nav_area, diff_area) = body_split(area, app.show_navigator);
+    let (nav_area, diff_area) = body_split(area, app.show_navigator, app.nav_width);
     if app.show_navigator {
         draw_navigator(frame, nav_area, app, &[]);
     }
@@ -4327,7 +4380,7 @@ mod tests {
         // Narrow + short terminal: a small diff viewport and a narrow wrap
         // width so a modest amount of typed text wraps into several rows.
         let size = Size::new(30, 12);
-        let viewport = diff_viewport_rows(size, app.show_navigator);
+        let viewport = diff_viewport_rows(size, app.show_navigator, app.nav_width);
 
         // Move the cursor to the LAST row (sample_file flattens to 8 rows:
         // 0..=7) so the comment box opens right at the viewport's bottom.
@@ -4347,7 +4400,7 @@ mod tests {
 
         // The box's bottom row must stay inside the viewport — the same
         // invariant `ensure_cursor_visible` maintains after every other key.
-        let map = app.disp_map(diff_inner_width(size, app.show_navigator));
+        let map = app.disp_map(diff_inner_width(size, app.show_navigator, app.nav_width));
         let dc = map.disp(app.diff.cursor);
         let tail = dc + map.extra_at(app.diff.cursor);
         assert!(
@@ -5351,8 +5404,8 @@ mod tests {
         assert!(app.handle_key(key, term).is_none());
         assert!(app.show_navigator);
 
-        let map = app.disp_map(diff_inner_width(term, true));
-        let viewport = diff_viewport_rows(term, true);
+        let map = app.disp_map(diff_inner_width(term, true, 0));
+        let viewport = diff_viewport_rows(term, true, 0);
         let cursor_disp = map.disp(app.diff.cursor);
         assert!(
             cursor_disp >= app.diff.scroll && cursor_disp < app.diff.scroll + viewport,
@@ -5424,22 +5477,78 @@ mod tests {
     fn narrow_body_stacks_navigator_above_diff() {
         // 40 cols (the width the e2e run hit): side-by-side leaves no room
         // for code, so the split must go vertical.
-        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30), true);
+        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30), true, 0);
         assert_eq!(nav.width, 40);
         assert_eq!(diff.width, 40);
         assert!(nav.height >= 4 && nav.height <= 10);
         assert_eq!(nav.y + nav.height, diff.y);
 
         // Wide pane keeps the horizontal split with the 24-col floor.
-        let (nav, diff) = body_split(Rect::new(0, 0, 120, 30), true);
+        let (nav, diff) = body_split(Rect::new(0, 0, 120, 30), true, 0);
         assert_eq!(nav.height, 30);
         assert_eq!(nav.width, 36);
         assert_eq!(nav.x + nav.width, diff.x);
 
         // Collapsed navigator: the diff takes the whole body at any width.
-        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30), false);
+        let (nav, diff) = body_split(Rect::new(0, 0, 40, 30), false, 0);
         assert_eq!(nav.width, 0);
         assert_eq!(diff, Rect::new(0, 0, 40, 30));
+    }
+
+    #[test]
+    fn body_split_honors_and_clamps_a_navigator_width_preference() {
+        let area = Rect::new(0, 0, 120, 30);
+        // An explicit preference replaces the 30% auto width.
+        let (nav, diff) = body_split(area, true, 20);
+        assert_eq!(nav.width, 20);
+        assert_eq!(nav.width + diff.width, 120);
+        // Preferences clamp: never narrower than NAV_MIN_WIDTH, never so
+        // wide the code pane drops below its readable floor.
+        assert_eq!(body_split(area, true, 2).0.width, NAV_MIN_WIDTH);
+        assert_eq!(body_split(area, true, 200).0.width, nav_max_width(120));
+        // 0 = auto: unchanged 30%/min-24 behavior.
+        assert_eq!(body_split(area, true, 0).0.width, 36);
+        // The stacked layout ignores width preferences entirely.
+        let (nav, _) = body_split(Rect::new(0, 0, 40, 30), true, 20);
+        assert_eq!(nav.width, 40, "stacked layout keeps full-width rows");
+    }
+
+    #[test]
+    fn bracket_keys_resize_the_navigator_and_respect_the_clamps() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+
+        // First press starts from the RENDERED auto width (36 at 120 cols).
+        app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), size);
+        assert_eq!(app.nav_width, 36 + NAV_RESIZE_STEP);
+        app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), size);
+        assert_eq!(app.nav_width, 36 - NAV_RESIZE_STEP);
+
+        // Shrinking bottoms out at NAV_MIN_WIDTH...
+        for _ in 0..20 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), size);
+        }
+        assert_eq!(app.nav_width, NAV_MIN_WIDTH);
+        // ...and widening tops out where the code pane stays readable.
+        for _ in 0..40 {
+            app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), size);
+        }
+        assert_eq!(app.nav_width, nav_max_width(120));
+
+        // Hidden navigator: the keys are inert, the preference untouched.
+        let before = app.nav_width;
+        app.show_navigator = false;
+        app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), size);
+        assert_eq!(app.nav_width, before);
+        app.show_navigator = true;
+
+        // Stacked layout (narrow pane): no width to trade, keys inert.
+        let narrow = Size::new(50, 40);
+        app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), narrow);
+        assert_eq!(app.nav_width, before);
     }
 
     #[test]
