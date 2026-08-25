@@ -2627,10 +2627,14 @@ const NAV_MIN_WIDTH: u16 = 14;
 /// Columns one `[`/`]` press moves the navigator/diff boundary.
 const NAV_RESIZE_STEP: u16 = 4;
 
+/// Columns the diff pane always keeps, even when the navigator is maxed
+/// out: its two borders plus a readable stretch of code.
+const DIFF_READABLE_FLOOR: u16 = 40;
+
 /// The widest the navigator may grow in `area`: always leave the code pane
 /// its borders plus a readable stretch of content.
 fn nav_max_width(area_width: u16) -> u16 {
-    area_width.saturating_sub(40).max(NAV_MIN_WIDTH)
+    area_width.saturating_sub(DIFF_READABLE_FLOOR).max(NAV_MIN_WIDTH)
 }
 
 /// `nav_width` is the reviewer's `[`/`]` preference in columns; `0` means
@@ -5505,7 +5509,9 @@ mod tests {
         // Preferences clamp: never narrower than NAV_MIN_WIDTH, never so
         // wide the code pane drops below its readable floor.
         assert_eq!(body_split(area, true, 2).0.width, NAV_MIN_WIDTH);
-        assert_eq!(body_split(area, true, 200).0.width, nav_max_width(120));
+        // 120-col area, 40-col diff floor: pin the concrete boundary so a
+        // regression in DIFF_READABLE_FLOOR or the formula is caught here.
+        assert_eq!(body_split(area, true, 200).0.width, 80);
         // 0 = auto: unchanged 30%/min-24 behavior.
         assert_eq!(body_split(area, true, 0).0.width, 36);
         // The stacked layout ignores width preferences entirely.
@@ -5536,7 +5542,7 @@ mod tests {
         for _ in 0..40 {
             app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), size);
         }
-        assert_eq!(app.nav_width, nav_max_width(120));
+        assert_eq!(app.nav_width, 80);
 
         // Hidden navigator: the keys are inert, the preference untouched.
         let before = app.nav_width;
