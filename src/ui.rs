@@ -897,6 +897,11 @@ struct App<'a> {
     /// divider is resizing the split — the drag moves the boundary instead
     /// of growing a selection. Cleared on button release.
     resizing_navigator: bool,
+    /// `grab column − diff_rect.x` at the moment a divider drag started: 0
+    /// or -1, since `on_divider` accepts either border. Subtracted back out
+    /// on every drag so the split moves by the pointer's actual delta
+    /// regardless of which of the two columns was grabbed.
+    resize_grab_offset: i32,
     /// Annotations the reviewer has left so far, in creation order.
     pending: Vec<PendingAnnotation>,
     /// Fully syntax-highlighted body rows per file, keyed by index into
@@ -1063,6 +1068,7 @@ impl<'a> App<'a> {
             show_navigator: true,
             nav_width: 0,
             resizing_navigator: false,
+            resize_grab_offset: 0,
             pending: Vec::new(),
             row_cache,
             view: ViewMode::Diff,
@@ -1971,6 +1977,7 @@ impl<'a> App<'a> {
                 self.resizing_navigator = false;
                 if self.on_divider(mouse.column, mouse.row, term_size) {
                     self.resizing_navigator = true;
+                    self.resize_grab_offset = mouse.column as i32 - diff_rect.x as i32;
                     return;
                 }
                 if in_nav {
@@ -1996,8 +2003,8 @@ impl<'a> App<'a> {
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.resizing_navigator {
-                    self.nav_width =
-                        mouse.column.clamp(NAV_MIN_WIDTH, nav_max_width(term_size.width));
+                    let target = (mouse.column as i32 - self.resize_grab_offset).max(0) as u16;
+                    self.nav_width = target.clamp(NAV_MIN_WIDTH, nav_max_width(term_size.width));
                     self.ensure_cursor_visible(term_size);
                     return;
                 }
@@ -5583,6 +5590,28 @@ mod tests {
         let narrow = Size::new(50, 40);
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 10), narrow);
         assert!(!app.resizing_navigator);
+    }
+
+    #[test]
+    fn grabbing_either_divider_column_tracks_the_same_pointer_delta() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let size = Size::new(120, 40);
+        // Auto width 36 at 120 cols: the divider spans columns 35 (nav's
+        // right border) and 36 (diff's left border) — either grabs it.
+        // Grabbing the OTHER column (35, not 36) must still track the
+        // pointer 1:1 instead of jumping or going dead for one direction.
+
+        let mut left = App::new(&request, &model);
+        left.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 10), size);
+        assert!(left.resizing_navigator);
+        left.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 34, 10), size);
+        assert_eq!(left.nav_width, 35, "a 1-column move must change the width by 1, not 2");
+
+        let mut right = App::new(&request, &model);
+        right.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 35, 10), size);
+        right.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 36, 10), size);
+        assert_eq!(right.nav_width, 37, "a 1-column move must not be a dead zone");
     }
 
     #[test]
