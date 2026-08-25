@@ -2129,10 +2129,9 @@ impl<'a> App<'a> {
         } else {
             current.saturating_sub(NAV_RESIZE_STEP)
         };
+        // `handle_key` re-follows the cursor for every key right after
+        // `handle_nav_key` returns, so this doesn't need to do it again.
         self.nav_width = target.clamp(NAV_MIN_WIDTH, nav_max_width(term_size.width));
-        // The code pane's width changed: comment wrap heights change with
-        // it, so re-follow the cursor against the new display map.
-        self.ensure_cursor_visible(term_size);
     }
 
     fn handle_nav_key(&mut self, key: KeyEvent, term_size: Size) {
