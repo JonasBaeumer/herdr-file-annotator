@@ -893,6 +893,10 @@ struct App<'a> {
     /// means auto (the 30% default). Clamped at layout time in
     /// `body_split`, so it survives terminal resizes without going stale.
     nav_width: u16,
+    /// True while a left-button drag that started on the navigator/diff
+    /// divider is resizing the split — the drag moves the boundary instead
+    /// of growing a selection. Cleared on button release.
+    resizing_navigator: bool,
     /// Annotations the reviewer has left so far, in creation order.
     pending: Vec<PendingAnnotation>,
     /// Fully syntax-highlighted body rows per file, keyed by index into
@@ -1058,6 +1062,7 @@ impl<'a> App<'a> {
             drag_origin: None,
             show_navigator: true,
             nav_width: 0,
+            resizing_navigator: false,
             pending: Vec::new(),
             row_cache,
             view: ViewMode::Diff,
@@ -1952,6 +1957,12 @@ impl<'a> App<'a> {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // Grabbing the divider starts a resize drag, not a click:
+                // no focus change, no cursor move, no selection origin.
+                if self.on_divider(mouse.column, mouse.row, term_size) {
+                    self.resizing_navigator = true;
+                    return;
+                }
                 if in_nav {
                     if let Some(idx) = self.nav_index_at(mouse.row, nav_rect) {
                         self.focus = Focus::Navigator;
@@ -1974,6 +1985,15 @@ impl<'a> App<'a> {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                // A divider drag moves the boundary to the mouse column,
+                // through the same clamps as `[`/`]` — the divider sits at
+                // the diff's left border, i.e. at x == nav_width.
+                if self.resizing_navigator {
+                    self.nav_width =
+                        mouse.column.clamp(NAV_MIN_WIDTH, nav_max_width(term_size.width));
+                    self.ensure_cursor_visible(term_size);
+                    return;
+                }
                 if let Some(origin) = self.drag_origin {
                     if self.view_row_count() == 0 {
                         return;
@@ -1988,6 +2008,7 @@ impl<'a> App<'a> {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_origin = None;
+                self.resizing_navigator = false;
             }
             MouseEventKind::ScrollRight => {
                 if in_diff {
@@ -2132,6 +2153,21 @@ impl<'a> App<'a> {
         // `handle_key` re-follows the cursor for every key right after
         // `handle_nav_key` returns, so this doesn't need to do it again.
         self.nav_width = target.clamp(NAV_MIN_WIDTH, nav_max_width(term_size.width));
+    }
+
+    /// Whether (`column`, `row`) sits on the navigator/diff divider — the
+    /// navigator's right border or the diff's left border, within the body
+    /// rows. Only meaningful in the side-by-side layout; the stacked layout
+    /// has no vertical divider to grab.
+    fn on_divider(&self, column: u16, row: u16, term_size: Size) -> bool {
+        if !self.show_navigator || term_size.width < STACK_THRESHOLD {
+            return false;
+        }
+        let (nav_rect, diff_rect) = body_rects(term_size, self.show_navigator, self.nav_width);
+        if nav_rect.width == 0 || row < diff_rect.y || row >= diff_rect.y + diff_rect.height {
+            return false;
+        }
+        column + 1 == diff_rect.x || column == diff_rect.x
     }
 
     fn handle_nav_key(&mut self, key: KeyEvent, term_size: Size) {
@@ -2350,6 +2386,7 @@ impl<'a> App<'a> {
                     HelpRow::new("horiz. wheel", "pan the diff"),
                     HelpRow::new("click", "select a file / move the cursor"),
                     HelpRow::new("drag", "select a range in the diff"),
+                    HelpRow::new("drag the divider", "resize the file list"),
                 ],
             },
         ]
@@ -5494,6 +5531,53 @@ mod tests {
         let (nav, diff) = body_split(Rect::new(0, 0, 40, 30), false, 0);
         assert_eq!(nav.width, 0);
         assert_eq!(diff, Rect::new(0, 0, 40, 30));
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    #[test]
+    fn dragging_the_divider_resizes_the_navigator() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+        // Auto width 36 at 120 cols: the divider is the diff's left border
+        // (x == 36) and the navigator's right border (x == 35).
+
+        // Grabbing the divider starts a resize, NOT a selection drag.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36, 10), size);
+        assert!(app.resizing_navigator);
+        assert!(app.drag_origin.is_none(), "a divider grab must not seed a selection");
+
+        // The boundary follows the mouse column, through the same clamps
+        // as the bracket keys.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 25, 10), size);
+        assert_eq!(app.nav_width, 25);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 3, 10), size);
+        assert_eq!(app.nav_width, NAV_MIN_WIDTH);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 119, 10), size);
+        assert_eq!(app.nav_width, nav_max_width(120));
+
+        // Release ends the resize; a later drag is back to selecting.
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 119, 10), size);
+        assert!(!app.resizing_navigator);
+        let width_after = app.nav_width;
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 60, 10), size);
+        assert_eq!(app.nav_width, width_after, "a drag without a divider grab must not resize");
+
+        // A plain click in the diff still clicks (cursor + drag origin),
+        // never resizes.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 90, 10), size);
+        assert!(!app.resizing_navigator);
+        assert!(app.drag_origin.is_some());
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 90, 10), size);
+
+        // Stacked layout: no vertical divider exists to grab.
+        let narrow = Size::new(50, 40);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 10), narrow);
+        assert!(!app.resizing_navigator);
     }
 
     #[test]

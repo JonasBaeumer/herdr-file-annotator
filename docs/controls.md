@@ -65,6 +65,9 @@ see your notes in place while you keep reading:
 | `t` | toggle diff view ↔ full source view of the file |
 | `?` | key-reference overlay |
 
+Mouse: drag the divider between the file list and the code to resize the
+split directly (same clamps as `[` / `]`).
+
 The `t` toggle is global: it switches the reading mode for the whole
 review, so files you navigate to open in the same view. Reviewing the diff
 is the default; the source view shows the finished state of the file with
