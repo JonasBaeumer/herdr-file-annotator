@@ -1966,6 +1966,9 @@ impl<'a> App<'a> {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // Every fresh press starts over, even if a prior resize
+                // never saw its Up (e.g. released outside the terminal).
+                self.resizing_navigator = false;
                 if self.on_divider(mouse.column, mouse.row, term_size) {
                     self.resizing_navigator = true;
                     return;
@@ -5580,6 +5583,26 @@ mod tests {
         let narrow = Size::new(50, 40);
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 10), narrow);
         assert!(!app.resizing_navigator);
+    }
+
+    #[test]
+    fn a_fresh_press_clears_a_resize_flag_stranded_by_a_release_outside_the_pane() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+
+        // Simulate a resize whose Up never reached the app (button released
+        // outside the terminal's captured area).
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36, 10), size);
+        assert!(app.resizing_navigator);
+
+        // The next press, anywhere else, must still start clean.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 90, 10), size);
+        assert!(!app.resizing_navigator, "a fresh press must clear a stranded resize flag");
+        let width_before = app.nav_width;
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 60, 10), size);
+        assert_eq!(app.nav_width, width_before, "the stranded flag must not hijack this selection drag");
     }
 
     #[test]
