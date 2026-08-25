@@ -1983,9 +1983,6 @@ impl<'a> App<'a> {
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                // A divider drag moves the boundary to the mouse column,
-                // through the same clamps as `[`/`]` — the divider sits at
-                // the diff's left border, i.e. at x == nav_width.
                 if self.resizing_navigator {
                     self.nav_width =
                         mouse.column.clamp(NAV_MIN_WIDTH, nav_max_width(term_size.width));
