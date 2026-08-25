@@ -1915,6 +1915,15 @@ impl<'a> App<'a> {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, term_size: Size) {
+        // A button release always ends a drag/resize in progress, even if
+        // help or an input bar opened mid-drag and would otherwise swallow
+        // this event below — the modals must not leak stale drag state into
+        // the next interaction.
+        if let MouseEventKind::Up(MouseButton::Left) = mouse.kind {
+            self.drag_origin = None;
+            self.resizing_navigator = false;
+            return;
+        }
         // The help overlay swallows mouse input the same way it swallows
         // most keys — except the wheel, which scrolls it, since that's easy
         // to support and matches j/k.
@@ -2001,10 +2010,8 @@ impl<'a> App<'a> {
                     self.ensure_cursor_visible(term_size);
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.drag_origin = None;
-                self.resizing_navigator = false;
-            }
+            // Up(Left) is handled unconditionally at the top of this
+            // function, before the modal gates.
             MouseEventKind::ScrollRight => {
                 if in_diff {
                     self.diff.hscroll = self
@@ -5573,6 +5580,31 @@ mod tests {
         let narrow = Size::new(50, 40);
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 20, 10), narrow);
         assert!(!app.resizing_navigator);
+    }
+
+    #[test]
+    fn help_opened_mid_drag_does_not_leak_the_resize_flag_past_release() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+
+        // Grab the divider, then `?` opens help while the button is still
+        // down (a keyboard event, independent of the held mouse button).
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 36, 10), size);
+        assert!(app.resizing_navigator);
+        app.help_open = true;
+        // The release arrives while help owns input and must not be lost.
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 36, 10), size);
+        app.help_open = false;
+        assert!(!app.resizing_navigator, "a release must end the resize even under a modal");
+
+        // A later, unrelated click+drag in the diff must select, not resize.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 90, 10), size);
+        assert!(app.drag_origin.is_some(), "a plain click must still seed a selection origin");
+        let width_before = app.nav_width;
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 60, 10), size);
+        assert_eq!(app.nav_width, width_before, "a stale resize flag must not hijack a selection drag");
     }
 
     #[test]
