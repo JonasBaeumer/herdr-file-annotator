@@ -1957,8 +1957,6 @@ impl<'a> App<'a> {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Grabbing the divider starts a resize drag, not a click:
-                // no focus change, no cursor move, no selection origin.
                 if self.on_divider(mouse.column, mouse.row, term_size) {
                     self.resizing_navigator = true;
                     return;
