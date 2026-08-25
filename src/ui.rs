@@ -216,6 +216,15 @@ enum NavRow {
 /// row's hidden-file count. Files sort by path for display; `file_idx`
 /// keeps pointing into the model's original order, which the rest of the
 /// pane addresses.
+///
+/// Deliberately rebuilt (sort included) on every call, i.e. every draw
+/// tick — reviewed on PR #21 and kept: a pathological 500-file review
+/// measures ~130µs per call in release, ~0.3% of one core at the 50ms
+/// tick, and typical reviews are an order of magnitude smaller. Caching
+/// would buy that back at the price of invalidation tracking across every
+/// `nav_collapsed` mutation site, in a draw path that already clones all
+/// highlighted rows per frame by the same simplicity-first reasoning (see
+/// `row_cache`'s comment).
 fn nav_tree_rows(files: &[FileDiff], collapsed: &HashSet<String>) -> Vec<NavRow> {
     let mut order: Vec<usize> = (0..files.len()).collect();
     order.sort_by(|&a, &b| files[a].path.cmp(&files[b].path));
