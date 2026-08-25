@@ -2136,8 +2136,6 @@ impl<'a> App<'a> {
     }
 
     fn handle_nav_key(&mut self, key: KeyEvent, term_size: Size) {
-        // Layout keys, valid from either focus (like `b`): resize the
-        // navigator/diff boundary.
         match key.code {
             KeyCode::Char('[') => return self.resize_navigator(false, term_size),
             KeyCode::Char(']') => return self.resize_navigator(true, term_size),
