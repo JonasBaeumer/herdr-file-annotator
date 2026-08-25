@@ -2490,7 +2490,7 @@ impl<'a> App<'a> {
                 current: files_current,
                 rows: vec![
                     HelpRow::new("j / k", "move down / up"),
-                    HelpRow::new("g / G", "first / last file"),
+                    HelpRow::new("g / G", "first / last row"),
                     HelpRow::new("l / enter / tab", "open the file / toggle a folder"),
                 ],
             },
@@ -4514,6 +4514,19 @@ mod tests {
         let source_text: String =
             app.help_lines(200).iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(source_text.contains("next / prev hunk \u{2014} inactive in source view"));
+    }
+
+    #[test]
+    fn help_overlay_files_section_calls_g_and_shift_g_row_not_file() {
+        // g/G jump to the first/last visible TREE ROW, which can be a
+        // directory (docs/controls.md: "jump to first / last row"). The
+        // overlay must not promise "file" when the target may be a dir.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: tree_files() });
+        let app = App::new(&request, &model);
+        let text: String = app.help_lines(200).iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("first / last row"));
+        assert!(!text.contains("first / last file"));
     }
 
     #[test]
