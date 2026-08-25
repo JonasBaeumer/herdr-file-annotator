@@ -1357,10 +1357,12 @@ impl<'a> App<'a> {
         if idx != self.nav.selected {
             self.nav.selected = idx;
             self.file_changed();
-            // Agent-pushed selection must stay reachable in the tree —
-            // expand collapsed ancestors and move the tree cursor along.
-            self.reveal_selected_in_tree();
         }
+        // Agent-pushed selection must stay reachable in the tree — expand
+        // collapsed ancestors and move the tree cursor along, on every
+        // effective goto. Not just when the selection changes: the reviewer
+        // may have re-collapsed an ancestor since the last push landed here.
+        self.reveal_selected_in_tree();
         self.apply_focus(idx, &target.focus);
         // An explicit view request switches the pane before the line maps —
         // advisory like everything else: an unknown view string is ignored,
@@ -4756,6 +4758,44 @@ mod tests {
         assert!(!app.nav_collapsed.contains("src"), "goto must expand collapsed ancestors");
         assert!(!app.nav_collapsed.contains("src/ui"));
         assert_eq!(app.files()[app.nav.selected].path, "src/ui/tree.rs");
+        assert!(matches!(
+            app.nav_rows().get(app.nav_cursor),
+            Some(NavRow::File { file_idx, .. }) if app.files()[*file_idx].path == "src/ui/tree.rs"
+        ));
+    }
+
+    #[test]
+    fn goto_reveals_the_target_even_when_it_is_already_selected() {
+        // A goto that lands on the file already selected must still expand
+        // collapsed ancestors: the reviewer may have re-collapsed a dir
+        // after an earlier push revealed it, and a second push for the same
+        // file must not leave it hidden again.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: tree_files() });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+
+        app.apply_goto(
+            &GotoTarget { file: "src/ui/tree.rs".into(), line: 1, view: None, focus: None },
+            size,
+        );
+        assert_eq!(app.files()[app.nav.selected].path, "src/ui/tree.rs");
+
+        // The reviewer collapses the ancestor again without changing the
+        // selected file.
+        app.nav_collapsed.insert("src".to_string());
+        app.nav_collapsed.insert("src/ui".to_string());
+
+        // Same file, different line: idx == nav.selected already.
+        app.apply_goto(
+            &GotoTarget { file: "src/ui/tree.rs".into(), line: 2, view: None, focus: None },
+            size,
+        );
+        assert!(
+            !app.nav_collapsed.contains("src"),
+            "goto must re-expand collapsed ancestors even when the file was already selected"
+        );
+        assert!(!app.nav_collapsed.contains("src/ui"));
         assert!(matches!(
             app.nav_rows().get(app.nav_cursor),
             Some(NavRow::File { file_idx, .. }) if app.files()[*file_idx].path == "src/ui/tree.rs"
