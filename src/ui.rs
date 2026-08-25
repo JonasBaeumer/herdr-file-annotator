@@ -6,7 +6,7 @@
 //! the diff cursor, surfaced as gutter markers and returned to `pane.rs` as
 //! `Outcome::annotations`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -193,28 +193,93 @@ enum ViewMode {
 /// File-list selection, decoupled from rendering so it's plain and testable.
 #[derive(Default)]
 struct NavState {
+    /// The file the diff pane shows — an index into `model.files`. Distinct
+    /// from `App::nav_cursor`, which addresses the navigator's visible tree
+    /// rows (directories included).
     selected: usize,
 }
 
-impl NavState {
-    fn down(&mut self, len: usize) {
-        if len == 0 {
-            self.selected = 0;
-            return;
+/// One visible row of the file navigator's tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NavRow {
+    /// A directory node. `path` is the full dir path ("src/ui"); the shown
+    /// segment is its last component. `hidden` counts the changed files
+    /// inside while collapsed (0 when expanded).
+    Dir { path: String, depth: usize, expanded: bool, hidden: usize },
+    /// A changed file; `file_idx` indexes `model.files`.
+    File { file_idx: usize, depth: usize },
+}
+
+/// Flatten the changed files into the navigator's visible tree rows:
+/// directories in path order, each emitted once, with everything under a
+/// collapsed directory (nested directories included) swallowed into its
+/// row's hidden-file count. Files sort by path for display; `file_idx`
+/// keeps pointing into the model's original order, which the rest of the
+/// pane addresses.
+fn nav_tree_rows(files: &[FileDiff], collapsed: &HashSet<String>) -> Vec<NavRow> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|&a, &b| files[a].path.cmp(&files[b].path));
+
+    let mut rows: Vec<NavRow> = Vec::new();
+    let mut open: Vec<String> = Vec::new(); // dir component stack, e.g. ["src", "src/ui"]
+    for idx in order {
+        let path = &files[idx].path;
+        let components: Vec<&str> = path.split('/').collect();
+        let dirs = &components[..components.len().saturating_sub(1)];
+
+        // Pop dirs the current path has left, keep the shared prefix.
+        let mut shared = 0;
+        for (level, dir) in dirs.iter().enumerate() {
+            let full = if level == 0 { dir.to_string() } else { format!("{}/{dir}", open[level - 1]) };
+            if open.get(level) == Some(&full) {
+                shared = level + 1;
+            } else {
+                break;
+            }
         }
-        self.selected = (self.selected + 1).min(len - 1);
-    }
+        open.truncate(shared);
 
-    fn up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-    }
+        // If an already-open ancestor is collapsed, this file is swallowed
+        // by that ancestor's row.
+        if let Some(swallowing) = open.iter().find(|d| collapsed.contains(*d)) {
+            let swallowing = swallowing.clone();
+            bump_hidden(&mut rows, &swallowing);
+            continue;
+        }
 
-    fn top(&mut self) {
-        self.selected = 0;
+        // Emit the path's remaining new directories; stop at a collapsed one.
+        let mut swallowed = false;
+        for dir in dirs.iter().skip(shared) {
+            let full = match open.last() {
+                Some(parent) => format!("{parent}/{dir}"),
+                None => dir.to_string(),
+            };
+            let depth = open.len();
+            let expanded = !collapsed.contains(&full);
+            rows.push(NavRow::Dir { path: full.clone(), depth, expanded, hidden: 0 });
+            open.push(full.clone());
+            if !expanded {
+                bump_hidden(&mut rows, &full);
+                swallowed = true;
+                break;
+            }
+        }
+        if !swallowed {
+            rows.push(NavRow::File { file_idx: idx, depth: open.len() });
+        }
     }
+    rows
+}
 
-    fn bottom(&mut self, len: usize) {
-        self.selected = len.saturating_sub(1);
+/// Count one more swallowed file on `dir`'s already-emitted row.
+fn bump_hidden(rows: &mut [NavRow], dir: &str) {
+    for row in rows.iter_mut().rev() {
+        if let NavRow::Dir { path, hidden, .. } = row {
+            if path == dir {
+                *hidden += 1;
+                return;
+            }
+        }
     }
 }
 
@@ -897,6 +962,12 @@ struct App<'a> {
     /// divider is resizing the split — the drag moves the boundary instead
     /// of growing a selection. Cleared on button release.
     resizing_navigator: bool,
+    /// Cursor over the navigator's visible tree rows (`nav_rows`) —
+    /// directories AND files. Moving onto a file row selects it; a
+    /// directory row can be toggled without disturbing the selection.
+    nav_cursor: usize,
+    /// Directory paths ("src/ui") the reviewer collapsed in the navigator.
+    nav_collapsed: HashSet<String>,
     /// `grab column − diff_rect.x` at the moment a divider drag started: 0
     /// or -1, since `on_divider` accepts either border. Subtracted back out
     /// on every drag so the split moves by the pointer's actual delta
@@ -1055,7 +1126,7 @@ impl<'a> App<'a> {
                 }
             }
         }
-        App {
+        let mut app = App {
             request,
             model,
             focus: Focus::Navigator,
@@ -1068,6 +1139,8 @@ impl<'a> App<'a> {
             show_navigator: true,
             nav_width: 0,
             resizing_navigator: false,
+            nav_cursor: 0,
+            nav_collapsed: HashSet::new(),
             resize_grab_offset: 0,
             pending: Vec::new(),
             row_cache,
@@ -1080,7 +1153,11 @@ impl<'a> App<'a> {
             focus_regions: HashMap::new(),
             folds_expanded: HashMap::new(),
             manual_folds: HashMap::new(),
-        }
+        };
+        // Start the tree cursor on the selected file's row (the first row
+        // can be a directory when every changed file lives in one).
+        app.reveal_selected_in_tree();
+        app
     }
 
     fn files(&self) -> &[FileDiff] {
@@ -1280,6 +1357,9 @@ impl<'a> App<'a> {
         if idx != self.nav.selected {
             self.nav.selected = idx;
             self.file_changed();
+            // Agent-pushed selection must stay reachable in the tree —
+            // expand collapsed ancestors and move the tree cursor along.
+            self.reveal_selected_in_tree();
         }
         self.apply_focus(idx, &target.focus);
         // An explicit view request switches the pane before the line maps —
@@ -1957,16 +2037,16 @@ impl<'a> App<'a> {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let down = matches!(mouse.kind, MouseEventKind::ScrollDown);
                 if in_nav {
-                    let len = self.files().len();
-                    let before = self.nav.selected;
-                    if down {
-                        self.nav.down(len);
+                    let len = self.nav_rows().len();
+                    if len == 0 {
+                        return;
+                    }
+                    self.nav_cursor = if down {
+                        (self.nav_cursor + 1).min(len - 1)
                     } else {
-                        self.nav.up();
-                    }
-                    if self.nav.selected != before {
-                        self.file_changed();
-                    }
+                        self.nav_cursor.saturating_sub(1)
+                    };
+                    self.select_file_under_cursor();
                 } else if in_diff {
                     self.wheel_diff(down, term_size);
                 }
@@ -1981,11 +2061,14 @@ impl<'a> App<'a> {
                     return;
                 }
                 if in_nav {
-                    if let Some(idx) = self.nav_index_at(mouse.row, nav_rect) {
+                    if let Some(row) = self.nav_index_at(mouse.row, nav_rect) {
                         self.focus = Focus::Navigator;
-                        if idx != self.nav.selected {
-                            self.nav.selected = idx;
-                            self.file_changed();
+                        self.nav_cursor = row;
+                        // A file click selects it; a directory click toggles
+                        // its collapse right away (no second activation).
+                        self.select_file_under_cursor();
+                        if matches!(self.nav_rows().get(row), Some(NavRow::Dir { .. })) {
+                            self.activate_nav_row();
                         }
                     }
                 } else if in_diff && self.view_row_count() > 0 {
@@ -2067,16 +2150,16 @@ impl<'a> App<'a> {
     /// deterministic scroll offset (a fresh ListState per frame scrolls just
     /// enough to keep the selected row visible).
     fn nav_index_at(&self, mouse_row: u16, nav_rect: Rect) -> Option<usize> {
-        let files = self.files();
+        let rows = self.nav_rows();
         let inner_y = nav_rect.y + 1;
         let inner_h = nav_rect.height.saturating_sub(2);
         if inner_h == 0 || mouse_row < inner_y || mouse_row >= inner_y + inner_h {
             return None;
         }
         let inner_h = inner_h as usize;
-        let offset = if self.nav.selected >= inner_h { self.nav.selected + 1 - inner_h } else { 0 };
+        let offset = if self.nav_cursor >= inner_h { self.nav_cursor + 1 - inner_h } else { 0 };
         let idx = offset + (mouse_row - inner_y) as usize;
-        (idx < files.len()).then_some(idx)
+        (idx < rows.len()).then_some(idx)
     }
 
     /// Base row under a mouse row in the diff pane; rows outside the inner
@@ -2182,6 +2265,63 @@ impl<'a> App<'a> {
         column + 1 == diff_rect.x || column == diff_rect.x
     }
 
+    /// The navigator's visible tree rows for the current collapse state.
+    fn nav_rows(&self) -> Vec<NavRow> {
+        nav_tree_rows(self.files(), &self.nav_collapsed)
+    }
+
+    /// Live preview while moving through the tree: landing on a FILE row
+    /// selects it (the diff pane follows, as the flat list always did);
+    /// landing on a directory row leaves the previous file selected.
+    fn select_file_under_cursor(&mut self) {
+        if let Some(NavRow::File { file_idx, .. }) = self.nav_rows().get(self.nav_cursor) {
+            if *file_idx != self.nav.selected {
+                self.nav.selected = *file_idx;
+                self.file_changed();
+            }
+        }
+    }
+
+    /// `l`/`Enter`/`Tab` (or a click) on a navigator row: a file row hands
+    /// focus to the diff, a directory row toggles its collapse. Collapsing
+    /// only removes rows BELOW the directory's own, so the cursor stays on
+    /// the row that was activated.
+    fn activate_nav_row(&mut self) {
+        match self.nav_rows().get(self.nav_cursor) {
+            Some(NavRow::File { .. }) => self.focus = Focus::Diff,
+            Some(NavRow::Dir { path, expanded, .. }) => {
+                if *expanded {
+                    self.nav_collapsed.insert(path.clone());
+                } else {
+                    self.nav_collapsed.remove(path);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Make the selected file reachable in the tree: expand its collapsed
+    /// ancestors and park the tree cursor on its row. Used by agent-pushed
+    /// navigation so a goto never selects a file the navigator is hiding.
+    fn reveal_selected_in_tree(&mut self) {
+        let Some(file) = self.files().get(self.nav.selected) else { return };
+        let path = file.path.clone();
+        let mut prefix = String::new();
+        let components: Vec<&str> = path.split('/').collect();
+        for dir in &components[..components.len().saturating_sub(1)] {
+            prefix = if prefix.is_empty() { dir.to_string() } else { format!("{prefix}/{dir}") };
+            self.nav_collapsed.remove(&prefix);
+        }
+        let selected = self.nav.selected;
+        if let Some(pos) = self
+            .nav_rows()
+            .iter()
+            .position(|r| matches!(r, NavRow::File { file_idx, .. } if *file_idx == selected))
+        {
+            self.nav_cursor = pos;
+        }
+    }
+
     fn handle_nav_key(&mut self, key: KeyEvent, term_size: Size) {
         match key.code {
             KeyCode::Char('[') => return self.resize_navigator(false, term_size),
@@ -2190,20 +2330,31 @@ impl<'a> App<'a> {
         }
         match self.focus {
             Focus::Navigator => {
-                let len = self.files().len();
-                let before = self.nav.selected;
+                let len = self.nav_rows().len();
+                if len == 0 {
+                    return;
+                }
                 match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => self.nav.down(len),
-                    KeyCode::Char('k') | KeyCode::Up => self.nav.up(),
-                    KeyCode::Char('g') => self.nav.top(),
-                    KeyCode::Char('G') => self.nav.bottom(len),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.nav_cursor = (self.nav_cursor + 1).min(len - 1);
+                        self.select_file_under_cursor();
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.nav_cursor = self.nav_cursor.saturating_sub(1);
+                        self.select_file_under_cursor();
+                    }
+                    KeyCode::Char('g') => {
+                        self.nav_cursor = 0;
+                        self.select_file_under_cursor();
+                    }
+                    KeyCode::Char('G') => {
+                        self.nav_cursor = len - 1;
+                        self.select_file_under_cursor();
+                    }
                     KeyCode::Char('l') | KeyCode::Enter | KeyCode::Tab => {
-                        self.focus = Focus::Diff
+                        self.activate_nav_row()
                     }
                     _ => {}
-                }
-                if self.nav.selected != before {
-                    self.file_changed();
                 }
             }
             Focus::Diff => {
@@ -2338,7 +2489,7 @@ impl<'a> App<'a> {
                 rows: vec![
                     HelpRow::new("j / k", "move down / up"),
                     HelpRow::new("g / G", "first / last file"),
-                    HelpRow::new("l / enter / tab", "focus the diff"),
+                    HelpRow::new("l / enter / tab", "open the file / toggle a folder"),
                 ],
             },
             HelpSection {
@@ -2745,29 +2896,57 @@ fn draw_panes_with_error(frame: &mut Frame, area: Rect, app: &App, err: &anyhow:
 
 fn draw_navigator(frame: &mut Frame, area: Rect, app: &App, files: &[FileDiff]) {
     let block = pane_block(format!("files ({})", files.len()), app.focus == Focus::Navigator);
-    let items: Vec<ListItem> = files.iter().map(nav_item).collect();
+    let rows = app.nav_rows();
+    let items: Vec<ListItem> = rows.iter().map(|r| nav_row_item(r, files, app.nav.selected)).collect();
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     let mut state = ListState::default();
-    if !files.is_empty() {
-        state.select(Some(app.nav.selected));
+    if !rows.is_empty() {
+        state.select(Some(app.nav_cursor.min(rows.len() - 1)));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn nav_item(file: &FileDiff) -> ListItem<'_> {
-    let line = Line::from(vec![
-        Span::styled(
-            format!("{} ", file.status.marker()),
-            Style::default().fg(marker_color(file.status)).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!("{} ", file_display_path(file))),
-        Span::styled(format!("+{}", file.adds), Style::default().fg(Color::Green)),
-        Span::raw(" "),
-        Span::styled(format!("-{}", file.dels), Style::default().fg(Color::Red)),
-    ]);
+/// Render one navigator tree row. Files show their basename (the tree
+/// carries the directory context); the file whose diff is on screen is
+/// bold, independent of where the tree cursor is.
+fn nav_row_item(row: &NavRow, files: &[FileDiff], selected: usize) -> ListItem<'static> {
+    let line = match row {
+        NavRow::Dir { path, depth, expanded, hidden } => {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let arrow = if *expanded { '\u{25be}' } else { '\u{25b8}' }; // ▾ / ▸
+            let count = if *hidden > 0 { format!(" ({hidden})") } else { String::new() };
+            Line::from(vec![
+                Span::raw(" ".repeat(depth * 2)),
+                Span::styled(
+                    format!("{arrow} {name}/{count}"),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ])
+        }
+        NavRow::File { file_idx, depth } => {
+            let file = &files[*file_idx];
+            let name = file.path.rsplit('/').next().unwrap_or(&file.path).to_string();
+            let name_style = if *file_idx == selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::raw(" ".repeat(depth * 2)),
+                Span::styled(
+                    format!("{} ", file.status.marker()),
+                    Style::default().fg(marker_color(file.status)).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{name} "), name_style),
+                Span::styled(format!("+{}", file.adds), Style::default().fg(Color::Green)),
+                Span::raw(" "),
+                Span::styled(format!("-{}", file.dels), Style::default().fg(Color::Red)),
+            ])
+        }
+    };
     ListItem::new(line)
 }
 
@@ -4460,25 +4639,127 @@ mod tests {
         );
     }
 
+    fn file_at(path: &str) -> FileDiff {
+        let mut f = sample_file();
+        f.path = path.to_string();
+        f
+    }
+
+    fn tree_files() -> Vec<FileDiff> {
+        ["README.md", "src/main.rs", "src/ui/mod.rs", "src/ui/tree.rs", "tests/e2e.rs"]
+            .iter()
+            .map(|p| file_at(p))
+            .collect()
+    }
+
     #[test]
-    fn nav_state_clamps_to_file_count() {
-        let mut nav = NavState::default();
-        nav.up(); // saturating at 0
-        assert_eq!(nav.selected, 0);
+    fn nav_tree_rows_builds_the_hierarchy_and_swallows_collapsed_subtrees() {
+        let files = tree_files();
+        let rows = nav_tree_rows(&files, &HashSet::new());
+        let dbg: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                NavRow::Dir { path, depth, .. } => format!("{depth}:{path}/"),
+                NavRow::File { file_idx, depth } => format!("{depth}:{}", files[*file_idx].path),
+            })
+            .collect();
+        assert_eq!(
+            dbg,
+            vec![
+                "0:README.md",
+                "0:src/",
+                "1:src/main.rs",
+                "1:src/ui/",
+                "2:src/ui/mod.rs",
+                "2:src/ui/tree.rs",
+                "0:tests/",
+                "1:tests/e2e.rs",
+            ]
+        );
 
-        nav.down(2);
-        assert_eq!(nav.selected, 1);
-        nav.down(2); // already at last index (1)
-        assert_eq!(nav.selected, 1);
+        // Collapsing src/ui swallows its two files into the dir row.
+        let collapsed: HashSet<String> = ["src/ui".to_string()].into();
+        let rows = nav_tree_rows(&files, &collapsed);
+        assert!(rows.iter().any(
+            |r| matches!(r, NavRow::Dir { path, expanded: false, hidden: 2, .. } if path == "src/ui")
+        ));
+        assert!(!rows.iter().any(
+            |r| matches!(r, NavRow::File { file_idx, .. } if files[*file_idx].path.starts_with("src/ui/"))
+        ));
 
-        nav.bottom(5);
-        assert_eq!(nav.selected, 4);
-        nav.top();
-        assert_eq!(nav.selected, 0);
+        // Collapsing src swallows its whole subtree — nested dir included.
+        let collapsed: HashSet<String> = ["src".to_string()].into();
+        let rows = nav_tree_rows(&files, &collapsed);
+        assert!(rows.iter().any(
+            |r| matches!(r, NavRow::Dir { path, expanded: false, hidden: 3, .. } if path == "src")
+        ));
+        assert!(!rows.iter().any(|r| matches!(r, NavRow::Dir { path, .. } if path == "src/ui")));
+        // The sibling top-level entries survive.
+        assert!(rows.iter().any(|r| matches!(r, NavRow::Dir { path, .. } if path == "tests")));
+    }
 
-        // No files: selection pinned to 0.
-        nav.down(0);
-        assert_eq!(nav.selected, 0);
+    #[test]
+    fn navigator_cursor_walks_the_tree_and_enter_toggles_directories() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: tree_files() });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+        assert!(app.focus == Focus::Navigator);
+
+        // Row 0 is README.md (a file): it's the live selection.
+        assert_eq!(app.nav_cursor, 0);
+
+        // j onto the src/ dir row: cursor moves, but the SELECTED file (the
+        // diff on screen) stays README.md.
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        let readme = app.nav.selected;
+        assert!(matches!(app.nav_rows().get(1), Some(NavRow::Dir { path, .. }) if path == "src"));
+        assert_eq!(app.nav.selected, readme, "a dir row must not steal the selection");
+
+        // Enter on the dir collapses it; the cursor stays on its row and
+        // G now lands on the last visible row (tests/e2e.rs).
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+        assert!(app.nav_collapsed.contains("src"));
+        assert_eq!(app.nav_cursor, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE), size);
+        let rows = app.nav_rows();
+        assert!(matches!(
+            rows.get(app.nav_cursor),
+            Some(NavRow::File { file_idx, .. }) if app.files()[*file_idx].path == "tests/e2e.rs"
+        ));
+        assert_eq!(
+            app.files()[app.nav.selected].path,
+            "tests/e2e.rs",
+            "landing on a file row selects it"
+        );
+
+        // Enter re-expands from the dir row.
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), size);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), size);
+        assert!(!app.nav_collapsed.contains("src"));
+    }
+
+    #[test]
+    fn goto_reveals_a_file_hidden_behind_a_collapsed_directory() {
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: tree_files() });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+        app.nav_collapsed.insert("src".to_string());
+        app.nav_collapsed.insert("src/ui".to_string());
+
+        app.apply_goto(
+            &GotoTarget { file: "src/ui/tree.rs".into(), line: 1, view: None, focus: None },
+            size,
+        );
+        assert!(!app.nav_collapsed.contains("src"), "goto must expand collapsed ancestors");
+        assert!(!app.nav_collapsed.contains("src/ui"));
+        assert_eq!(app.files()[app.nav.selected].path, "src/ui/tree.rs");
+        assert!(matches!(
+            app.nav_rows().get(app.nav_cursor),
+            Some(NavRow::File { file_idx, .. }) if app.files()[*file_idx].path == "src/ui/tree.rs"
+        ));
     }
 
     #[test]
