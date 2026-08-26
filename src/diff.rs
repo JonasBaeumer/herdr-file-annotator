@@ -41,6 +41,37 @@ pub enum Origin {
     Remove,
 }
 
+/// Display tab width for source text. Terminals treat `\t` as a jump to the
+/// next tab stop, and ratatui writes cell contents through verbatim, so a
+/// raw tab in a rendered line makes the terminal place every later cell
+/// further right than ratatui's buffer believes it did. Its diff-based
+/// redraw then never repairs those cells, and stale text from earlier
+/// frames piles up on screen (tab-indented Go is the worst case). Expand
+/// tabs before any text reaches the render path so buffer and screen agree.
+pub const TAB_WIDTH: usize = 4;
+
+/// Replace each tab with the spaces needed to reach the next multiple of
+/// [`TAB_WIDTH`] columns, counting the column by characters seen so far
+/// (good enough for the ASCII indentation tabs actually occur in).
+pub fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + TAB_WIDTH * 4);
+    let mut col = 0usize;
+    for ch in text.chars() {
+        if ch == '\t' {
+            let n = TAB_WIDTH - (col % TAB_WIDTH);
+            out.extend(std::iter::repeat(' ').take(n));
+            col += n;
+        } else {
+            out.push(ch);
+            col += 1;
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct DiffLine {
     pub origin: Origin,
@@ -255,7 +286,7 @@ pub fn load_source(working_dir: &str, path: &str) -> Result<Vec<String>> {
         bail!("{} grew past the {}-byte source view limit while reading", full.display(), MAX_SOURCE_BYTES);
     }
 
-    let lines: Vec<String> = buf.lines().map(|line| line.to_string()).collect();
+    let lines: Vec<String> = buf.lines().map(expand_tabs).collect();
     if lines.len() > MAX_SOURCE_LINES {
         bail!(
             "{} has {} lines, over the {}-line source view limit",
@@ -560,6 +591,7 @@ fn parse_hunk(lines: &[&str]) -> Option<(Hunk, usize, u32, u32)> {
             // and let the outer loop resume scanning from this line.
             break;
         };
+        let content = expand_tabs(content);
 
         match origin {
             Origin::Context => {
@@ -567,7 +599,7 @@ fn parse_hunk(lines: &[&str]) -> Option<(Hunk, usize, u32, u32)> {
                     origin,
                     old_no: Some(old_no),
                     new_no: Some(new_no),
-                    content: content.to_string(),
+                    content: content.clone(),
                 });
                 old_no += 1;
                 new_no += 1;
@@ -577,7 +609,7 @@ fn parse_hunk(lines: &[&str]) -> Option<(Hunk, usize, u32, u32)> {
                     origin,
                     old_no: Some(old_no),
                     new_no: None,
-                    content: content.to_string(),
+                    content: content.clone(),
                 });
                 old_no += 1;
                 dels += 1;
@@ -587,7 +619,7 @@ fn parse_hunk(lines: &[&str]) -> Option<(Hunk, usize, u32, u32)> {
                     origin,
                     old_no: None,
                     new_no: Some(new_no),
-                    content: content.to_string(),
+                    content: content.clone(),
                 });
                 new_no += 1;
                 adds += 1;
@@ -598,7 +630,7 @@ fn parse_hunk(lines: &[&str]) -> Option<(Hunk, usize, u32, u32)> {
 
     Some((
         Hunk {
-            header: header.to_string(),
+            header: expand_tabs(header),
             old_start,
             old_count,
             new_start,
@@ -645,6 +677,27 @@ fn git(working_dir: &str, args: &[&str]) -> Result<std::process::Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_tabs_aligns_to_tab_stops() {
+        assert_eq!(expand_tabs("no tabs"), "no tabs");
+        assert_eq!(expand_tabs("\tx"), "    x");
+        assert_eq!(expand_tabs("\t\tx"), "        x");
+        assert_eq!(expand_tabs("ab\tx"), "ab  x");
+        assert_eq!(expand_tabs("abcd\tx"), "abcd    x");
+        assert_eq!(expand_tabs("a\tb\tc"), "a   b   c");
+    }
+
+    #[test]
+    fn parse_expands_tabs_in_body_and_hunk_header() {
+        let raw = "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1,2 +1,2 @@ func\tmain() {\n \tif x {\n-\t\told()\n+\t\tnew()\n \t}\n";
+        let files = parse_unified(raw).unwrap();
+        let hunk = &files[0].hunks[0];
+        assert_eq!(hunk.header, "@@ -1,2 +1,2 @@ func    main() {");
+        let contents: Vec<&str> = hunk.lines.iter().map(|l| l.content.as_str()).collect();
+        assert_eq!(contents, vec!["    if x {", "        old()", "        new()", "    }"]);
+        assert!(contents.iter().all(|c| !c.contains('\t')));
+    }
 
     #[test]
     fn modified_file_two_hunks() {
@@ -1078,5 +1131,22 @@ index 1111111..2222222 100644
             load_source(&wd, "at_limit_lines.txt").is_ok(),
             "a file at the line limit must still load"
         );
+    }
+
+    #[test]
+    fn load_source_expands_tabs() {
+        // parse_expands_tabs_in_body_and_hunk_header covers the parse_hunk
+        // call site into expand_tabs; load_source is a separate call site
+        // (see load_source above) that nothing else exercises directly. A
+        // regression here would reintroduce the terminal corruption this
+        // fix addresses, specifically in source view, while every other
+        // tab-expansion test kept passing.
+        let repo = TempRepo::new("tab_source");
+        repo.write("tabbed.go", "\tif x {\n\t\treturn\n\t}\n");
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let lines = load_source(&wd, "tabbed.go").expect("file loads");
+        assert_eq!(lines, vec!["    if x {", "        return", "    }"]);
+        assert!(lines.iter().all(|l| !l.contains('\t')), "no raw tab must reach the render path");
     }
 }
