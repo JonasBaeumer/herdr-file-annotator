@@ -10,13 +10,20 @@ the box first.)
 
 ## File list
 
+Changed files show as a directory tree: folder rows (`▾ src/`) group the
+files inside them, files show their name with the change counts. Moving
+onto a file row previews it in the diff pane immediately; folder rows can
+be collapsed and expanded without disturbing which file is open — a
+collapsed folder shows how many changed files it's hiding (`▸ src/ (4)`).
+An agent `goto` into a collapsed folder expands it automatically.
+
 | Keys | Action |
 |---|---|
-| `j` / `k` | move selection down / up |
-| `g` / `G` | jump to first / last file |
-| `l` / `Enter` / `Tab` | open the selected file in the diff view |
+| `j` / `k` | move the cursor down / up the tree |
+| `g` / `G` | jump to first / last row |
+| `l` / `Enter` / `Tab` | on a file: focus the diff · on a folder: collapse / expand |
 
-Mouse: wheel moves the selection, click opens a file.
+Mouse: wheel moves the cursor, click opens a file or toggles a folder.
 
 ## Diff view
 
