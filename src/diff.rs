@@ -1132,4 +1132,21 @@ index 1111111..2222222 100644
             "a file at the line limit must still load"
         );
     }
+
+    #[test]
+    fn load_source_expands_tabs() {
+        // parse_expands_tabs_in_body_and_hunk_header covers the parse_hunk
+        // call site into expand_tabs; load_source is a separate call site
+        // (see load_source above) that nothing else exercises directly. A
+        // regression here would reintroduce the terminal corruption this
+        // fix addresses, specifically in source view, while every other
+        // tab-expansion test kept passing.
+        let repo = TempRepo::new("tab_source");
+        repo.write("tabbed.go", "\tif x {\n\t\treturn\n\t}\n");
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let lines = load_source(&wd, "tabbed.go").expect("file loads");
+        assert_eq!(lines, vec!["    if x {", "        return", "    }"]);
+        assert!(lines.iter().all(|l| !l.contains('\t')), "no raw tab must reach the render path");
+    }
 }
