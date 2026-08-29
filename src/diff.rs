@@ -10,6 +10,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
@@ -51,8 +52,11 @@ pub enum Origin {
 pub const TAB_WIDTH: usize = 4;
 
 /// Replace each tab with the spaces needed to reach the next multiple of
-/// [`TAB_WIDTH`] columns, counting the column by characters seen so far
-/// (good enough for the ASCII indentation tabs actually occur in).
+/// [`TAB_WIDTH`] columns, counting the column in TERMINAL CELLS via
+/// unicode-width — the same model the pane's pan/clip math uses — so a tab
+/// after wide (CJK, emoji) or zero-width (combining) characters lands on
+/// the stop the terminal will actually show. Control characters count 0,
+/// matching how the render path treats them.
 pub fn expand_tabs(text: &str) -> String {
     if !text.contains('\t') {
         return text.to_string();
@@ -66,7 +70,7 @@ pub fn expand_tabs(text: &str) -> String {
             col += n;
         } else {
             out.push(ch);
-            col += 1;
+            col += ch.width().unwrap_or(0);
         }
     }
     out
@@ -686,6 +690,20 @@ mod tests {
         assert_eq!(expand_tabs("ab\tx"), "ab  x");
         assert_eq!(expand_tabs("abcd\tx"), "abcd    x");
         assert_eq!(expand_tabs("a\tb\tc"), "a   b   c");
+    }
+
+    #[test]
+    fn expand_tabs_counts_terminal_cells_not_chars() {
+        // Wide char: 界 occupies TWO cells, so only two spaces reach the
+        // 4-column stop (three would land everything after one cell off).
+        assert_eq!(expand_tabs("界\tx"), "界  x");
+        assert_eq!(expand_tabs("界界\tx"), "界界    x"); // col 4 → full stop
+        // Zero-width combining mark: e + U+0301 is ONE cell.
+        assert_eq!(expand_tabs("e\u{301}\tx"), "e\u{301}   x");
+        // Control chars count 0, matching the render path's treatment.
+        assert_eq!(expand_tabs("\u{7}\tx"), "\u{7}    x");
+        // ASCII behavior is byte-identical to before.
+        assert_eq!(expand_tabs("ab\tx"), "ab  x");
     }
 
     #[test]
