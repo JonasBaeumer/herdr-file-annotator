@@ -10,7 +10,8 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
@@ -52,25 +53,30 @@ pub enum Origin {
 pub const TAB_WIDTH: usize = 4;
 
 /// Replace each tab with the spaces needed to reach the next multiple of
-/// [`TAB_WIDTH`] columns, counting the column in TERMINAL CELLS via
-/// unicode-width — the same model the pane's pan/clip math uses — so a tab
-/// after wide (CJK, emoji) or zero-width (combining) characters lands on
-/// the stop the terminal will actually show. Control characters count 0,
-/// matching how the render path treats them.
+/// [`TAB_WIDTH`] columns, counting the column in TERMINAL CELLS: per
+/// GRAPHEME CLUSTER via unicode-width, the exact model the render path
+/// uses (ratatui measures per-grapheme symbols, and unicode-width's string
+/// width is context-sensitive across ZWJ/VS16 sequences — a per-char sum
+/// overcounts a family emoji as 8 cells instead of 2). So a tab after
+/// wide, combining, or multi-codepoint text lands on the stop the
+/// terminal will actually show. Stray control characters count whatever
+/// unicode-width's string width assigns them (1) — the render path's
+/// buffer accounting uses the same measure, and agreeing with the buffer
+/// is this function's entire job.
 pub fn expand_tabs(text: &str) -> String {
     if !text.contains('\t') {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len() + TAB_WIDTH * 4);
     let mut col = 0usize;
-    for ch in text.chars() {
-        if ch == '\t' {
+    for grapheme in text.graphemes(true) {
+        if grapheme == "\t" {
             let n = TAB_WIDTH - (col % TAB_WIDTH);
             out.extend(std::iter::repeat(' ').take(n));
             col += n;
         } else {
-            out.push(ch);
-            col += ch.width().unwrap_or(0);
+            out.push_str(grapheme);
+            col += grapheme.width();
         }
     }
     out
@@ -700,10 +706,22 @@ mod tests {
         assert_eq!(expand_tabs("界界\tx"), "界界    x"); // col 4 → full stop
         // Zero-width combining mark: e + U+0301 is ONE cell.
         assert_eq!(expand_tabs("e\u{301}\tx"), "e\u{301}   x");
-        // Control chars count 0, matching the render path's treatment.
-        assert_eq!(expand_tabs("\u{7}\tx"), "\u{7}    x");
+        // Stray control chars count as unicode-width's string width says
+        // (1) — the same measure the render path's buffer accounting uses.
+        assert_eq!(expand_tabs("\u{7}\tx"), "\u{7}   x");
         // ASCII behavior is byte-identical to before.
         assert_eq!(expand_tabs("ab\tx"), "ab  x");
+    }
+
+    #[test]
+    fn expand_tabs_measures_multi_codepoint_graphemes_as_clusters() {
+        // A ZWJ family emoji is ONE two-cell grapheme; a per-char width
+        // sum calls it 8 and lands the next text two cells past the stop.
+        assert_eq!(expand_tabs("\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}\tx"),
+            format!("\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}  x"));
+        // VS16 forces emoji presentation: U+2764 U+FE0F is one two-cell
+        // grapheme, not a one-cell heart plus an invisible selector.
+        assert_eq!(expand_tabs("\u{2764}\u{FE0F}\tx"), "\u{2764}\u{FE0F}  x");
     }
 
     #[test]
