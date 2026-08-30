@@ -7,7 +7,7 @@
 
 id = "jonasbaeumer.file-annotator"
 name = "File Annotator"
-version = "0.8.0"
+version = "0.8.1"
 min_herdr_version = "0.8.0"
 description = "Agent-summoned, blocking diff review: the agent calls an MCP tool, a review pane opens beside it, and the agent waits for your verdict and line annotations."
 platforms = ["macos", "linux"]
