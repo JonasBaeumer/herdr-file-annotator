@@ -9,7 +9,7 @@ plugin removes the choice, when you and your agent need to meet over actual
 code, a review pane opens right in your workspace, and closes when you're
 done.
 
-![Demo: the agent opens a review pane, walks through the diff while the pane follows, and collects two line-anchored annotations](docs/demo.gif)
+![Demo: the user asks for a walkthrough, the agent opens a review pane and tours the changed files, folds a long file down to the retry loop, and collects two typed line-anchored annotations](docs/demo.gif)
 
 **Annotate the code, not the prompt.** No more dictating "change file X, line
 Z…" into the prompt. Select the lines in the pane, write the note, tag it
