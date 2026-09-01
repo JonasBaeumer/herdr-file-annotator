@@ -1,4 +1,14 @@
-# herdr-file-annotator
+<div align="center">
+  <p>
+    <img src="docs/img/banner.svg" alt="herdr-file-annotator: annotate the code, not the prompt" width="800">
+  </p>
+  <p>
+    <a href="https://github.com/JonasBaeumer/herdr-file-annotator/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/JonasBaeumer/herdr-file-annotator/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI&labelColor=000000" alt="CI status"></a>
+    <a href="https://github.com/JonasBaeumer/herdr-file-annotator/releases"><img src="https://img.shields.io/github/v/release/JonasBaeumer/herdr-file-annotator?style=for-the-badge&logo=github&logoColor=white&color=bd93f9&labelColor=000000" alt="Latest release"></a>
+    <a href="https://herdr.dev"><img src="https://img.shields.io/badge/herdr-%E2%89%A5%200.8.0-bd93f9?style=for-the-badge&labelColor=000000" alt="Requires herdr 0.8.0 or newer"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-bd93f9?style=for-the-badge&labelColor=000000" alt="MIT license"></a>
+  </p>
+</div>
 
 **Maximize agentic development but don't lose touch with the actual codebase.**
 
