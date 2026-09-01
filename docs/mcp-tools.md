@@ -86,7 +86,45 @@ talk you through a diff rather than hand it over cold and wait:
    Nothing landed yet returns `{"status": "pending", ...}` — that's normal,
    the agent just calls it again later. You can also finish in the pane on
    your own schedule at any point; a pane closed without a decision surfaces
-   as a normal `cancelled` verdict, not an error.
+   as a normal `cancelled` verdict, not an error. And if the agent has gone
+   idle by the time you finish, the verdict nudge (below) wakes it for you —
+   you never have to tell it you're done.
+
+## Automatic continuation: the verdict nudge
+
+A non-blocking review has a gap: the agent opens the pane, goes idle, you
+review and finish — and nothing tells the agent feedback is waiting. MCP has
+no way for a server to wake an idle agent, but herdr does: the server knows
+which pane the agent lives in.
+
+So when a verdict lands and no `collect_review` call is waiting on it, the
+server types one line into the agent's own chat and submits it:
+
+> [herdr-annotator] The reviewer finished: request_changes with 3
+> annotations. Call collect_review to fetch the feedback and act on it.
+
+The agent wakes, calls `collect_review`, and acts — a full round trip with
+no human dispatching. The nudge carries only the verdict name and the
+annotation count; the feedback itself stays behind `collect_review`, so the
+verdict is still consumed exactly once through the normal tool path. A pane
+closed without a decision nudges too ("closed without a verdict"), so the
+agent always learns the review is over.
+
+Details worth knowing:
+
+- **No double delivery.** While a `collect_review` call is polling, the
+  nudge is suppressed — the verdict arrives as that call's return value.
+  `review_changes` never nudges; it's blocking, the verdict is its return
+  value.
+- **It looks like you typed it.** The nudge lands in the agent's input as a
+  normal prompt (that's the only door into an idle agent). The
+  `[herdr-annotator]` prefix marks where it came from.
+- **A draft in the input box** gets the nudge appended to it — rare, and
+  worth knowing about; fix up the draft and carry on.
+- **Turning it off:** set `notify_on_verdict = false` in the
+  [config](configuration.md), and collect with `collect_review` as before.
+- It works for any agent CLI running in a herdr pane — nothing about it is
+  specific to one agent.
 
 ![The review pane mid-walkthrough: agent-driven navigation landed on the retry loop, with two annotations already left inline](img/annotations-inline.png)
 

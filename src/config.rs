@@ -41,6 +41,10 @@ pub struct Config {
     pub focus: bool,
     pub accept_timeout: Duration,
     pub review_timeout: Option<Duration>,
+    /// When a non-blocking review's verdict lands with no `collect_review`
+    /// call waiting on it, type a short prompt into the agent's pane so the
+    /// agent picks the feedback up on its own.
+    pub notify_on_verdict: bool,
 }
 
 impl Default for Config {
@@ -51,6 +55,7 @@ impl Default for Config {
             focus: true,
             accept_timeout: Duration::from_secs(DEFAULT_ACCEPT_TIMEOUT_SECS),
             review_timeout: None,
+            notify_on_verdict: true,
         }
     }
 }
@@ -65,6 +70,7 @@ struct RawConfig {
     focus: Option<bool>,
     accept_timeout_secs: Option<u64>,
     review_timeout_secs: Option<u64>,
+    notify_on_verdict: Option<bool>,
 }
 
 /// Load the plugin config, falling back to defaults on any problem. Never
@@ -146,6 +152,7 @@ fn validate(raw: RawConfig) -> Result<Config, String> {
         focus,
         accept_timeout,
         review_timeout,
+        notify_on_verdict: raw.notify_on_verdict.unwrap_or(default.notify_on_verdict),
     })
 }
 
@@ -195,6 +202,7 @@ mod tests {
         assert!(config.focus);
         assert_eq!(config.accept_timeout, Duration::from_secs(20));
         assert_eq!(config.review_timeout, None);
+        assert!(config.notify_on_verdict, "the nudge is on unless the config turns it off");
     }
 
     #[test]
@@ -206,6 +214,7 @@ mod tests {
             focus = false
             accept_timeout_secs = 5
             review_timeout_secs = 600
+            notify_on_verdict = false
             "#,
         )
         .unwrap();
@@ -215,6 +224,7 @@ mod tests {
         assert!(!config.focus);
         assert_eq!(config.accept_timeout, Duration::from_secs(5));
         assert_eq!(config.review_timeout, Some(Duration::from_secs(600)));
+        assert!(!config.notify_on_verdict);
     }
 
     #[test]
