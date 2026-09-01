@@ -438,8 +438,27 @@ fn handle_collect_review(args: &Value, active: &mut Option<ActiveReview>) -> Val
             None => {}
         }
         if wait_seconds == 0 || Instant::now() >= deadline {
+            #[cfg(test)]
+            tests::pending_path_test_hook();
             if let Some(a) = active.as_ref() {
                 a.collector_waiting.store(false, Ordering::SeqCst);
+            }
+            // Look one last time *after* lowering the flag. A verdict
+            // deposited since the loop's check was flagged off the nudge by
+            // the raised flag; if it isn't returned here it is stranded with
+            // no continuation signal at all. Rechecking after the store
+            // guarantees every verdict gets exactly one of: returned by this
+            // call, or nudged.
+            match active.as_ref().and_then(|a| a.open.try_take()) {
+                Some(Ok(result)) => {
+                    *active = None;
+                    return review_result_response(&result);
+                }
+                Some(Err(err)) => {
+                    *active = None;
+                    return tool_error(format!("{err:#}"));
+                }
+                None => {}
             }
             let open_for_secs = active
                 .as_ref()
@@ -598,6 +617,22 @@ mod tests {
     use crate::protocol::{Annotation, LineRange, PaneConnection, Side, Verdict};
     use std::os::unix::net::UnixListener;
 
+    thread_local! {
+        /// Runs at the top of `handle_collect_review`'s pending path, inside
+        /// the race window between the loop's last mailbox check and the
+        /// flag store — lets a test deposit a verdict exactly there.
+        static PENDING_PATH_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn pending_path_test_hook() {
+        PENDING_PATH_HOOK.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f();
+            }
+        });
+    }
+
     /// Stand up a fake pane on a unix socket (same pattern as protocol.rs's
     /// tests) and hand back an `ActiveReview` wired to it, plus the pane's
     /// thread handle and a sender the test uses to release the verdict on
@@ -698,6 +733,37 @@ mod tests {
 
         release_tx.send(()).unwrap();
         let _ = handle_collect_review(&json!({ "wait_seconds": 5 }), &mut active);
+        pane.join().unwrap();
+    }
+
+    #[test]
+    fn a_verdict_landing_inside_the_pending_window_is_returned_not_stranded() {
+        let (active_review, pane, release_tx) = open_fake_review();
+        let mut active = Some(active_review);
+
+        // Deposit the verdict inside the race window: after the loop's last
+        // mailbox check, while collector_waiting is still up (so a wired
+        // nudge would be suppressed). The call must return the verdict —
+        // returning "pending" here strands it with no continuation signal.
+        PENDING_PATH_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _ = release_tx.send(());
+                // Give the pane and mailbox threads time to deposit.
+                std::thread::sleep(Duration::from_millis(500));
+            }));
+        });
+        let out = handle_collect_review(&json!({}), &mut active);
+        PENDING_PATH_HOOK.with(|h| *h.borrow_mut() = None);
+
+        assert_eq!(out["isError"], false);
+        let result: ReviewResult =
+            serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            result.verdict,
+            Verdict::Approve,
+            "a verdict deposited during the pending window must be returned, not stranded behind a suppressed nudge"
+        );
+        assert!(active.is_none(), "collecting a verdict must clear the active review");
         pane.join().unwrap();
     }
 
