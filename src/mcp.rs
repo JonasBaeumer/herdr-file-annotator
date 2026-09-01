@@ -83,7 +83,7 @@ pub fn run() -> Result<()> {
             ("initialize", Some(id)) => Some(result_frame(id, initialize_result(&params))),
             ("ping", Some(id)) => Some(result_frame(id, json!({}))),
             ("tools/list", Some(id)) => {
-                Some(result_frame(id, json!({ "tools": tool_descriptors() })))
+                Some(result_frame(id, json!({ "tools": tool_descriptors(&config) })))
             }
             ("tools/call", Some(id)) => {
                 Some(result_frame(id, handle_tool_call(&params, &config, &mut active)))
@@ -149,7 +149,15 @@ fn review_input_schema() -> Value {
     })
 }
 
-fn tool_descriptors() -> Vec<Value> {
+/// Takes the config because show_changes' description promises the verdict
+/// nudge — a promise that must disappear when `notify_on_verdict = false`,
+/// or the agent waits for a prompt that never comes.
+fn tool_descriptors(config: &Config) -> Vec<Value> {
+    let nudge_promise = if config.notify_on_verdict {
+        " If the reviewer finishes while you are not polling, the server sends a short '[herdr-annotator] The reviewer finished…' prompt into your chat — when you see it, call collect_review and act on the feedback."
+    } else {
+        ""
+    };
     vec![
         json!({
             "name": REVIEW_CHANGES,
@@ -158,7 +166,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": SHOW_CHANGES,
-            "description": "Open a review pane beside this agent and return immediately — for a guided walkthrough where you explain the diff in chat while the human reads it at their own pace. Typical flow: call show_changes to open the pane, call goto once per point you want to highlight as you narrate it (and focus to fold a long file down to just the regions you are discussing), then call collect_review to get the verdict and annotations once you're done (or whenever you want to check). Same arguments as review_changes: baseline, note, working_dir. Unlike review_changes this never blocks and has no timeout — nothing here is waiting on the human, so there's nothing to time out; the review stays open until the reviewer finishes in the pane or you call collect_review. If the reviewer finishes while you are not polling, the server sends a short '[herdr-annotator] The reviewer finished…' prompt into your chat — when you see it, call collect_review and act on the feedback. Only one review may be open at a time: fails if one is already open.",
+            "description": format!("Open a review pane beside this agent and return immediately — for a guided walkthrough where you explain the diff in chat while the human reads it at their own pace. Typical flow: call show_changes to open the pane, call goto once per point you want to highlight as you narrate it (and focus to fold a long file down to just the regions you are discussing), then call collect_review to get the verdict and annotations once you're done (or whenever you want to check). Same arguments as review_changes: baseline, note, working_dir. Unlike review_changes this never blocks and has no timeout — nothing here is waiting on the human, so there's nothing to time out; the review stays open until the reviewer finishes in the pane or you call collect_review.{nudge_promise} Only one review may be open at a time: fails if one is already open."),
             "inputSchema": review_input_schema(),
         }),
         json!({
@@ -590,8 +598,11 @@ fn run_show(args: &Value, config: &Config) -> Result<ActiveReview> {
 /// the normal tool path.
 fn nudge_message(result: &ReviewResult) -> String {
     match result.verdict {
+        // Deliberately neutral about what happens next: a cancellation can be
+        // a deliberate human stop, so the nudge only says the review is over
+        // and leaves the reaction to the agent's own operating instructions.
         Verdict::Cancelled => "[herdr-annotator] The review pane closed without a verdict. \
-             Call collect_review to confirm, then continue."
+             Call collect_review to confirm the cancellation."
             .to_string(),
         verdict => {
             let verdict = serde_json::to_value(verdict)
@@ -765,6 +776,31 @@ mod tests {
         );
         assert!(active.is_none(), "collecting a verdict must clear the active review");
         pane.join().unwrap();
+    }
+
+    #[test]
+    fn show_changes_promises_the_nudge_only_when_the_config_delivers_it() {
+        let on = Config::default();
+        let with_nudge = tool_descriptors(&on);
+        let desc = |tools: &[Value]| {
+            tools
+                .iter()
+                .find(|t| t["name"] == SHOW_CHANGES)
+                .and_then(|t| t["description"].as_str())
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            desc(&with_nudge).contains("[herdr-annotator]"),
+            "with notify_on_verdict on, the description must tell the agent about the nudge"
+        );
+
+        let off = Config { notify_on_verdict: false, ..Config::default() };
+        let without_nudge = tool_descriptors(&off);
+        assert!(
+            !desc(&without_nudge).contains("[herdr-annotator]"),
+            "with notify_on_verdict off, the description must not promise a prompt that never comes"
+        );
     }
 
     #[test]
