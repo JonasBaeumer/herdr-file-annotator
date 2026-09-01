@@ -119,8 +119,10 @@ Details worth knowing:
 - **It looks like you typed it.** The nudge lands in the agent's input as a
   normal prompt (that's the only door into an idle agent). The
   `[herdr-annotator]` prefix marks where it came from.
-- **A draft in the input box** gets the nudge appended to it — rare, and
-  worth knowing about; fix up the draft and carry on.
+- **A draft in the input box** gets the nudge appended to it and submitted
+  along with it — rare, and worth knowing about; if a half-typed instruction
+  went through, restate it. The server cannot see or preserve the pane's
+  input, so this is inherent to typing into the agent's chat.
 - **Turning it off:** set `notify_on_verdict = false` in the
   [config](configuration.md), and collect with `collect_review` as before.
 - It works for any agent CLI running in a herdr pane — nothing about it is
