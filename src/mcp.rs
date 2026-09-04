@@ -22,7 +22,8 @@
 //! through the stdin loop.
 
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -30,7 +31,10 @@ use serde_json::{json, Value};
 
 use crate::config::{self, Config};
 use crate::herdr;
-use crate::protocol::{GotoTarget, Handoff, LineRange, OpenReview, ReviewRequest, ReviewResult, PROTOCOL_VERSION};
+use crate::protocol::{
+    GotoTarget, Handoff, LineRange, OpenReview, ReviewRequest, ReviewResult, Verdict,
+    VerdictNotify, PROTOCOL_VERSION,
+};
 
 const REVIEW_CHANGES: &str = "review_changes";
 const SHOW_CHANGES: &str = "show_changes";
@@ -45,6 +49,11 @@ struct ActiveReview {
     open: OpenReview,
     working_dir: String,
     opened_at: Instant,
+    /// True while a `collect_review` call is checking or waiting for the
+    /// verdict. The mailbox thread's nudge callback reads it: an agent
+    /// already polling gets the verdict as that call's return value, so
+    /// typing a "call collect_review" prompt at it too would be noise.
+    collector_waiting: Arc<AtomicBool>,
 }
 
 pub fn run() -> Result<()> {
@@ -74,7 +83,7 @@ pub fn run() -> Result<()> {
             ("initialize", Some(id)) => Some(result_frame(id, initialize_result(&params))),
             ("ping", Some(id)) => Some(result_frame(id, json!({}))),
             ("tools/list", Some(id)) => {
-                Some(result_frame(id, json!({ "tools": tool_descriptors() })))
+                Some(result_frame(id, json!({ "tools": tool_descriptors(&config) })))
             }
             ("tools/call", Some(id)) => {
                 Some(result_frame(id, handle_tool_call(&params, &config, &mut active)))
@@ -140,7 +149,15 @@ fn review_input_schema() -> Value {
     })
 }
 
-fn tool_descriptors() -> Vec<Value> {
+/// Takes the config because show_changes' description promises the verdict
+/// nudge — a promise that must disappear when `notify_on_verdict = false`,
+/// or the agent waits for a prompt that never comes.
+fn tool_descriptors(config: &Config) -> Vec<Value> {
+    let nudge_promise = if config.notify_on_verdict {
+        " If the reviewer finishes while you are not polling, the server sends a short '[herdr-annotator] The reviewer finished…' prompt into your chat — when you see it, call collect_review and act on the feedback."
+    } else {
+        ""
+    };
     vec![
         json!({
             "name": REVIEW_CHANGES,
@@ -149,7 +166,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": SHOW_CHANGES,
-            "description": "Open a review pane beside this agent and return immediately — for a guided walkthrough where you explain the diff in chat while the human reads it at their own pace. Typical flow: call show_changes to open the pane, call goto once per point you want to highlight as you narrate it (and focus to fold a long file down to just the regions you are discussing), then call collect_review to get the verdict and annotations once you're done (or whenever you want to check). Same arguments as review_changes: baseline, note, working_dir. Unlike review_changes this never blocks and has no timeout — nothing here is waiting on the human, so there's nothing to time out; the review stays open until the reviewer finishes in the pane or you call collect_review. Only one review may be open at a time: fails if one is already open.",
+            "description": format!("Open a review pane beside this agent and return immediately — for a guided walkthrough where you explain the diff in chat while the human reads it at their own pace. Typical flow: call show_changes to open the pane, call goto once per point you want to highlight as you narrate it (and focus to fold a long file down to just the regions you are discussing), then call collect_review to get the verdict and annotations once you're done (or whenever you want to check). Same arguments as review_changes: baseline, note, working_dir. Unlike review_changes this never blocks and has no timeout — nothing here is waiting on the human, so there's nothing to time out; the review stays open until the reviewer finishes in the pane or you call collect_review.{nudge_promise} Only one review may be open at a time: fails if one is already open."),
             "inputSchema": review_input_schema(),
         }),
         json!({
@@ -404,6 +421,14 @@ fn handle_collect_review(args: &Value, active: &mut Option<ActiveReview>) -> Val
     };
     let deadline = Instant::now() + Duration::from_secs(wait_seconds);
 
+    // While this call is checking, a verdict that lands belongs to this
+    // call's return value — flag the mailbox thread off the nudge. The flag
+    // comes back down only on the pending path; once the verdict is taken
+    // the review is gone and there is nothing left to nudge about.
+    if let Some(a) = active.as_ref() {
+        a.collector_waiting.store(true, Ordering::SeqCst);
+    }
+
     loop {
         let taken = active.as_ref().and_then(|a| a.open.try_take());
         match taken {
@@ -421,6 +446,28 @@ fn handle_collect_review(args: &Value, active: &mut Option<ActiveReview>) -> Val
             None => {}
         }
         if wait_seconds == 0 || Instant::now() >= deadline {
+            #[cfg(test)]
+            tests::pending_path_test_hook();
+            if let Some(a) = active.as_ref() {
+                a.collector_waiting.store(false, Ordering::SeqCst);
+            }
+            // Look one last time *after* lowering the flag. A verdict
+            // deposited since the loop's check was flagged off the nudge by
+            // the raised flag; if it isn't returned here it is stranded with
+            // no continuation signal at all. Rechecking after the store
+            // guarantees every verdict gets exactly one of: returned by this
+            // call, or nudged.
+            match active.as_ref().and_then(|a| a.open.try_take()) {
+                Some(Ok(result)) => {
+                    *active = None;
+                    return review_result_response(&result);
+                }
+                Some(Err(err)) => {
+                    *active = None;
+                    return tool_error(format!("{err:#}"));
+                }
+                None => {}
+            }
             let open_for_secs = active
                 .as_ref()
                 .map(|a| a.opened_at.elapsed().as_secs())
@@ -520,13 +567,59 @@ fn run_review(args: &Value, config: &Config) -> Result<ReviewResult> {
 
 fn run_show(args: &Value, config: &Config) -> Result<ActiveReview> {
     let prepared = prepare_handoff(args, config)?;
-    let open = prepared.handoff.open(&prepared.request)?;
+    let collector_waiting = Arc::new(AtomicBool::new(false));
+    let notify: Option<VerdictNotify> = if config.notify_on_verdict {
+        let waiting = Arc::clone(&collector_waiting);
+        Some(Box::new(move |result: &ReviewResult| {
+            if waiting.load(Ordering::SeqCst) {
+                return;
+            }
+            let message = nudge_message(result);
+            if let Err(err) = herdr::nudge_agent_pane(&message) {
+                eprintln!("herdr-annotator mcp: could not deliver the verdict nudge ({err:#})");
+            }
+        }))
+    } else {
+        None
+    };
+    let open = prepared.handoff.open_with_notify(&prepared.request, notify)?;
     eprintln!("herdr-annotator mcp: review pane open, returning control to the agent");
     Ok(ActiveReview {
         open,
         working_dir: prepared.working_dir,
         opened_at: Instant::now(),
+        collector_waiting,
     })
+}
+
+/// The line typed into the agent's pane when a verdict lands unasked. Carries
+/// only the verdict name and the annotation count — the feedback itself stays
+/// behind `collect_review`, so the verdict is consumed exactly once through
+/// the normal tool path.
+fn nudge_message(result: &ReviewResult) -> String {
+    match result.verdict {
+        // Deliberately neutral about what happens next: a cancellation can be
+        // a deliberate human stop, so the nudge only says the review is over
+        // and leaves the reaction to the agent's own operating instructions.
+        Verdict::Cancelled => "[herdr-annotator] The review pane closed without a verdict. \
+             Call collect_review to confirm the cancellation."
+            .to_string(),
+        verdict => {
+            let verdict = serde_json::to_value(verdict)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{verdict:?}"));
+            let annotations = match result.annotations.len() {
+                0 => "no annotations".to_string(),
+                1 => "1 annotation".to_string(),
+                n => format!("{n} annotations"),
+            };
+            format!(
+                "[herdr-annotator] The reviewer finished: {verdict} with {annotations}. \
+                 Call collect_review to fetch the feedback and act on it."
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -534,6 +627,22 @@ mod tests {
     use super::*;
     use crate::protocol::{Annotation, LineRange, PaneConnection, Side, Verdict};
     use std::os::unix::net::UnixListener;
+
+    thread_local! {
+        /// Runs at the top of `handle_collect_review`'s pending path, inside
+        /// the race window between the loop's last mailbox check and the
+        /// flag store — lets a test deposit a verdict exactly there.
+        static PENDING_PATH_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn pending_path_test_hook() {
+        PENDING_PATH_HOOK.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f();
+            }
+        });
+    }
 
     /// Stand up a fake pane on a unix socket (same pattern as protocol.rs's
     /// tests) and hand back an `ActiveReview` wired to it, plus the pane's
@@ -582,7 +691,12 @@ mod tests {
         let _ = std::fs::remove_file(&sock);
 
         (
-            ActiveReview { open, working_dir: "/tmp/repo".into(), opened_at: Instant::now() },
+            ActiveReview {
+                open,
+                working_dir: "/tmp/repo".into(),
+                opened_at: Instant::now(),
+                collector_waiting: Arc::new(AtomicBool::new(false)),
+            },
             pane,
             release_tx,
         )
@@ -613,6 +727,118 @@ mod tests {
         assert!(active.is_none(), "collecting a verdict must clear the active review");
 
         pane.join().unwrap();
+    }
+
+    #[test]
+    fn a_pending_collect_lowers_the_collector_flag_so_a_later_verdict_still_nudges() {
+        let (active_review, pane, release_tx) = open_fake_review();
+        let flag = Arc::clone(&active_review.collector_waiting);
+        let mut active = Some(active_review);
+
+        let pending = handle_collect_review(&json!({}), &mut active);
+        assert_eq!(pending["isError"], false);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the flag must come back down on the pending path — a verdict landing after this call returned belongs to the nudge"
+        );
+
+        release_tx.send(()).unwrap();
+        let _ = handle_collect_review(&json!({ "wait_seconds": 5 }), &mut active);
+        pane.join().unwrap();
+    }
+
+    #[test]
+    fn a_verdict_landing_inside_the_pending_window_is_returned_not_stranded() {
+        let (active_review, pane, release_tx) = open_fake_review();
+        let mut active = Some(active_review);
+
+        // Deposit the verdict inside the race window: after the loop's last
+        // mailbox check, while collector_waiting is still up (so a wired
+        // nudge would be suppressed). The call must return the verdict —
+        // returning "pending" here strands it with no continuation signal.
+        PENDING_PATH_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _ = release_tx.send(());
+                // Give the pane and mailbox threads time to deposit.
+                std::thread::sleep(Duration::from_millis(500));
+            }));
+        });
+        let out = handle_collect_review(&json!({}), &mut active);
+        PENDING_PATH_HOOK.with(|h| *h.borrow_mut() = None);
+
+        assert_eq!(out["isError"], false);
+        let result: ReviewResult =
+            serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            result.verdict,
+            Verdict::Approve,
+            "a verdict deposited during the pending window must be returned, not stranded behind a suppressed nudge"
+        );
+        assert!(active.is_none(), "collecting a verdict must clear the active review");
+        pane.join().unwrap();
+    }
+
+    #[test]
+    fn show_changes_promises_the_nudge_only_when_the_config_delivers_it() {
+        let on = Config::default();
+        let with_nudge = tool_descriptors(&on);
+        let desc = |tools: &[Value]| {
+            tools
+                .iter()
+                .find(|t| t["name"] == SHOW_CHANGES)
+                .and_then(|t| t["description"].as_str())
+                .unwrap()
+                .to_string()
+        };
+        assert!(
+            desc(&with_nudge).contains("[herdr-annotator]"),
+            "with notify_on_verdict on, the description must tell the agent about the nudge"
+        );
+
+        let off = Config { notify_on_verdict: false, ..Config::default() };
+        let without_nudge = tool_descriptors(&off);
+        assert!(
+            !desc(&without_nudge).contains("[herdr-annotator]"),
+            "with notify_on_verdict off, the description must not promise a prompt that never comes"
+        );
+    }
+
+    #[test]
+    fn nudge_messages_carry_the_verdict_and_count_but_never_the_feedback() {
+        let annotation = Annotation {
+            file: "src/lib.rs".into(),
+            lines: LineRange { start: 1, end: 2 },
+            side: Side::New,
+            tag: Some("fix".into()),
+            comment: "secret feedback".into(),
+        };
+        let request_changes = ReviewResult {
+            version: PROTOCOL_VERSION,
+            verdict: Verdict::RequestChanges,
+            summary: Some("secret summary".into()),
+            annotations: vec![annotation.clone(), annotation.clone(), annotation],
+        };
+        let msg = nudge_message(&request_changes);
+        assert!(msg.contains("request_changes with 3 annotations"), "unexpected message: {msg}");
+        assert!(msg.contains("collect_review"), "the nudge must point at the tool: {msg}");
+        assert!(
+            !msg.contains("secret"),
+            "annotation bodies and summaries must stay behind collect_review: {msg}"
+        );
+
+        let approve = ReviewResult {
+            version: PROTOCOL_VERSION,
+            verdict: Verdict::Approve,
+            summary: None,
+            annotations: Vec::new(),
+        };
+        let msg = nudge_message(&approve);
+        assert!(msg.contains("approve with no annotations"), "unexpected message: {msg}");
+
+        let cancelled = ReviewResult::cancelled("review pane closed without a verdict");
+        let msg = nudge_message(&cancelled);
+        assert!(msg.contains("without a verdict"), "unexpected message: {msg}");
+        assert!(msg.contains("collect_review"), "the nudge must point at the tool: {msg}");
     }
 
     #[test]

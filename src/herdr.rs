@@ -35,6 +35,32 @@ pub fn inside_herdr() -> bool {
     std::env::var("HERDR_ENV").as_deref() == Ok("1")
 }
 
+/// Type `message` into the agent's own pane and submit it with Enter — the
+/// verdict nudge. The MCP server is a child of the agent process, so
+/// HERDR_PANE_ID names the pane whose chat input the message lands in.
+pub fn nudge_agent_pane(message: &str) -> Result<()> {
+    let pane_id = std::env::var("HERDR_PANE_ID")
+        .context("HERDR_PANE_ID is not set — cannot deliver the verdict nudge")?;
+    for args in [
+        vec!["pane", "send-text", &pane_id, message],
+        vec!["pane", "send-keys", &pane_id, "enter"],
+    ] {
+        let output = Command::new(herdr_bin())
+            .args(&args)
+            .output()
+            .context("spawning herdr CLI for the verdict nudge")?;
+        if !output.status.success() {
+            bail!(
+                "`herdr {} {}` failed: {}",
+                args[0],
+                args[1],
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Open the review pane beside the calling agent's pane, injecting the handoff
 /// socket path. herdr CLI server errors arrive as JSON on stderr with exit 1.
 ///
@@ -117,6 +143,63 @@ mod tests {
         assert!(result.is_ok(), "zero exit must be Ok: {result:?}");
         let argv = std::fs::read_to_string(&log).unwrap();
         assert_eq!(argv.trim(), "pane zoom --current --toggle");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Like `fake_herdr`, but appends to the log — the nudge makes two CLI
+    /// calls and both argvs need to survive.
+    fn fake_herdr_appending(dir: &Path, exit_code: i32) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all(dir).unwrap();
+        let log = dir.join("argv.log");
+        let script = dir.join("herdr-fake.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit {}\n", log.display(), exit_code),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, log)
+    }
+
+    #[test]
+    fn nudge_types_the_message_into_the_agents_pane_and_submits_it() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-nudge-ok-{}", std::process::id()));
+        let (script, log) = fake_herdr_appending(&dir, 0);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        std::env::set_var("HERDR_PANE_ID", "pane-42");
+        let result = nudge_agent_pane("review closed: approve");
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_BIN_PATH");
+
+        assert!(result.is_ok(), "zero exits must be Ok: {result:?}");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            argv,
+            "pane send-text pane-42 review closed: approve\npane send-keys pane-42 enter\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nudge_without_a_pane_id_is_an_error_not_a_stray_message() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("HERDR_PANE_ID");
+        let result = nudge_agent_pane("review closed: approve");
+        assert!(result.is_err(), "no HERDR_PANE_ID must surface as Err for the caller to log");
+    }
+
+    #[test]
+    fn nudge_surfaces_a_failed_cli_call_as_an_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-nudge-err-{}", std::process::id()));
+        let (script, _log) = fake_herdr_appending(&dir, 1);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        std::env::set_var("HERDR_PANE_ID", "pane-42");
+        let result = nudge_agent_pane("review closed: approve");
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_BIN_PATH");
+        assert!(result.is_err(), "nonzero exit must be Err so the caller can log it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

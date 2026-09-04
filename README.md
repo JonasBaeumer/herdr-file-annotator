@@ -30,7 +30,9 @@ structured, line-anchored output it acts on directly.
 diffs, reading everything doesn't scale, and agent prose summaries are a
 poor substitute for the code itself. Here the agent drives the pane: it
 jumps you to exactly the parts worth seeing while explaining in chat. Ask
-questions, ask for the next spot — you only see what you need to see.
+questions, ask for the next spot — you only see what you need to see. And
+when you finish in the pane, the agent picks your feedback up on its own —
+no "I'm done" prompt needed.
 
 **Diff or finished state, just a toggle away.** Reviewing the changes is the default;
 press `t` when you just want to read the final version of the file, no diff

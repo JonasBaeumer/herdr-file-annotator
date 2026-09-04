@@ -165,6 +165,11 @@ pub fn read_json_line<T: DeserializeOwned, R: BufRead>(reader: &mut R) -> Result
     Ok(Some(value))
 }
 
+/// Callback invoked by the mailbox thread when a verdict lands (see
+/// `Handoff::open_with_notify`). Runs on that thread, so it must not block
+/// for long.
+pub type VerdictNotify = Box<dyn FnOnce(&ReviewResult) + Send + 'static>;
+
 /// Server side: bind, then wait up to `accept_timeout` for the pane to connect.
 /// Accepting runs on a throwaway thread so the timeout can't wedge the caller.
 pub struct Handoff {
@@ -198,7 +203,20 @@ impl Handoff {
     /// vocabulary and surfaced as an `Err` instead — callers that treat
     /// `Cancelled` as "nothing to worry about" must not see a protocol bug
     /// dressed up as one.
-    pub fn open(mut self, request: &ReviewRequest) -> Result<OpenReview> {
+    pub fn open(self, request: &ReviewRequest) -> Result<OpenReview> {
+        self.open_with_notify(request, None)
+    }
+
+    /// Like `open`, but with an optional callback the mailbox thread invokes
+    /// once a verdict lands. The verdict is deposited in the mailbox *before*
+    /// the callback runs, so a caller reacting to the notification can
+    /// immediately `try_take` it. Broken channels (`Err` outcomes) do not
+    /// notify — they are protocol failures, not reviewer decisions.
+    pub fn open_with_notify(
+        mut self,
+        request: &ReviewRequest,
+        notify: Option<VerdictNotify>,
+    ) -> Result<OpenReview> {
         write_json_line(&mut self.stream, &ServerMsg::Request(request.clone()))?;
         let writer = self.stream.try_clone().context("splitting review socket")?;
         let result = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -213,8 +231,15 @@ impl Handoff {
                     Err(err) => Err(format!("{err:#}")),
                 }
             };
+            let notification = match (&outcome, notify) {
+                (Ok(result), Some(callback)) => Some((callback, result.clone())),
+                _ => None,
+            };
             if let Ok(mut slot) = mailbox.lock() {
                 *slot = Some(outcome);
+            }
+            if let Some((callback, result)) = notification {
+                callback(&result);
             }
         });
         Ok(OpenReview { writer, result })
@@ -445,6 +470,134 @@ mod tests {
         let result = open.wait(Some(Duration::from_secs(5))).unwrap();
         pane.join().unwrap();
         assert_eq!(result.verdict, Verdict::Approve);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn notify_fires_with_the_verdict_already_in_the_mailbox() {
+        let dir = std::env::temp_dir().join(format!("annot-test-notify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let sock_client = sock.clone();
+        let pane = std::thread::spawn(move || {
+            let mut conn = PaneConnection::connect(&sock_client).unwrap();
+            let _ = conn.receive_request().unwrap();
+            let (mut channel, _goto_rx) = conn.into_channel();
+            channel
+                .send_result(&ReviewResult {
+                    version: PROTOCOL_VERSION,
+                    verdict: Verdict::Approve,
+                    summary: None,
+                    annotations: Vec::new(),
+                })
+                .unwrap();
+        });
+
+        let handoff = Handoff::accept(listener, Duration::from_secs(5)).unwrap();
+        let (notified_tx, notified_rx) = mpsc::channel::<Verdict>();
+        let open = handoff
+            .open_with_notify(
+                &ReviewRequest {
+                    version: PROTOCOL_VERSION,
+                    working_dir: "/tmp/repo".into(),
+                    baseline: None,
+                    note: None,
+                },
+                Some(Box::new(move |result| {
+                    notified_tx.send(result.verdict).unwrap();
+                })),
+            )
+            .unwrap();
+
+        let verdict = notified_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(verdict, Verdict::Approve);
+        // Deposit-before-notify: a caller reacting to the notification must
+        // find the verdict already collectable.
+        let taken = open.try_take().expect("verdict must be in the mailbox when notify fires");
+        assert_eq!(taken.unwrap().verdict, Verdict::Approve);
+        pane.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn notify_fires_for_a_pane_that_closes_without_a_verdict() {
+        let dir = std::env::temp_dir().join(format!("annot-test-notify-eof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let sock_client = sock.clone();
+        let pane = std::thread::spawn(move || {
+            let mut conn = PaneConnection::connect(&sock_client).unwrap();
+            let _ = conn.receive_request().unwrap();
+            // Drop without answering: EOF, a genuine cancelled verdict.
+        });
+
+        let handoff = Handoff::accept(listener, Duration::from_secs(5)).unwrap();
+        let (notified_tx, notified_rx) = mpsc::channel::<Verdict>();
+        let _open = handoff
+            .open_with_notify(
+                &ReviewRequest {
+                    version: PROTOCOL_VERSION,
+                    working_dir: "/tmp/repo".into(),
+                    baseline: None,
+                    note: None,
+                },
+                Some(Box::new(move |result| {
+                    notified_tx.send(result.verdict).unwrap();
+                })),
+            )
+            .unwrap();
+
+        let verdict = notified_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(verdict, Verdict::Cancelled);
+        pane.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn a_broken_channel_does_not_notify() {
+        let dir = std::env::temp_dir().join(format!("annot-test-notify-err-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let sock_client = sock.clone();
+        let pane = std::thread::spawn(move || {
+            let mut conn = PaneConnection::connect(&sock_client).unwrap();
+            let _ = conn.receive_request().unwrap();
+            conn.stream.write_all(b"not json\n").unwrap();
+        });
+
+        let handoff = Handoff::accept(listener, Duration::from_secs(5)).unwrap();
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notified_in_callback = std::sync::Arc::clone(&notified);
+        let open = handoff
+            .open_with_notify(
+                &ReviewRequest {
+                    version: PROTOCOL_VERSION,
+                    working_dir: "/tmp/repo".into(),
+                    baseline: None,
+                    note: None,
+                },
+                Some(Box::new(move |_| {
+                    notified_in_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+                })),
+            )
+            .unwrap();
+
+        let outcome = open.wait(Some(Duration::from_secs(5)));
+        assert!(outcome.is_err(), "a malformed reply is a broken channel, not a verdict");
+        assert!(
+            !notified.load(std::sync::atomic::Ordering::SeqCst),
+            "protocol failures must not type a nudge at the agent"
+        );
+        pane.join().unwrap();
         let _ = std::fs::remove_file(&sock);
     }
 
