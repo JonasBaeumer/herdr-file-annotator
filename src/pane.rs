@@ -28,7 +28,10 @@ pub fn run() -> Result<()> {
     let (mut channel, goto_rx) = conn.into_channel();
 
     let model = crate::diff::load(&request.working_dir, request.baseline.as_deref());
-    let outcome = crate::ui::run(&request, model, goto_rx)?;
+    // The pane reads the same config file as the MCP server; only the
+    // display keys matter here (placement/timeouts are the server's side).
+    let config = crate::config::load();
+    let outcome = crate::ui::run(&request, model, goto_rx, config.wrap_lines)?;
 
     let result = ReviewResult {
         version: PROTOCOL_VERSION,
