@@ -1,7 +1,8 @@
 # Controls
 
 Everything in the review pane is keyboard-driven, with full mouse support as
-an alternative. Press `?` in the pane for the context-aware key reference —
+an alternative. Press `?` (the default `help` binding) in the pane for the
+context-aware key reference —
 it shows exactly the keys that work in your current view. (While a comment
 or summary box is open, `?` is typed as text like any other character; close
 the box first.)
