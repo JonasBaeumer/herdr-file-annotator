@@ -1947,13 +1947,23 @@ impl<'a> App<'a> {
         // Rows inside a fold run contribute nothing — the tail isn't on
         // screen, and the head is replaced by its (never-wrapped) pill.
         if self.wrap {
+            // Mirrors `view_lines`: a source that failed to load (or is not
+            // loaded yet) renders as a placeholder row, which wraps like any
+            // other row and must be counted the same way.
+            let placeholder: Vec<Line<'static>>;
             let rows: Option<&Vec<Line<'static>>> = match self.view {
                 ViewMode::Diff => self.row_cache.get(&self.nav.selected),
-                ViewMode::Source => self
-                    .source_cache
-                    .get(&self.nav.selected)
-                    .and_then(|r| r.as_ref().ok())
-                    .map(|s| &s.lines),
+                ViewMode::Source => match self.source_cache.get(&self.nav.selected) {
+                    Some(Ok(source)) => Some(&source.lines),
+                    Some(Err(reason)) => {
+                        placeholder = vec![source_placeholder_line(reason)];
+                        Some(&placeholder)
+                    }
+                    None => {
+                        placeholder = vec![source_placeholder_line("not loaded")];
+                        Some(&placeholder)
+                    }
+                },
             };
             for (b, row) in rows.into_iter().flatten().enumerate() {
                 if fold_run_containing(&folds, b).is_some() {
@@ -7367,6 +7377,29 @@ mod tests {
             row_text(comment_y).contains("a note"),
             "comment must follow the wrapped continuations, buffer line was {:?}",
             row_text(comment_y)
+        );
+    }
+
+    #[test]
+    fn display_map_counts_wrapped_source_error_placeholder_rows() {
+        // A failed source load renders (and wraps) its placeholder row like
+        // any other; the map must count those continuations or scrolling
+        // caps short of them.
+        let (request, model) = long_line_fixture();
+        let mut app = long_line_app(&request, &model);
+        app.view = ViewMode::Source;
+        let reason = "a very long load failure reason that certainly wraps in a narrow pane";
+        app.source_cache.insert(0, Err(reason.to_string()));
+        app.wrap = true;
+
+        let inner = 20;
+        let placeholder = source_placeholder_line(reason);
+        assert!(wrap_height(&placeholder, inner) > 1, "the placeholder must wrap at this width");
+        let map = app.disp_map(inner);
+        assert_eq!(
+            map.total(1),
+            wrap_height(&placeholder, inner),
+            "the map must count the wrapped placeholder's continuation rows"
         );
     }
 
