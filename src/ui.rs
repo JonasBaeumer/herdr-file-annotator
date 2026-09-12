@@ -3381,7 +3381,9 @@ fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
             spans.push(Span::styled(" ".repeat(pinned_cols), indent_style));
         }
         spans.extend(chunk);
-        out.push(Line::from(spans));
+        // Keep the line-level style: hunk headers and placeholders carry
+        // their color there, over default-styled spans.
+        out.push(Line::from(spans).style(line.style));
     }
     out
 }
@@ -7178,6 +7180,19 @@ mod tests {
         assert_eq!(line_text(&wrapped[1]).len(), 20, "continuations use the full width — no indent");
         let rejoined: String = wrapped.iter().map(|l| line_text(l)).collect();
         assert_eq!(rejoined, line_text(&row), "wrapping must not lose or pad content");
+    }
+
+    #[test]
+    fn wrap_line_keeps_the_line_level_style() {
+        // Hunk headers and placeholders carry their color on `Line::style`
+        // over a default-styled span, so every generated row must keep it.
+        let style = Style::default().fg(Color::Cyan);
+        let row = Line::styled("@@ -1,20 +1,20 @@ fn a_very_long_signature()", style);
+        let wrapped = wrap_line(&row, 20);
+        assert!(wrapped.len() > 1);
+        for l in &wrapped {
+            assert_eq!(l.style, style, "wrapping must not drop the line-level style");
+        }
     }
 
     fn long_line_app(
