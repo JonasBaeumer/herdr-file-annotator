@@ -148,6 +148,19 @@ impl Binding {
                     if ch == 'c' {
                         return Err("\"ctrl+c\" is reserved: it always cancels".to_string());
                     }
+                    // Terminals encode these as the reserved named keys (0x09
+                    // tab, 0x0d enter, 0x1b esc), so the event never arrives
+                    // as a ctrl+char and the binding could never match.
+                    if let Some(alias) = match ch {
+                        'i' => Some("tab"),
+                        'm' => Some("enter"),
+                        '[' => Some("esc"),
+                        _ => None,
+                    } {
+                        return Err(format!(
+                            "\"ctrl+{ch}\" is reserved: terminals send it as {alias}"
+                        ));
+                    }
                     Ok(Binding { ch, ctrl: true })
                 }
                 _ => Err(format!("\"{spec}\": expected ctrl+ and exactly one character")),
@@ -312,6 +325,23 @@ mod tests {
         }
         let unknown = Keymap::with_overrides(&overrides(&[("fly", "f")]));
         assert!(unknown.unwrap_err().contains("unknown action \"fly\""));
+    }
+
+    #[test]
+    fn ctrl_aliases_of_reserved_named_keys_are_rejected() {
+        // Terminals encode ctrl+i as tab (0x09), ctrl+m as enter (0x0d) and
+        // ctrl+[ as esc (0x1b), so crossterm reports them as the named keys —
+        // never as Char events with CONTROL. Accepting them would release the
+        // action's default and bind it to a key that can never arrive.
+        for spec in ["ctrl+i", "ctrl+I", "ctrl+m", "ctrl+M", "ctrl+["] {
+            let err = Keymap::with_overrides(&overrides(&[("approve", spec)]));
+            assert!(err.is_err(), "approve = {spec:?} must be rejected");
+        }
+        // Neighbouring ctrl combinations stay bindable.
+        for spec in ["ctrl+h", "ctrl+j", "ctrl+n"] {
+            let ok = Keymap::with_overrides(&overrides(&[("approve", spec)]));
+            assert!(ok.is_ok(), "approve = {spec:?} must stay bindable");
+        }
     }
 
     #[test]
