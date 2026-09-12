@@ -176,9 +176,14 @@ impl Binding {
         } else {
             let mut chars = spec.chars();
             match (chars.next(), chars.next()) {
-                (Some(ch), None) if !ch.is_whitespace() => Ok(Binding { ch, ctrl: false }),
+                // Control scalars (a TOML backslash-u escape, say) would build
+                // a binding crossterm reports as a named key, never as a
+                // Char event — printable characters only.
+                (Some(ch), None) if !ch.is_whitespace() && !ch.is_control() => {
+                    Ok(Binding { ch, ctrl: false })
+                }
                 _ => Err(format!(
-                    "\"{spec}\": expected a single character or ctrl+<char> \
+                    "{spec:?}: expected a single printable character or ctrl+<letter> \
                      (enter/esc/tab/arrows are reserved)"
                 )),
             }
@@ -354,6 +359,18 @@ mod tests {
         for spec in ["ctrl+h", "ctrl+j", "ctrl+n"] {
             let ok = Keymap::with_overrides(&overrides(&[("approve", spec)]));
             assert!(ok.is_ok(), "approve = {spec:?} must stay bindable");
+        }
+    }
+
+    #[test]
+    fn control_characters_are_rejected_as_plain_bindings() {
+        // TOML escapes (r"\u001b", r"\u007f") can smuggle raw control scalars
+        // past the whitespace guard, but crossterm reports those bytes as
+        // named keys (esc, backspace, …), never as Char events, so the
+        // binding would release the default and could never match.
+        for spec in ["\u{1b}", "\u{7f}", "\u{7}", "\t"] {
+            let err = Keymap::with_overrides(&overrides(&[("approve", spec)]));
+            assert!(err.is_err(), "approve = {spec:?} must be rejected");
         }
     }
 
