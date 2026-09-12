@@ -3213,21 +3213,14 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
         lines.splice(at..at, group);
     }
 
-    let paragraph = Paragraph::new(lines).block(block).scroll((scroll_row_u16(app.diff.scroll), 0));
+    // `scroll` is a usize display-row offset, and wrapped continuations or
+    // woven comment rows can push it (and the row count) past the u16 range
+    // `Paragraph::scroll` works in — so hand the widget the viewport slice
+    // directly instead of the full buffer plus an offset.
+    let viewport = area.height.saturating_sub(2) as usize;
+    let visible: Vec<Line> = lines.into_iter().skip(app.diff.scroll).take(viewport).collect();
+    let paragraph = Paragraph::new(visible).block(block);
     frame.render_widget(paragraph, area);
-}
-
-/// Narrow a display-space scroll offset to the `u16` `Paragraph::scroll`
-/// takes, WITHOUT wrapping. `MAX_SOURCE_LINES`'s margin for woven comment
-/// rows is a soft guideline sized for a realistic annotation count, not an
-/// enforced bound — a saved comment or the open editing box can add extra
-/// display rows without limit, so `scroll` itself could still exceed
-/// `u16::MAX` given enough of them. Clamping here means that pathological
-/// case stops scrolling further, rather than the offset wrapping and the
-/// pane silently rendering unrelated earlier rows while the cursor/footer
-/// still report the true, later position.
-fn scroll_row_u16(scroll: usize) -> u16 {
-    scroll.min(u16::MAX as usize) as u16
 }
 
 fn str_cols(s: &str) -> usize {
@@ -6993,22 +6986,6 @@ mod tests {
     }
 
     #[test]
-    fn scroll_row_u16_clamps_past_the_line_cap_margin_instead_of_wrapping() {
-        // MAX_SOURCE_LINES's margin bounds the source's BASE rows, but
-        // saved comments and the open editing box add unbounded extra
-        // display rows on top — a source near the line cap with enough
-        // wrapped comments can still push `scroll` past `u16::MAX`. A bare
-        // `as u16` cast would wrap that back down to a small offset and
-        // render unrelated earlier rows while the cursor/footer still
-        // report the true, later position; clamping instead just stops
-        // scrolling further, which is the safe failure.
-        assert_eq!(scroll_row_u16(0), 0);
-        assert_eq!(scroll_row_u16(65_535), 65_535, "must reach the real max exactly");
-        assert_eq!(scroll_row_u16(65_536), 65_535, "one past the max clamps, not wraps");
-        assert_eq!(scroll_row_u16(200_000), 65_535, "far past the max still clamps to it");
-    }
-
-    #[test]
     fn missing_source_falls_back_to_a_placeholder_row() {
         // working_dir points nowhere: the file can't be read, so the source
         // view is a single placeholder row and annotating there is inert.
@@ -7397,6 +7374,46 @@ mod tests {
             "comment must follow the wrapped continuations, buffer line was {:?}",
             row_text(comment_y)
         );
+    }
+
+    #[test]
+    fn rendering_reaches_wrapped_display_rows_past_the_u16_scroll_range() {
+        // Wrapping can expand a source accepted by the 2 MiB / 50k-line
+        // caps past 65,535 display rows in a narrow pane. The renderer
+        // must reach the tail by slicing to the viewport, not by a scroll
+        // offset squeezed through `Paragraph::scroll`'s u16.
+        use ratatui::backend::TestBackend;
+
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+        app.view = ViewMode::Source;
+        app.show_navigator = false;
+        app.wrap = true;
+
+        let long = "x".repeat(2000);
+        let mut rows: Vec<Line<'static>> = (0..300).map(|_| gutter_row(&long)).collect();
+        rows.push(gutter_row("zzz"));
+        let raw: Vec<String> =
+            (0..300).map(|_| long.clone()).chain(std::iter::once("zzz".to_string())).collect();
+        app.source_cache.insert(0, Ok(SourceFile { lines: rows, count: 301, raw }));
+
+        let size = Size { width: 22, height: 13 };
+        app.diff.cursor = 300;
+        app.ensure_cursor_visible(size);
+        assert!(app.diff.scroll > u16::MAX as usize, "fixture must scroll past the u16 range");
+
+        let mut terminal = Terminal::new(TestBackend::new(22, 13)).unwrap();
+        terminal
+            .draw(|frame| draw_diff(frame, frame.area(), &app, app.selected_file()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let all: String = (0..13)
+            .map(|y| (0..22).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("zzz"), "the cursor's row must be visible, buffer was:\n{all}");
     }
 
     #[test]
