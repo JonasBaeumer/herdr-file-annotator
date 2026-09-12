@@ -3,7 +3,7 @@
 //! Every letter/character key in the review pane is an [`Action`] with a
 //! default binding; the `[keys]` table in `config.toml` overrides them by
 //! action name (see `docs/configuration.md`). Bindings are single printable
-//! characters (case means shift: `"G"` is shift+g) or `ctrl+<char>`.
+//! characters (case means shift: `"G"` is shift+g) or `ctrl+<letter>`.
 //!
 //! Deliberately NOT remappable, so every muscle-memory escape hatch keeps
 //! working regardless of config: `ctrl+c` (cancel, everywhere), `esc`,
@@ -145,16 +145,24 @@ impl Binding {
             match (chars.next(), chars.next()) {
                 (Some(ch), None) if !ch.is_whitespace() => {
                     let ch = ch.to_ascii_lowercase();
+                    // Ctrl with punctuation or digits reaches the terminal as
+                    // an unrelated control byte (ctrl+[ is esc, ctrl+? is DEL,
+                    // ctrl+@ is NUL, ctrl+\ ctrl+] ctrl+^ ctrl+_ are FS..US),
+                    // so such a binding could never match a key event.
+                    if !ch.is_ascii_lowercase() {
+                        return Err(format!(
+                            "\"ctrl+{ch}\": ctrl bindings must use a letter"
+                        ));
+                    }
                     if ch == 'c' {
                         return Err("\"ctrl+c\" is reserved: it always cancels".to_string());
                     }
-                    // Terminals encode these as the reserved named keys (0x09
-                    // tab, 0x0d enter, 0x1b esc), so the event never arrives
-                    // as a ctrl+char and the binding could never match.
+                    // Two letters alias reserved named keys the same way:
+                    // terminals send ctrl+i as tab (0x09) and ctrl+m as
+                    // enter (0x0d), never as a ctrl+char event.
                     if let Some(alias) = match ch {
                         'i' => Some("tab"),
                         'm' => Some("enter"),
-                        '[' => Some("esc"),
                         _ => None,
                     } {
                         return Err(format!(
@@ -333,11 +341,16 @@ mod tests {
         // ctrl+[ as esc (0x1b), so crossterm reports them as the named keys —
         // never as Char events with CONTROL. Accepting them would release the
         // action's default and bind it to a key that can never arrive.
-        for spec in ["ctrl+i", "ctrl+I", "ctrl+m", "ctrl+M", "ctrl+["] {
+        for spec in [
+            "ctrl+i", "ctrl+I", "ctrl+m", "ctrl+M", "ctrl+[", // tab / enter / esc
+            "ctrl+?", "ctrl+8", // DEL: crossterm reports Backspace
+            "ctrl+@", "ctrl+2", // NUL: crossterm reports ctrl+space
+            "ctrl+\\", "ctrl+]", "ctrl+^", "ctrl+_", // FS/GS/RS/US: ctrl+4..7
+        ] {
             let err = Keymap::with_overrides(&overrides(&[("approve", spec)]));
             assert!(err.is_err(), "approve = {spec:?} must be rejected");
         }
-        // Neighbouring ctrl combinations stay bindable.
+        // Ctrl+letter combinations stay bindable.
         for spec in ["ctrl+h", "ctrl+j", "ctrl+n"] {
             let ok = Keymap::with_overrides(&overrides(&[("approve", spec)]));
             assert!(ok.is_ok(), "approve = {spec:?} must stay bindable");

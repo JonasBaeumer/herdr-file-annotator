@@ -42,7 +42,7 @@ Name the action, give it a key:
 ```toml
 [keys]
 comment = "a"      # single character; case means shift ("G" ≠ "g")
-approve = "ctrl+y" # or ctrl+<char>
+approve = "ctrl+y" # or ctrl+<letter> (a-z; ctrl+i and ctrl+m are reserved)
 wrap = "W"
 ```
 
