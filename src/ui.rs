@@ -2903,8 +2903,17 @@ fn summary_footer_text(buf: &str, width: usize) -> String {
 /// (`path:line`, diff focus) or `files (n)` (navigator focus); it comes
 /// FIRST so it's what survives if the pane is too narrow for the rest, the
 /// same "position outlives the hints" convention the old footer used.
-fn slim_footer_text(context: &str, width: usize) -> String {
-    let hints = " \u{b7} a approve \u{b7} r request changes \u{b7} q cancel \u{b7} ? help";
+fn slim_footer_text(context: &str, keymap: &Keymap, width: usize) -> String {
+    // Hints carry the ACTIVE bindings, like the `?` overlay: a remapped
+    // pane must not advertise keys it no longer listens to.
+    let k = |action: Action| keymap.label(action);
+    let hints = format!(
+        " \u{b7} {} approve \u{b7} {} request changes \u{b7} {} cancel \u{b7} {} help",
+        k(Action::Approve),
+        k(Action::RequestChanges),
+        k(Action::Cancel),
+        k(Action::Help)
+    );
     let full = format!(" {context}{hints}");
     if str_cols(&full) <= width {
         return full;
@@ -2931,7 +2940,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 Focus::Navigator => format!("files ({})", app.files().len()),
                 Focus::Diff => app.cursor_position().unwrap_or_default(),
             };
-            slim_footer_text(&context, area.width as usize)
+            slim_footer_text(&context, &app.keymap, area.width as usize)
         }
     };
     let footer = Paragraph::new(text).style(Style::default().add_modifier(Modifier::REVERSED));
@@ -4738,7 +4747,7 @@ mod tests {
         // The slimmed non-input footer: context first, then the four
         // always-on keys, `? help` included — this is what replaced the old
         // per-focus hint sausage that used to overflow narrow panes.
-        let text = slim_footer_text("a.txt:1", 80);
+        let text = slim_footer_text("a.txt:1", &Keymap::default(), 80);
         assert_eq!(text, " a.txt:1 \u{b7} a approve \u{b7} r request changes \u{b7} q cancel \u{b7} ? help");
         assert!(str_cols(&text) <= 80);
     }
@@ -4748,13 +4757,24 @@ mod tests {
         // Position survives, key hints get cut — the same convention the
         // old (now-removed) `diff_focus_footer` used.
         let wide_enough_for_context_only = " a.txt:1".chars().count();
-        let text = slim_footer_text("a.txt:1", wide_enough_for_context_only);
+        let text = slim_footer_text("a.txt:1", &Keymap::default(), wide_enough_for_context_only);
         assert_eq!(text, " a.txt:1");
         assert!(!text.contains("approve"));
 
         // Too narrow even for the bare context: tail_fit keeps its end.
-        let text = slim_footer_text("src/very/long/nested/path/file.rs:123", 10);
+        let text = slim_footer_text("src/very/long/nested/path/file.rs:123", &Keymap::default(), 10);
         assert!(str_cols(&text) <= 10, "footer must never exceed the pane width: {text:?}");
+    }
+
+    #[test]
+    fn slim_footer_advertises_the_remapped_verdict_keys() {
+        // The footer hints come from the active keymap, like the `?` overlay:
+        // after a remap it must show the live keys, not the defaults.
+        let keymap = custom_keymap(&[("approve", "ctrl+y"), ("help", "!")]);
+        let text = slim_footer_text("a.txt:1", &keymap, 80);
+        assert!(text.contains("ctrl+y approve"), "remapped approve key must show: {text:?}");
+        assert!(text.contains("! help"), "remapped help key must show: {text:?}");
+        assert!(!text.contains(" a approve"), "released default must not show: {text:?}");
     }
 
     #[test]
@@ -6602,7 +6622,7 @@ mod tests {
         let width = 80usize;
 
         let context = app.cursor_position().expect("cursor sits on a line");
-        let text = slim_footer_text(&context, width);
+        let text = slim_footer_text(&context, &app.keymap, width);
         assert!(text.contains("? help"), "footer must advertise the new help overlay: {text:?}");
         assert!(text.contains(&context), "footer must still show the position: {text:?}");
         assert!(str_cols(&text) <= width, "footer must fit the pane: {text:?}");
