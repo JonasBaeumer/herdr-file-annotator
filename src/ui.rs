@@ -2614,7 +2614,7 @@ impl<'a> App<'a> {
                 current: false,
                 rows: vec![
                     HelpRow::new("wheel", "scroll the files or the diff"),
-                    HelpRow::new("horiz. wheel", "pan the diff"),
+                    HelpRow { key: "horiz. wheel", desc: format!("pan the diff{pan_note}") },
                     HelpRow::new("click", "select a file / move the cursor"),
                     HelpRow::new("drag", "select a range in the diff"),
                     HelpRow::new("drag the divider", "resize the file list"),
@@ -4692,6 +4692,25 @@ mod tests {
         let source_text: String =
             app.help_lines(200).iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(source_text.contains("next / prev hunk \u{2014} inactive in source view"));
+    }
+
+    #[test]
+    fn help_overlay_notes_horizontal_wheel_inactive_while_wrapped() {
+        // The keyboard pan row carries the wrapped qualifier; the Mouse
+        // section's horizontal-wheel row is silenced by the same guard and
+        // must say so too.
+        let request = sample_request();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = App::new(&request, &model);
+        app.focus = Focus::Diff;
+
+        let text: String = app.help_lines(200).iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("pan the diff"));
+        assert!(!text.contains("pan the diff \u{2014} inactive"));
+
+        app.wrap = true;
+        let text: String = app.help_lines(200).iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("pan the diff \u{2014} inactive while wrapped"));
     }
 
     #[test]

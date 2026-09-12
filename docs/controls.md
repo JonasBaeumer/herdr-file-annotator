@@ -44,8 +44,8 @@ Long lines clip with `‹` / `…` markers at the edges; pan to see the rest,
 or press `w` to wrap them to the pane width instead. Wrapped continuation
 lines are indented behind the line-number gutter, so code columns stay
 aligned and the cursor, annotations, and clicks keep addressing the whole
-logical line. While wrapped, the pan keys are inactive — `w` again returns
-to clip-and-pan. To start every review wrapped, set `wrap_lines = true` in
+logical line. While wrapped, panning is inactive (both the keys and the
+horizontal wheel) — `w` again returns to clip-and-pan. To start every review wrapped, set `wrap_lines = true` in
 the [configuration](configuration.md).
 
 ## Annotating
