@@ -2,8 +2,10 @@
 //!
 //! Every letter/character key in the review pane is an [`Action`] with a
 //! default binding; the `[keys]` table in `config.toml` overrides them by
-//! action name (see `docs/configuration.md`). Bindings are single printable
-//! characters (case means shift: `"G"` is shift+g) or `ctrl+<letter>`.
+//! action name (see `docs/configuration.md`). Bindings are single visible
+//! characters (case means shift: `"G"` is shift+g) or `ctrl+<letter>`;
+//! whitespace can't be bound — a space would label its actions invisibly
+//! in the `?` overlay and the footer.
 //!
 //! Deliberately NOT remappable, so every muscle-memory escape hatch keeps
 //! working regardless of config: `ctrl+c` (cancel, everywhere), `esc`,
@@ -31,15 +33,6 @@ pub enum Context {
 const FILES: u8 = 1;
 const DIFF: u8 = 2;
 const ALL: u8 = FILES | DIFF;
-
-impl Context {
-    fn bit(self) -> u8 {
-        match self {
-            Context::Files => FILES,
-            Context::Diff => DIFF,
-        }
-    }
-}
 
 /// Everything a remappable key can do. The handlers in `ui.rs` match on
 /// this instead of on raw key codes.
@@ -183,8 +176,8 @@ impl Binding {
                     Ok(Binding { ch, ctrl: false })
                 }
                 _ => Err(format!(
-                    "{spec:?}: expected a single printable character or ctrl+<letter> \
-                     (enter/esc/tab/arrows are reserved)"
+                    "{spec:?}: expected a single visible character or ctrl+<letter> \
+                     (enter/esc/tab/arrows are reserved; space can't be bound)"
                 )),
             }
         }
@@ -331,7 +324,13 @@ mod tests {
     #[test]
     fn reserved_and_malformed_specs_are_rejected() {
         for (name, spec) in
-            [("cancel", "ctrl+c"), ("approve", "enter"), ("approve", ""), ("approve", "ctrl+")]
+            [
+                ("cancel", "ctrl+c"),
+                ("approve", "enter"),
+                ("approve", ""),
+                ("approve", " "), // whitespace can't be bound
+                ("approve", "ctrl+"),
+            ]
         {
             let err = Keymap::with_overrides(&overrides(&[(name, spec)]));
             assert!(err.is_err(), "{name} = {spec:?} must be rejected");
