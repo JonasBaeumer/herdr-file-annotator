@@ -11,6 +11,7 @@
 //! Malformed TOML or invalid values print ONE warning line to stderr and fall
 //! back to full defaults — a bad config file must never crash the server.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::herdr::PLUGIN_ID;
+use crate::keymap::Keymap;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_ACCEPT_TIMEOUT_SECS: u64 = 20;
@@ -48,6 +50,10 @@ pub struct Config {
     /// Start the pane with long lines wrapped to the pane width instead of
     /// clipped-and-pannable. Either way `w` toggles it live per review.
     pub wrap_lines: bool,
+    /// The pane's keybindings: defaults plus the `[keys]` table's
+    /// overrides. Resolved here so an invalid table follows the same
+    /// warn-and-use-defaults path as every other config problem.
+    pub keymap: Keymap,
 }
 
 impl Default for Config {
@@ -60,6 +66,7 @@ impl Default for Config {
             review_timeout: None,
             notify_on_verdict: true,
             wrap_lines: false,
+            keymap: Keymap::default(),
         }
     }
 }
@@ -76,6 +83,7 @@ struct RawConfig {
     review_timeout_secs: Option<u64>,
     notify_on_verdict: Option<bool>,
     wrap_lines: Option<bool>,
+    keys: Option<HashMap<String, String>>,
 }
 
 /// Load the plugin config, falling back to defaults on any problem. Never
@@ -159,6 +167,10 @@ fn validate(raw: RawConfig) -> Result<Config, String> {
         review_timeout,
         notify_on_verdict: raw.notify_on_verdict.unwrap_or(default.notify_on_verdict),
         wrap_lines: raw.wrap_lines.unwrap_or(default.wrap_lines),
+        keymap: match &raw.keys {
+            None => default.keymap,
+            Some(pairs) => Keymap::with_overrides(pairs).map_err(|e| format!("[keys] {e}"))?,
+        },
     })
 }
 
@@ -234,6 +246,30 @@ mod tests {
         assert_eq!(config.review_timeout, Some(Duration::from_secs(600)));
         assert!(!config.notify_on_verdict);
         assert!(config.wrap_lines);
+    }
+
+    #[test]
+    fn keys_table_overrides_bindings_and_bad_tables_reject_the_config() {
+        let raw: RawConfig = toml::from_str(
+            r#"
+            [keys]
+            wrap = "W"
+            approve = "ctrl+a"
+            "#,
+        )
+        .unwrap();
+        let config = validate(raw).unwrap();
+        assert_eq!(config.keymap.label(crate::keymap::Action::Wrap), "W");
+        assert_eq!(config.keymap.label(crate::keymap::Action::Approve), "ctrl+a");
+
+        // Any bad entry rejects the whole config, which `load` then turns
+        // into the standard warn-and-use-defaults fallback.
+        for table in ["[keys]\nfly = \"f\"", "[keys]\napprove = \"enter\"", "[keys]\ndown = \"a\""]
+        {
+            let raw: RawConfig = toml::from_str(table).unwrap();
+            let err = validate(raw);
+            assert!(err.is_err(), "{table:?} must be rejected, got {err:?}");
+        }
     }
 
     #[test]

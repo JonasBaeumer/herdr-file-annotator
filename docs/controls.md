@@ -6,6 +6,11 @@ it shows exactly the keys that work in your current view. (While a comment
 or summary box is open, `?` is typed as text like any other character; close
 the box first.)
 
+All character keys below are defaults: remap any of them with the `[keys]`
+table in the config — see
+[Custom keybindings](configuration.md#custom-keybindings). The `?` overlay
+always reflects your active bindings.
+
 ![The ? key reference overlay, listing finish, file-list, and diff keys](img/help-overlay.png)
 
 ## File list
