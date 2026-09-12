@@ -423,7 +423,9 @@ impl DispMap {
     /// A base row inside a hidden tail maps to its fold's pill row.
     fn disp(&self, base: usize) -> usize {
         let b = self.normalize(base);
-        b - self.hidden_before(b) + self.ends.iter().take_while(|&&e| e < b).count()
+        // `ends` is sorted, and wrap mode gives it one entry per
+        // continuation row — O(file) of them — so count by binary search.
+        b - self.hidden_before(b) + self.ends.partition_point(|&e| e < b)
     }
 
     /// Number of comment rows hanging directly under this base row.
@@ -440,19 +442,24 @@ impl DispMap {
     /// above) a display row — clicking an inline comment resolves to the
     /// line it annotates, clicking a fold pill to the fold's head row.
     /// Returns the largest base row whose display index is <= `disp_row`,
-    /// clamped to the file's rows. The walk starts from the LAST base row,
-    /// not from `disp_row`: with hidden rows in play `disp(b)` can be far
-    /// below `b`, so `disp_row` itself is no longer an upper bound for the
-    /// answer.
+    /// clamped to the file's rows. `disp` is monotone non-decreasing in the
+    /// base row (rows in a hidden tail plateau on their pill), so that row
+    /// is found by binary search — this runs on every click and wheel
+    /// scroll, and a linear walk over wrap-scale `ends` would freeze them.
     fn base_at(&self, disp_row: usize, base_count: usize) -> usize {
         if base_count == 0 {
             return 0;
         }
-        let mut b = base_count - 1;
-        while b > 0 && self.disp(b) > disp_row {
-            b -= 1;
+        let (mut lo, mut hi) = (0, base_count - 1); // disp(0) == 0 <= disp_row always
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if self.disp(mid) <= disp_row {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
         }
-        self.normalize(b)
+        self.normalize(lo)
     }
 }
 
@@ -4050,6 +4057,25 @@ mod tests {
         for b in [0, 3, 5, 15, 20, 30] {
             assert_eq!(map.base_at(map.disp(b), 40), b, "round trip for base {b}");
         }
+    }
+
+    #[test]
+    fn base_at_stays_fast_with_wrap_scale_extras() {
+        // Wrap mode legitimately puts one `ends` entry per continuation
+        // row — tens of thousands on a large accepted file. Display-to-base
+        // lookups run on every click and wheel scroll, so they must not
+        // cost base_count x |ends| comparisons.
+        let n = 40_000usize;
+        let map = DispMap::new((0..n).collect()); // one continuation per row
+        let t = std::time::Instant::now();
+        assert_eq!(map.base_at(2 * n - 1, n), n - 1);
+        assert_eq!(map.base_at(7, n), 3); // two display rows per base row
+        assert_eq!(map.base_at(0, n), 0);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "display->base lookup must stay near-logarithmic, took {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
