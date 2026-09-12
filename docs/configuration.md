@@ -29,4 +29,5 @@ review_timeout_secs = 3600
 
 The config is read when the MCP server starts, so changes apply after
 restarting your agent (or reconnecting its MCP servers — `/mcp` in Claude
-Code).
+Code). The exception is `wrap_lines`: the review pane reads it when it
+opens, so a change applies from the next review without a restart.
