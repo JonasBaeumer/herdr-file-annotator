@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthChar;
 
 /// Which pane a key press is interpreted in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,10 +170,12 @@ impl Binding {
         } else {
             let mut chars = spec.chars();
             match (chars.next(), chars.next()) {
-                // Control scalars (a TOML backslash-u escape, say) would build
-                // a binding crossterm reports as a named key, never as a
-                // Char event — printable characters only.
-                (Some(ch), None) if !ch.is_whitespace() && !ch.is_control() => {
+                // Visible characters only: control scalars (a TOML backslash-u
+                // escape, say) reach crossterm as named keys, never as Char
+                // events, and zero-width scalars (ZWSP, combining marks) would
+                // label their action invisibly in the ? overlay and footer.
+                // `width()` is None for the former and Some(0) for the latter.
+                (Some(ch), None) if !ch.is_whitespace() && ch.width().unwrap_or(0) > 0 => {
                     Ok(Binding { ch, ctrl: false })
                 }
                 _ => Err(format!(
@@ -368,6 +371,12 @@ mod tests {
         // named keys (esc, backspace, …), never as Char events, so the
         // binding would release the default and could never match.
         for spec in ["\u{1b}", "\u{7f}", "\u{7}", "\t"] {
+            let err = Keymap::with_overrides(&overrides(&[("approve", spec)]));
+            assert!(err.is_err(), "approve = {spec:?} must be rejected");
+        }
+        // Zero-width scalars (ZWSP, combining marks) are neither whitespace
+        // nor control but would label their action invisibly.
+        for spec in ["\u{200b}", "\u{301}"] {
             let err = Keymap::with_overrides(&overrides(&[("approve", spec)]));
             assert!(err.is_err(), "approve = {spec:?} must be rejected");
         }
