@@ -17,6 +17,7 @@ herdr plugin config-dir jonasbaeumer.file-annotator
 | `accept_timeout_secs` | `20` | How long the agent waits for the pane to appear |
 | `review_timeout_secs` | unset | If set, a review left open this long returns a `cancelled` verdict |
 | `notify_on_verdict` | `true` | Nudge the agent (a short prompt typed into its pane) when a non-blocking review finishes with no `collect_review` waiting — see [MCP tools](mcp-tools.md#automatic-continuation-the-verdict-nudge) |
+| `wrap_lines` | `false` | Start the pane with long lines wrapped to the pane width instead of clipped-and-pannable — `w` toggles it live either way, see [Controls](controls.md#diff-view) |
 
 Example — open reviews as a tab, and auto-cancel anything left open for an
 hour:

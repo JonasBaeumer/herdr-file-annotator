@@ -45,6 +45,9 @@ pub struct Config {
     /// call waiting on it, type a short prompt into the agent's pane so the
     /// agent picks the feedback up on its own.
     pub notify_on_verdict: bool,
+    /// Start the pane with long lines wrapped to the pane width instead of
+    /// clipped-and-pannable. Either way `w` toggles it live per review.
+    pub wrap_lines: bool,
 }
 
 impl Default for Config {
@@ -56,6 +59,7 @@ impl Default for Config {
             accept_timeout: Duration::from_secs(DEFAULT_ACCEPT_TIMEOUT_SECS),
             review_timeout: None,
             notify_on_verdict: true,
+            wrap_lines: false,
         }
     }
 }
@@ -71,6 +75,7 @@ struct RawConfig {
     accept_timeout_secs: Option<u64>,
     review_timeout_secs: Option<u64>,
     notify_on_verdict: Option<bool>,
+    wrap_lines: Option<bool>,
 }
 
 /// Load the plugin config, falling back to defaults on any problem. Never
@@ -153,6 +158,7 @@ fn validate(raw: RawConfig) -> Result<Config, String> {
         accept_timeout,
         review_timeout,
         notify_on_verdict: raw.notify_on_verdict.unwrap_or(default.notify_on_verdict),
+        wrap_lines: raw.wrap_lines.unwrap_or(default.wrap_lines),
     })
 }
 
@@ -203,6 +209,7 @@ mod tests {
         assert_eq!(config.accept_timeout, Duration::from_secs(20));
         assert_eq!(config.review_timeout, None);
         assert!(config.notify_on_verdict, "the nudge is on unless the config turns it off");
+        assert!(!config.wrap_lines, "clip-and-pan stays the default; wrap is opt-in");
     }
 
     #[test]
@@ -215,6 +222,7 @@ mod tests {
             accept_timeout_secs = 5
             review_timeout_secs = 600
             notify_on_verdict = false
+            wrap_lines = true
             "#,
         )
         .unwrap();
@@ -225,6 +233,7 @@ mod tests {
         assert_eq!(config.accept_timeout, Duration::from_secs(5));
         assert_eq!(config.review_timeout, Some(Duration::from_secs(600)));
         assert!(!config.notify_on_verdict);
+        assert!(config.wrap_lines);
     }
 
     #[test]

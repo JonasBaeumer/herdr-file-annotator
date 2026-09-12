@@ -88,11 +88,13 @@ pub fn run(
     request: &ReviewRequest,
     model: Result<DiffModel>,
     goto_rx: std::sync::mpsc::Receiver<GotoTarget>,
+    wrap_lines: bool,
 ) -> Result<Outcome> {
     let _guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::new(request, &model);
+    app.wrap = wrap_lines;
 
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
@@ -1047,6 +1049,13 @@ struct App<'a> {
     /// independent of any agent focus. Normalized (sorted, merged) on
     /// insertion; `active_folds` unions them with the focus-derived runs.
     manual_folds: HashMap<usize, Vec<(usize, usize)>>,
+    /// `w`: wrap long lines to the pane width instead of clipping them.
+    /// While on, horizontal panning is disabled (`hscroll` stays 0) — the
+    /// two are alternative answers to the same problem. A wrapped row's
+    /// continuation lines are display-map extras exactly like inline
+    /// comment rows, so scroll/mouse/fold math needs no wrap-specific
+    /// cases. Initial value comes from the `wrap_lines` config key.
+    wrap: bool,
 }
 
 /// The file's current modification time, or `None` if it can't be stat'd
@@ -1162,6 +1171,7 @@ impl<'a> App<'a> {
             focus_regions: HashMap::new(),
             folds_expanded: HashMap::new(),
             manual_folds: HashMap::new(),
+            wrap: false,
         };
         // Start the tree cursor on the selected file's row (the first row
         // can be a directory when every changed file lives in one).
@@ -1932,6 +1942,26 @@ impl<'a> App<'a> {
             let h = editing_box_height(buf, inner_width);
             ends.extend(std::iter::repeat(*row_end).take(h));
         }
+        // Wrap-mode continuation lines are extras exactly like comment
+        // rows: they hang under their base row and shift everything below.
+        // Rows inside a fold run contribute nothing — the tail isn't on
+        // screen, and the head is replaced by its (never-wrapped) pill.
+        if self.wrap {
+            let rows: Option<&Vec<Line<'static>>> = match self.view {
+                ViewMode::Diff => self.row_cache.get(&self.nav.selected),
+                ViewMode::Source => self
+                    .source_cache
+                    .get(&self.nav.selected)
+                    .and_then(|r| r.as_ref().ok())
+                    .map(|s| &s.lines),
+            };
+            for (b, row) in rows.into_iter().flatten().enumerate() {
+                if fold_run_containing(&folds, b).is_some() {
+                    continue;
+                }
+                ends.extend(std::iter::repeat(b).take(wrap_height(row, inner_width) - 1));
+            }
+        }
         DispMap::with_hidden(ends, folds.iter().map(|&(s, e)| (s + 1, e)).collect())
     }
 
@@ -2117,14 +2147,14 @@ impl<'a> App<'a> {
             // Up(Left) is handled unconditionally at the top of this
             // function, before the modal gates.
             MouseEventKind::ScrollRight => {
-                if in_diff {
+                if in_diff && !self.wrap {
                     self.diff.hscroll = self
                         .next_pan_stop(self.diff.hscroll, self.pan_step(term_size))
                         .min(self.pan_cap());
                 }
             }
             MouseEventKind::ScrollLeft => {
-                if in_diff {
+                if in_diff && !self.wrap {
                     self.diff.hscroll = self.diff.hscroll.saturating_sub(self.pan_step(term_size));
                 }
             }
@@ -2389,15 +2419,26 @@ impl<'a> App<'a> {
                     }
                     KeyCode::Char('g') => self.diff.top(),
                     KeyCode::Char('G') => self.diff.bottom(row_count),
-                    KeyCode::Right | KeyCode::Char('L') => {
+                    // Panning and wrapping are alternative answers to long
+                    // lines: while wrapped there is nothing off-screen to
+                    // pan to, so the pan keys go quiet instead of moving an
+                    // invisible offset.
+                    KeyCode::Right | KeyCode::Char('L') if !self.wrap => {
                         self.diff.hscroll =
                             self.next_pan_stop(self.diff.hscroll, self.pan_step(term_size))
                                 .min(self.pan_cap())
                     }
-                    KeyCode::Left | KeyCode::Char('H') => {
+                    KeyCode::Left | KeyCode::Char('H') if !self.wrap => {
                         self.diff.hscroll = self.diff.hscroll.saturating_sub(self.pan_step(term_size))
                     }
                     KeyCode::Char('0') => self.diff.hscroll = 0,
+                    KeyCode::Char('w') => {
+                        self.wrap = !self.wrap;
+                        // Entering wrap with a live pan would wrap rows the
+                        // reviewer can't see the start of; leaving it should
+                        // start unpanned like every other view change.
+                        self.diff.hscroll = 0;
+                    }
                     KeyCode::Char('h') | KeyCode::Tab => {
                         // Focusing an invisible pane strands the keyboard
                         // (j/k would switch files with no visible feedback):
@@ -2470,6 +2511,8 @@ impl<'a> App<'a> {
         // than advertising a dead key while it's the active view.
         let hunk_note =
             if self.view == ViewMode::Source { " \u{2014} inactive in source view" } else { "" };
+        // Same honesty for the pan keys, which `w` turns off entirely.
+        let pan_note = if self.wrap { " \u{2014} inactive while wrapped" } else { "" };
 
         vec![
             // The overlay is itself a modal state: while it is open, the
@@ -2510,8 +2553,12 @@ impl<'a> App<'a> {
                     let mut rows = vec![
                         HelpRow::new("j / k", "move cursor"),
                         HelpRow::new("g / G", "top / bottom"),
-                        HelpRow::new("\u{2190} / \u{2192} (H/L)", "pan left / right"),
+                        HelpRow {
+                            key: "\u{2190} / \u{2192} (H/L)",
+                            desc: format!("pan left / right{pan_note}"),
+                        },
                         HelpRow::new("0", "reset pan"),
+                        HelpRow::new("w", "wrap long lines / back to clip-and-pan"),
                         HelpRow::new("d / u", "half page down / up"),
                         HelpRow { key: "n / p", desc: format!("next / prev hunk{hunk_note}") },
                         HelpRow::new("h / tab", "focus the files"),
@@ -3039,10 +3086,14 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
     // marker (the first two spans of a line row) stay pinned; hunk headers
     // and placeholders (single-span rows) pan whole. Runs after the style
     // patches (they only touch styles/first gutter char) and before comment
-    // weaving (comments wrap instead of panning).
-    for line in &mut lines {
-        let pinned = if line.spans.len() >= 3 { 2 } else { 0 };
-        pan_and_clip(line, app.diff.hscroll, inner_width, pinned);
+    // weaving (comments wrap instead of panning). In wrap mode rows wrap
+    // instead of clipping (below, after the folds collapse), so neither pan
+    // nor the clip markers apply.
+    if !app.wrap {
+        for line in &mut lines {
+            let pinned = if line.spans.len() >= 3 { 2 } else { 0 };
+            pan_and_clip(line, app.diff.hscroll, inner_width, pinned);
+        }
     }
 
     // Fold collapse (agent-focused source view): each run's head row becomes
@@ -3079,6 +3130,29 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
     let folded_row = |base: usize| -> usize {
         base - folds.iter().map(|&(s, e)| if e < base { e - s } else { 0 }).sum::<usize>()
     };
+
+    // Wrap expansion: every visible row becomes its wrapped lines — except
+    // fold pills, which the display map skips too; the two must agree row
+    // for row. Runs AFTER the folds collapse (a folded row's content must
+    // not spend display rows) and BEFORE the comment weave (whose splice
+    // indices need translating into expanded space). `expand_map[i]` is the
+    // expanded index of fold-compressed row `i`, with one extra entry for
+    // the end so `i + 1` always resolves.
+    let mut expand_map: Vec<usize> = Vec::new();
+    if app.wrap {
+        let pills: HashSet<usize> = folds.iter().map(|&(s, _)| folded_row(s)).collect();
+        let mut wrapped: Vec<Line> = Vec::with_capacity(lines.len());
+        for (i, line) in lines.into_iter().enumerate() {
+            expand_map.push(wrapped.len());
+            if pills.contains(&i) {
+                wrapped.push(line);
+            } else {
+                wrapped.extend(wrap_line(&line, inner_width));
+            }
+        }
+        expand_map.push(wrapped.len());
+        lines = wrapped;
+    }
 
     // Inline comment rows, woven in directly under the lines they annotate
     // (GitHub-style) so feedback sits next to the code instead of living only
@@ -3118,7 +3192,14 @@ fn draw_diff(frame: &mut Frame, area: Rect, app: &App, file: Option<&FileDiff>) 
         ));
     }
     for (end, group) in groups.into_iter().rev() {
-        let at = (end + 1).min(lines.len());
+        // In wrap mode `end` indexes fold-compressed rows, but the splice
+        // lands in expanded space: directly under the LAST wrapped line of
+        // the anchor row, which is where `end + 1` maps to.
+        let at = if app.wrap {
+            expand_map[(end + 1).min(expand_map.len() - 1)]
+        } else {
+            (end + 1).min(lines.len())
+        };
         lines.splice(at..at, group);
     }
 
@@ -3240,6 +3321,82 @@ fn pan_and_clip(line: &mut Line<'static>, hscroll: usize, width: usize, pinned: 
             used = keep;
         }
         line.spans.push(Span::styled("\u{2026}", Style::default().fg(Color::DarkGray)));
+    }
+}
+
+/// Wrap a rendered row to `width` display columns — the wrap-mode
+/// counterpart of `pan_and_clip`. The pinned lead (gutter + origin marker
+/// on line rows) stays on the first line; continuation lines get a blank
+/// indent of the same width so code columns stay aligned. Splitting follows
+/// the same two invariants as `pan_and_clip`: widths are unicode-width 0.2
+/// string widths (ratatui's pinned pair), and boundaries never split an
+/// extended grapheme cluster — a cluster straddling the wrap column moves
+/// to the next line whole, leaving the previous line short rather than
+/// rendering half a glyph. A single cluster wider than the wrap width still
+/// gets a line of its own: progress beats fit on absurdly narrow panes.
+fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let pinned = pinned_spans(line);
+    let pinned_cols: usize = line.spans.iter().take(pinned).map(|s| str_cols(&s.content)).sum();
+    let avail = width.saturating_sub(pinned_cols).max(1);
+
+    if pannable_cols(line) <= avail {
+        return vec![line.clone()];
+    }
+
+    // Chunk the unpinned spans into runs of at most `avail` columns. A new
+    // chunk always receives at least one cluster before the next boundary
+    // check, so no chunk comes out empty.
+    let mut chunks: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut used = 0usize;
+    for span in line.spans.iter().skip(pinned) {
+        let mut piece = String::new();
+        for g in span.content.graphemes(true) {
+            let w = str_cols(g);
+            if used + w > avail && used > 0 {
+                if !piece.is_empty() {
+                    let taken = std::mem::take(&mut piece);
+                    chunks.last_mut().unwrap().push(Span::styled(taken, span.style));
+                }
+                chunks.push(Vec::new());
+                used = 0;
+            }
+            piece.push_str(g);
+            used += w;
+        }
+        if !piece.is_empty() {
+            chunks.last_mut().unwrap().push(Span::styled(piece, span.style));
+        }
+    }
+
+    // The indent inherits the gutter span's style: content styles carry any
+    // row-wide background (cursor, selection) already, and the indent must
+    // not break that band.
+    let indent_style = line.spans.first().map(|s| s.style).unwrap_or_default();
+    let mut out = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        if i == 0 {
+            spans.extend(line.spans.iter().take(pinned).cloned());
+        } else if pinned > 0 {
+            spans.push(Span::styled(" ".repeat(pinned_cols), indent_style));
+        }
+        spans.extend(chunk);
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+/// Display rows `wrap_line` produces for a row, without building them in
+/// the common fits-on-one-line case. `disp_map` and `draw_diff` must agree
+/// on this number for every row, or the scroll offset and mouse hits drift
+/// off the rendered lines.
+fn wrap_height(line: &Line<'static>, width: usize) -> usize {
+    let pinned = pinned_spans(line);
+    let pinned_cols: usize = line.spans.iter().take(pinned).map(|s| str_cols(&s.content)).sum();
+    if pannable_cols(line) <= width.saturating_sub(pinned_cols).max(1) {
+        1
+    } else {
+        wrap_line(line, width).len()
     }
 }
 
@@ -6951,5 +7108,272 @@ mod tests {
         // And once the pane is wide enough for the tag chip, cancel is
         // still there — commit+cancel is never traded away for tag.
         assert!(contains(tag_at, "esc"));
+    }
+
+    /// A hand-built 3-span row shaped like `highlight_diff_line`'s output:
+    /// a 10-col gutter, a 1-col marker, and the given content.
+    fn gutter_row(content: &str) -> Line<'static> {
+        Line::from(vec![
+            Span::styled("   1    1 ".to_string(), Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::raw(content.to_string()),
+        ])
+    }
+
+    #[test]
+    fn wrap_line_leaves_fitting_rows_alone() {
+        let row = gutter_row("fn main() {}");
+        let wrapped = wrap_line(&row, 80);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(line_text(&wrapped[0]), line_text(&row));
+        assert_eq!(wrap_height(&row, 80), 1);
+    }
+
+    #[test]
+    fn wrap_line_splits_and_indents_continuations_at_the_gutter_width() {
+        let row = gutter_row("abcdefghijklmnopqrst"); // 20 cols past an 11-col lead
+        let width = 16; // 5 content columns per line
+        let wrapped = wrap_line(&row, width);
+        assert_eq!(wrapped.len(), 4, "20 columns at 5 per line");
+        assert_eq!(wrap_height(&row, width), 4, "the count and the lines must agree");
+        assert_eq!(line_text(&wrapped[0]), "   1    1  abcde");
+        for (i, part) in ["fghij", "klmno", "pqrst"].iter().enumerate() {
+            assert_eq!(
+                line_text(&wrapped[i + 1]),
+                format!("{}{part}", " ".repeat(11)),
+                "continuation {i} must sit behind a gutter-width indent"
+            );
+        }
+        for l in &wrapped {
+            let cols: usize = l.spans.iter().map(|s| str_cols(&s.content)).sum();
+            assert!(cols <= width, "wrapped line overflows: {cols} > {width}");
+        }
+    }
+
+    #[test]
+    fn wrap_line_moves_a_straddling_wide_cluster_whole() {
+        // Content "aa日本": widths 1,1,2,2. With 3 content columns the 日
+        // straddles the first boundary and must move whole, leaving line
+        // one a column short rather than rendering half a glyph.
+        let row = gutter_row("aa\u{65e5}\u{672c}");
+        let width = 11 + 3;
+        let wrapped = wrap_line(&row, width);
+        let parts: Vec<String> =
+            wrapped.iter().map(|l| line_text(l).trim_start().to_string()).collect();
+        assert_eq!(parts, vec!["1    1  aa".to_string(), "日".to_string(), "本".to_string()]);
+        for l in &wrapped {
+            let cols: usize = l.spans.iter().map(|s| str_cols(&s.content)).sum();
+            assert!(cols <= width, "wrapped line overflows: {cols} > {width}");
+        }
+    }
+
+    #[test]
+    fn wrap_line_wraps_single_span_rows_across_the_full_width() {
+        // Hunk headers and placeholders have no pinned lead: they wrap
+        // across the whole pane width with no continuation indent.
+        let row = Line::from("@@ -1,20 +1,20 @@ fn a_very_long_signature()");
+        let wrapped = wrap_line(&row, 20);
+        assert!(wrapped.len() > 1);
+        assert_eq!(line_text(&wrapped[0]).len(), 20);
+        assert_eq!(line_text(&wrapped[1]).len(), 20, "continuations use the full width — no indent");
+        let rejoined: String = wrapped.iter().map(|l| line_text(l)).collect();
+        assert_eq!(rejoined, line_text(&row), "wrapping must not lose or pad content");
+    }
+
+    fn long_line_app(
+        request: &ReviewRequest,
+        model: &Result<DiffModel>,
+    ) -> App<'static> {
+        let request: &'static ReviewRequest = Box::leak(Box::new(request.clone()));
+        let model: &'static Result<DiffModel> = Box::leak(Box::new(match model {
+            Ok(m) => Ok(DiffModel { files: m.files.clone() }),
+            Err(_) => unreachable!("fixture model is always Ok"),
+        }));
+        let mut app = App::new(request, model);
+        app.focus = Focus::Diff;
+        app
+    }
+
+    fn long_line_fixture() -> (ReviewRequest, Result<DiffModel>) {
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: "/tmp".to_string(),
+            baseline: None,
+            note: None,
+        };
+        let file = FileDiff {
+            path: "min.js".to_string(),
+            old_path: None,
+            status: FileStatus::Added,
+            binary: false,
+            adds: 2,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,2 @@".to_string(),
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![
+                    line(Origin::Add, None, Some(1), &"x".repeat(100)),
+                    line(Origin::Add, None, Some(2), "short();"),
+                ],
+            }],
+        };
+        (request, Ok(DiffModel { files: vec![file] }))
+    }
+
+    #[test]
+    fn wrap_extras_shift_the_display_map_like_comment_rows() {
+        let (request, model) = long_line_fixture();
+        let mut app = long_line_app(&request, &model);
+        app.wrap = true;
+
+        let inner = 40;
+        let long_row = &app.row_cache.get(&0).unwrap()[1];
+        let h = wrap_height(long_row, inner);
+        assert!(h > 1, "the fixture's long row must actually wrap at width {inner}");
+
+        let map = app.disp_map(inner);
+        // Base rows: 0 header, 1 long line, 2 short line.
+        assert_eq!(map.disp(1), 1, "extras hang UNDER their row, not above it");
+        assert_eq!(map.extra_at(1), h - 1);
+        assert_eq!(map.disp(2), 1 + h, "rows below shift by the continuations");
+        assert_eq!(map.total(3), 3 + (h - 1));
+        // Clicking any continuation line resolves to the row it belongs to.
+        for disp_row in 1..1 + h {
+            assert_eq!(map.base_at(disp_row, 3), 1);
+        }
+        // And the scroll follow keeps the row's LAST wrapped line on
+        // screen, same as it does for a tall comment stack.
+        let scroll = follow_display(0, 1, &map, 3);
+        assert_eq!(scroll, (1 + h).saturating_sub(3));
+
+        // Off wrap, the same map goes back to one display row per base row.
+        app.wrap = false;
+        assert_eq!(app.disp_map(inner).total(3), 3);
+    }
+
+    #[test]
+    fn folded_rows_and_pill_heads_contribute_no_wrap_extras() {
+        // 40 source lines; lines 1, 11, and 21 (1-based) are long enough to
+        // wrap. Focus 10–15 + 30–35 folds rows 0–8, 15–28, and 35–39, so
+        // row 0 is a pill head and row 20 is folded away — only row 10's
+        // long line is actually on screen to spend display rows.
+        let dir = std::env::temp_dir()
+            .join(format!("herdr-annotator-wrapfold-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).expect("temp dir");
+        let body = (1..=40)
+            .map(|n| {
+                if n == 1 || n == 11 || n == 21 {
+                    format!("let long{n} = {};", "\"y\".repeat(90)".repeat(6))
+                } else {
+                    format!("line{n}();")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(dir.join("src/lib.rs"), body).expect("write source");
+        let request = ReviewRequest {
+            version: 1,
+            working_dir: dir.to_string_lossy().into_owned(),
+            baseline: None,
+            note: None,
+        };
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file()] });
+        let mut app = focused_app(&request, &model);
+        app.wrap = true;
+
+        let inner = 40;
+        let folds = app.active_folds();
+        assert_eq!(folds, vec![(0, 8), (15, 28), (35, 39)]);
+        let rows = &app.source_cache.get(&0).unwrap().as_ref().unwrap().lines;
+        assert!(wrap_height(&rows[0], inner) > 1, "row 0 would wrap if it were visible");
+        assert!(wrap_height(&rows[20], inner) > 1, "row 20 would wrap if it were visible");
+        let visible_extras = wrap_height(&rows[10], inner) - 1;
+        assert!(visible_extras > 0);
+
+        let hidden: usize = folds.iter().map(|&(s, e)| e - s).sum();
+        let map = app.disp_map(inner);
+        assert_eq!(
+            map.total(40),
+            40 - hidden + visible_extras,
+            "only the visible long row may add display rows"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrapped_rendering_stays_in_lockstep_with_the_display_map() {
+        // The scroll offset and mouse math live in `disp_map`'s display
+        // space while the pixels come from `draw_diff`'s own expansion —
+        // this renders a wrap + inline-comment scenario into a test
+        // backend and checks a later row lands on exactly the buffer line
+        // the map predicts. If the two ever disagree, scrolling shows the
+        // wrong rows and clicks land off by the drift.
+        use ratatui::backend::TestBackend;
+
+        let (request, model) = long_line_fixture();
+        let mut app = long_line_app(&request, &model);
+        app.wrap = true;
+        app.pending.push(PendingAnnotation {
+            file_idx: 0,
+            annotation: Annotation {
+                file: "min.js".to_string(),
+                lines: LineRange { start: 1, end: 1 },
+                side: Side::New,
+                tag: Some("fix".to_string()),
+                comment: "a note".to_string(),
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        terminal
+            .draw(|frame| draw_diff(frame, frame.area(), &app, app.selected_file()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let row_text = |y: u16| -> String { (0..40).map(|x| buffer[(x, y)].symbol()).collect() };
+
+        let map = app.disp_map(38); // pane width minus the two border columns
+        assert!(map.extra_at(1) > 1, "row 1 must carry wrap AND comment extras");
+        // Base row 2 renders at border row 1 + its display index.
+        let y = 1 + map.disp(2) as u16;
+        assert!(
+            row_text(y).contains("short();"),
+            "display row {} must hold base row 2, buffer line was {:?}",
+            map.disp(2),
+            row_text(y)
+        );
+        // And the comment sits under the long row's LAST continuation, not
+        // its first line.
+        let comment_y = 1 + (map.disp(1) + wrap_height(&app.row_cache.get(&0).unwrap()[1], 38)) as u16;
+        assert!(
+            row_text(comment_y).contains("a note"),
+            "comment must follow the wrapped continuations, buffer line was {:?}",
+            row_text(comment_y)
+        );
+    }
+
+    #[test]
+    fn w_toggles_wrap_and_silences_the_pan_keys() {
+        let (request, model) = long_line_fixture();
+        let mut app = long_line_app(&request, &model);
+        let term = Size { width: 60, height: 20 };
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+
+        app.handle_key(right, term);
+        assert!(app.diff.hscroll > 0, "panning works while unwrapped");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE), term);
+        assert!(app.wrap);
+        assert_eq!(app.diff.hscroll, 0, "entering wrap resets the pan");
+        app.handle_key(right, term);
+        assert_eq!(app.diff.hscroll, 0, "pan keys are inert while wrapped");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE), term);
+        assert!(!app.wrap);
+        app.handle_key(right, term);
+        assert!(app.diff.hscroll > 0, "leaving wrap re-enables panning");
     }
 }
