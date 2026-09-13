@@ -233,6 +233,8 @@ impl Keymap {
                     continue;
                 }
                 if let Some(&taken) = map.get(&binding) {
+                    // `taken` was inserted by an earlier iteration over this
+                    // same ACTIONS table, so the find cannot miss.
                     let taken_name =
                         ACTIONS.iter().find(|(a, ..)| *a == taken).map(|(_, n, ..)| *n).unwrap();
                     return Err(format!(
