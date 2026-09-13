@@ -13,6 +13,9 @@ use crate::config::{Config, Placement, SplitDirection};
 pub const PLUGIN_ID: &str = "jonasbaeumer.file-annotator";
 pub const PANE_ENTRYPOINT: &str = "review";
 
+/// Label the review pane reports itself under in herdr's agent view.
+pub const AGENT_LABEL: &str = "annotator";
+
 fn herdr_bin() -> String {
     std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
 }
@@ -27,6 +30,60 @@ pub fn zoom_toggle_current() -> Result<()> {
         .context("spawning herdr CLI for zoom")?;
     if !output.status.success() {
         bail!("`herdr pane zoom` failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
+/// Report this pane to herdr's agent view as a blocked agent — the sidebar
+/// then shows the attention dot on the pane's tab while a review is pending.
+///
+/// The report targets the REVIEW pane (HERDR_PANE_ID in the pane process is
+/// its own id), not the agent's pane: herdr's built-in agent detection owns
+/// the lifecycle state of a pane it recognizes and silently ignores external
+/// reports there, so the coding agent's own entry cannot be overridden.
+pub fn mark_pane_blocked(message: &str) -> Result<()> {
+    let pane_id = std::env::var("HERDR_PANE_ID")
+        .context("HERDR_PANE_ID is not set — cannot report the blocked status")?;
+    let output = Command::new(herdr_bin())
+        .args([
+            "pane",
+            "report-agent",
+            &pane_id,
+            "--source",
+            PLUGIN_ID,
+            "--agent",
+            AGENT_LABEL,
+            "--state",
+            "blocked",
+            "--message",
+            message,
+        ])
+        .output()
+        .context("spawning herdr CLI to report the blocked status")?;
+    if !output.status.success() {
+        bail!(
+            "`herdr pane report-agent` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Withdraw the pane's agent-view entry when the review ends. herdr also
+/// drops the entry on its own when the pane closes, so a crashed pane never
+/// leaks a stale blocked dot — this call just clears it at UI-close time.
+pub fn release_pane_agent() -> Result<()> {
+    let pane_id = std::env::var("HERDR_PANE_ID")
+        .context("HERDR_PANE_ID is not set — cannot release the agent-view entry")?;
+    let output = Command::new(herdr_bin())
+        .args(["pane", "release-agent", &pane_id, "--source", PLUGIN_ID, "--agent", AGENT_LABEL])
+        .output()
+        .context("spawning herdr CLI to release the agent-view entry")?;
+    if !output.status.success() {
+        bail!(
+            "`herdr pane release-agent` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -200,6 +257,71 @@ mod tests {
         std::env::remove_var("HERDR_PANE_ID");
         std::env::remove_var("HERDR_BIN_PATH");
         assert!(result.is_err(), "nonzero exit must be Err so the caller can log it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocked_report_invokes_the_documented_herdr_cli_contract() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-blocked-ok-{}", std::process::id()));
+        let (script, log) = fake_herdr(&dir, 0);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        std::env::set_var("HERDR_PANE_ID", "w2:p7");
+        let result = mark_pane_blocked("review pending: myrepo");
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_BIN_PATH");
+
+        assert!(result.is_ok(), "zero exit must be Ok: {result:?}");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            argv.trim(),
+            "pane report-agent w2:p7 --source jonasbaeumer.file-annotator \
+             --agent annotator --state blocked --message review pending: myrepo"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn release_invokes_the_documented_herdr_cli_contract() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-release-ok-{}", std::process::id()));
+        let (script, log) = fake_herdr(&dir, 0);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        std::env::set_var("HERDR_PANE_ID", "w2:p7");
+        let result = release_pane_agent();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_BIN_PATH");
+
+        assert!(result.is_ok(), "zero exit must be Ok: {result:?}");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            argv.trim(),
+            "pane release-agent w2:p7 --source jonasbaeumer.file-annotator --agent annotator"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blocked_report_without_a_pane_id_is_an_error_not_a_stray_call() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("HERDR_PANE_ID");
+        assert!(mark_pane_blocked("review pending").is_err());
+        assert!(release_pane_agent().is_err());
+    }
+
+    #[test]
+    fn blocked_report_surfaces_a_failed_cli_call_as_an_error() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-blocked-err-{}", std::process::id()));
+        let (script, _log) = fake_herdr(&dir, 1);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        std::env::set_var("HERDR_PANE_ID", "w2:p7");
+        let report = mark_pane_blocked("review pending");
+        let release = release_pane_agent();
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_BIN_PATH");
+        assert!(report.is_err(), "nonzero exit must be Err so the caller can log it");
+        assert!(release.is_err(), "nonzero exit must be Err so the caller can log it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

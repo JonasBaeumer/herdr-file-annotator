@@ -31,7 +31,24 @@ pub fn run() -> Result<()> {
     // The pane reads the same config file as the MCP server; only the
     // display keys matter here (placement/timeouts are the server's side).
     let config = crate::config::load();
+
+    // Show up in herdr's agent view as blocked while the review is pending,
+    // so a reviewer working in another tab sees the attention dot. Best
+    // effort: status display must never stop a review from opening.
+    let repo = std::path::Path::new(&request.working_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| request.working_dir.clone());
+    if let Err(err) = crate::herdr::mark_pane_blocked(&format!("review pending: {repo}")) {
+        eprintln!("herdr-annotator pane: could not report blocked status: {err:#}");
+    }
+
+    // On the error path the process exits and herdr drops the agent-view
+    // entry with the pane, so `?` here cannot leak a stale blocked dot.
     let outcome = crate::ui::run(&request, model, goto_rx, config)?;
+    if let Err(err) = crate::herdr::release_pane_agent() {
+        eprintln!("herdr-annotator pane: could not release the agent-view entry: {err:#}");
+    }
 
     let result = ReviewResult {
         version: PROTOCOL_VERSION,
