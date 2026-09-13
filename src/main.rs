@@ -1,6 +1,7 @@
 mod config;
 mod diff;
 mod herdr;
+mod keymap;
 mod mcp;
 mod pane;
 mod protocol;

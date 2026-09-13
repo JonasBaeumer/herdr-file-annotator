@@ -36,6 +36,7 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use crate::diff::{load_source, DiffLine, DiffModel, FileDiff, FileStatus, Origin};
+use crate::keymap::{Action, Context, Keymap};
 use crate::protocol::{Annotation, GotoTarget, LineRange, ReviewRequest, Side, Verdict};
 
 /// What the reviewer decided, handed back to `pane.rs`.
@@ -88,13 +89,14 @@ pub fn run(
     request: &ReviewRequest,
     model: Result<DiffModel>,
     goto_rx: std::sync::mpsc::Receiver<GotoTarget>,
-    wrap_lines: bool,
+    config: crate::config::Config,
 ) -> Result<Outcome> {
     let _guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::new(request, &model);
-    app.wrap = wrap_lines;
+    app.wrap = config.wrap_lines;
+    app.keymap = config.keymap;
 
     loop {
         terminal.draw(|frame| draw(frame, &app))?;
@@ -1063,6 +1065,10 @@ struct App<'a> {
     /// comment rows, so scroll/mouse/fold math needs no wrap-specific
     /// cases. Initial value comes from the `wrap_lines` config key.
     wrap: bool,
+    /// Active keybindings: defaults plus the `[keys]` config overrides.
+    /// Key handling resolves presses through this; the `?` overlay renders
+    /// its labels, so a remapped pane documents itself truthfully.
+    keymap: Keymap,
 }
 
 /// The file's current modification time, or `None` if it can't be stat'd
@@ -1179,6 +1185,7 @@ impl<'a> App<'a> {
             folds_expanded: HashMap::new(),
             manual_folds: HashMap::new(),
             wrap: false,
+            keymap: Keymap::default(),
         };
         // Start the tree cursor on the selected file's row (the first row
         // can be a directory when every changed file lives in one).
@@ -1671,67 +1678,66 @@ impl<'a> App<'a> {
             return outcome;
         }
 
+        // Every remappable key resolves to its action ONCE, in the context
+        // the press lands in. The fixed keys (esc, enter, tab, ctrl+c)
+        // keep literal arms because their meaning is modal — see keymap.rs
+        // for what is remappable and what is deliberately not.
+        let action = self.keymap.lookup(
+            &key,
+            match self.focus {
+                Focus::Navigator => Context::Files,
+                Focus::Diff => Context::Diff,
+            },
+        );
+
         // The help overlay owns the keyboard while it's open: close keys
-        // close it (note `q` does NOT fall through to the cancel arm below
-        // — a reviewer dismissing the help must not accidentally cancel the
-        // whole review), j/k scroll, everything else is swallowed rather
-        // than reaching the nav/verdict handling underneath.
+        // close it (note the cancel binding does NOT fall through to the
+        // cancel arm below — a reviewer dismissing the help must not
+        // accidentally cancel the whole review), down/up scroll, and
+        // everything else is swallowed rather than reaching the
+        // nav/verdict handling underneath. `?` and `q` stay literal close
+        // keys alongside the active Help binding, so the overlay's own
+        // "close this help" row is true under any remap.
         if self.help_open {
-            match key.code {
-                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                    self.help_open = false;
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    let max = self.help_max_scroll(term_size);
-                    self.help_scroll = (self.help_scroll + 1).min(max);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.help_scroll = self.help_scroll.saturating_sub(1);
-                }
-                _ => {}
+            let close_keys =
+                [KeyCode::Char('?'), KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')];
+            if action == Some(Action::Help) || close_keys.contains(&key.code) {
+                self.help_open = false;
+            } else if action == Some(Action::Down) {
+                let max = self.help_max_scroll(term_size);
+                self.help_scroll = (self.help_scroll + 1).min(max);
+            } else if action == Some(Action::Up) {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
             }
             return None;
         }
 
         // Global verdict keys (disabled while an input prompt is open, handled above).
-        match key.code {
-            KeyCode::Char('?') => {
+        match action {
+            Some(Action::Help) => {
                 self.help_open = true;
                 self.help_scroll = 0;
                 return None;
             }
-            KeyCode::Char('q') => {
+            Some(Action::Cancel) => {
                 return Some(Outcome {
                     verdict: Verdict::Cancelled,
                     summary: Some("reviewer cancelled".into()),
                     annotations: Vec::new(),
                 });
             }
-            KeyCode::Esc => {
-                // A live visual selection swallows Esc (clear it) rather
-                // than cancelling the whole review.
-                if self.visual_anchor.is_some() {
-                    self.visual_anchor = None;
-                    return None;
-                }
-                return Some(Outcome {
-                    verdict: Verdict::Cancelled,
-                    summary: Some("reviewer cancelled".into()),
-                    annotations: Vec::new(),
-                });
-            }
-            KeyCode::Char('a') => {
+            Some(Action::Approve) => {
                 return Some(Outcome {
                     verdict: Verdict::Approve,
                     summary: None,
                     annotations: self.pending_annotations(),
                 });
             }
-            KeyCode::Char('r') => {
+            Some(Action::RequestChanges) => {
                 self.input = Some(InputMode::Summary { buf: String::new() });
                 return None;
             }
-            KeyCode::Char('b') => {
+            Some(Action::ToggleFiles) => {
                 self.show_navigator = !self.show_navigator;
                 if !self.show_navigator && self.focus == Focus::Navigator {
                     self.focus = Focus::Diff;
@@ -1742,7 +1748,7 @@ impl<'a> App<'a> {
                 self.ensure_cursor_visible(term_size);
                 return None;
             }
-            KeyCode::Char('z') => {
+            Some(Action::Zoom) => {
                 if let Err(err) = crate::herdr::zoom_toggle_current() {
                     eprintln!("herdr-annotator pane: {err:#}");
                 }
@@ -1750,8 +1756,21 @@ impl<'a> App<'a> {
             }
             _ => {}
         }
+        if key.code == KeyCode::Esc {
+            // A live visual selection swallows Esc (clear it) rather
+            // than cancelling the whole review.
+            if self.visual_anchor.is_some() {
+                self.visual_anchor = None;
+                return None;
+            }
+            return Some(Outcome {
+                verdict: Verdict::Cancelled,
+                summary: Some("reviewer cancelled".into()),
+                annotations: Vec::new(),
+            });
+        }
 
-        self.handle_nav_key(key, term_size);
+        self.handle_nav_key(action, key, term_size);
         self.ensure_cursor_visible(term_size);
         None
     }
@@ -2380,10 +2399,13 @@ impl<'a> App<'a> {
         }
     }
 
-    fn handle_nav_key(&mut self, key: KeyEvent, term_size: Size) {
-        match key.code {
-            KeyCode::Char('[') => return self.resize_navigator(false, term_size),
-            KeyCode::Char(']') => return self.resize_navigator(true, term_size),
+    /// `action` is the keymap resolution `handle_key` already computed for
+    /// this press; the raw `key` rides along only for the fixed modal keys
+    /// (enter, tab) that are never in the keymap.
+    fn handle_nav_key(&mut self, action: Option<Action>, key: KeyEvent, term_size: Size) {
+        match action {
+            Some(Action::FilesNarrower) => return self.resize_navigator(false, term_size),
+            Some(Action::FilesWider) => return self.resize_navigator(true, term_size),
             _ => {}
         }
         match self.focus {
@@ -2392,24 +2414,24 @@ impl<'a> App<'a> {
                 if len == 0 {
                     return;
                 }
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
+                match (action, key.code) {
+                    (Some(Action::Down), _) => {
                         self.nav_cursor = (self.nav_cursor + 1).min(len - 1);
                         self.select_file_under_cursor();
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
+                    (Some(Action::Up), _) => {
                         self.nav_cursor = self.nav_cursor.saturating_sub(1);
                         self.select_file_under_cursor();
                     }
-                    KeyCode::Char('g') => {
+                    (Some(Action::Top), _) => {
                         self.nav_cursor = 0;
                         self.select_file_under_cursor();
                     }
-                    KeyCode::Char('G') => {
+                    (Some(Action::Bottom), _) => {
                         self.nav_cursor = len - 1;
                         self.select_file_under_cursor();
                     }
-                    KeyCode::Char('l') | KeyCode::Enter | KeyCode::Tab => {
+                    (Some(Action::Open), _) | (None, KeyCode::Enter | KeyCode::Tab) => {
                         self.activate_nav_row()
                     }
                     _ => {}
@@ -2418,63 +2440,64 @@ impl<'a> App<'a> {
             Focus::Diff => {
                 let row_count = self.view_row_count();
                 let cursor_before = self.diff.cursor;
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => self.diff.down(row_count),
-                    KeyCode::Char('k') | KeyCode::Up => self.diff.up(),
-                    KeyCode::Char('d') | KeyCode::PageDown => {
+                match (action, key.code) {
+                    (Some(Action::Down), _) => self.diff.down(row_count),
+                    (Some(Action::Up), _) => self.diff.up(),
+                    (Some(Action::HalfPageDown), _) => {
                         self.diff.page_down(half_page(term_size, self.show_navigator, self.nav_width), row_count)
                     }
-                    KeyCode::Char('u') | KeyCode::PageUp => {
+                    (Some(Action::HalfPageUp), _) => {
                         self.diff.page_up(half_page(term_size, self.show_navigator, self.nav_width))
                     }
                     // Hunk jumps only mean something in the diff view.
-                    KeyCode::Char('n') if self.view == ViewMode::Diff => {
+                    (Some(Action::NextHunk), _) if self.view == ViewMode::Diff => {
                         self.diff.next_hunk(&hunk_row_indices(&self.diff_rows()))
                     }
-                    KeyCode::Char('p') if self.view == ViewMode::Diff => {
+                    (Some(Action::PrevHunk), _) if self.view == ViewMode::Diff => {
                         self.diff.prev_hunk(&hunk_row_indices(&self.diff_rows()))
                     }
-                    KeyCode::Char('g') => self.diff.top(),
-                    KeyCode::Char('G') => self.diff.bottom(row_count),
+                    (Some(Action::Top), _) => self.diff.top(),
+                    (Some(Action::Bottom), _) => self.diff.bottom(row_count),
                     // Panning and wrapping are alternative answers to long
                     // lines: while wrapped there is nothing off-screen to
                     // pan to, so the pan keys go quiet instead of moving an
                     // invisible offset.
-                    KeyCode::Right | KeyCode::Char('L') if !self.wrap => {
+                    (Some(Action::PanRight), _) if !self.wrap => {
                         self.diff.hscroll =
                             self.next_pan_stop(self.diff.hscroll, self.pan_step(term_size))
                                 .min(self.pan_cap())
                     }
-                    KeyCode::Left | KeyCode::Char('H') if !self.wrap => {
+                    (Some(Action::PanLeft), _) if !self.wrap => {
                         self.diff.hscroll = self.diff.hscroll.saturating_sub(self.pan_step(term_size))
                     }
-                    KeyCode::Char('0') => self.diff.hscroll = 0,
-                    KeyCode::Char('w') => {
+                    (Some(Action::PanReset), _) => self.diff.hscroll = 0,
+                    (Some(Action::Wrap), _) => {
                         self.wrap = !self.wrap;
                         // Entering wrap with a live pan would wrap rows the
                         // reviewer can't see the start of; leaving it should
                         // start unpanned like every other view change.
                         self.diff.hscroll = 0;
                     }
-                    KeyCode::Char('h') | KeyCode::Tab => {
+                    (Some(Action::ToFiles), _) | (None, KeyCode::Tab) => {
                         // Focusing an invisible pane strands the keyboard
-                        // (j/k would switch files with no visible feedback):
-                        // going "to the files" while collapsed reveals them.
+                        // (down/up would switch files with no visible
+                        // feedback): going "to the files" while collapsed
+                        // reveals them.
                         self.show_navigator = true;
                         self.focus = Focus::Navigator;
                     }
-                    KeyCode::Char('v') => {
+                    (Some(Action::Select), _) => {
                         self.visual_anchor = match self.visual_anchor {
                             Some(_) => None,
                             None => Some(self.diff.cursor),
                         };
                     }
-                    KeyCode::Char('c') => self.open_comment_input(),
-                    KeyCode::Char('x') => self.delete_pending_at_cursor(),
-                    KeyCode::Char('t') => self.toggle_view(term_size),
-                    KeyCode::Enter => self.expand_fold_at_cursor(),
-                    KeyCode::Char('f') => self.fold_at_cursor_or_selection(),
-                    KeyCode::Char('F') => self.unfold_all(),
+                    (Some(Action::Comment), _) => self.open_comment_input(),
+                    (Some(Action::DeleteAnnotation), _) => self.delete_pending_at_cursor(),
+                    (Some(Action::ToggleView), _) => self.toggle_view(term_size),
+                    (None, KeyCode::Enter) => self.expand_fold_at_cursor(),
+                    (Some(Action::Fold), _) => self.fold_at_cursor_or_selection(),
+                    (Some(Action::UnfoldAll), _) => self.unfold_all(),
                     _ => {}
                 }
                 // Any move that landed inside a fold's hidden tail continues
@@ -2528,8 +2551,12 @@ impl<'a> App<'a> {
         // than advertising a dead key while it's the active view.
         let hunk_note =
             if self.view == ViewMode::Source { " \u{2014} inactive in source view" } else { "" };
-        // Same honesty for the pan keys, which `w` turns off entirely.
+        // Same honesty for the pan keys, which the wrap toggle turns off
+        // entirely.
         let pan_note = if self.wrap { " \u{2014} inactive while wrapped" } else { "" };
+        // Key labels come from the ACTIVE keymap, so the overlay stays the
+        // one reference that is always true under a `[keys]` remap.
+        let k = |action: Action| self.keymap.label(action);
 
         vec![
             // The overlay is itself a modal state: while it is open, the
@@ -2540,16 +2567,16 @@ impl<'a> App<'a> {
                 current: false,
                 rows: vec![
                     HelpRow::new("? / esc / q / enter", "close this help"),
-                    HelpRow::new("j / k", "scroll it"),
+                    HelpRow::new(format!("{} / {}", k(Action::Down), k(Action::Up)), "scroll it"),
                 ],
             },
             HelpSection {
                 name: "Finish (once help is closed)",
                 current: false,
                 rows: vec![
-                    HelpRow::new("a", "approve"),
-                    HelpRow::new("r", "request changes"),
-                    HelpRow::new("q", "cancel the review"),
+                    HelpRow::new(k(Action::Approve), "approve"),
+                    HelpRow::new(k(Action::RequestChanges), "request changes"),
+                    HelpRow::new(k(Action::Cancel), "cancel the review"),
                     HelpRow::new("esc", "cancel (clears an active selection first)"),
                     HelpRow::new("ctrl+c", "cancel, even mid-input"),
                 ],
@@ -2558,9 +2585,18 @@ impl<'a> App<'a> {
                 name: "Files",
                 current: files_current,
                 rows: vec![
-                    HelpRow::new("j / k", "move down / up"),
-                    HelpRow::new("g / G", "first / last row"),
-                    HelpRow::new("l / enter / tab", "open the file / toggle a folder"),
+                    HelpRow::new(
+                        format!("{} / {}", k(Action::Down), k(Action::Up)),
+                        "move down / up",
+                    ),
+                    HelpRow::new(
+                        format!("{} / {}", k(Action::Top), k(Action::Bottom)),
+                        "first / last row",
+                    ),
+                    HelpRow::new(
+                        format!("{} / enter / tab", k(Action::Open)),
+                        "open the file / toggle a folder",
+                    ),
                 ],
             },
             HelpSection {
@@ -2568,24 +2604,46 @@ impl<'a> App<'a> {
                 current: diff_current,
                 rows: {
                     let mut rows = vec![
-                        HelpRow::new("j / k", "move cursor"),
-                        HelpRow::new("g / G", "top / bottom"),
+                        HelpRow::new(
+                            format!("{} / {}", k(Action::Down), k(Action::Up)),
+                            "move cursor",
+                        ),
+                        HelpRow::new(
+                            format!("{} / {}", k(Action::Top), k(Action::Bottom)),
+                            "top / bottom",
+                        ),
                         HelpRow {
-                            key: "\u{2190} / \u{2192} (H/L)",
+                            key: format!(
+                                "\u{2190} / \u{2192} ({}/{})",
+                                k(Action::PanLeft),
+                                k(Action::PanRight)
+                            ),
                             desc: format!("pan left / right{pan_note}"),
                         },
-                        HelpRow::new("0", "reset pan"),
-                        HelpRow::new("w", "wrap long lines / back to clip-and-pan"),
-                        HelpRow::new("d / u", "half page down / up"),
-                        HelpRow { key: "n / p", desc: format!("next / prev hunk{hunk_note}") },
-                        HelpRow::new("h / tab", "focus the files"),
-                        HelpRow::new("t", "toggle diff / source view"),
+                        HelpRow::new(k(Action::PanReset), "reset pan"),
+                        HelpRow::new(k(Action::Wrap), "wrap long lines / back to clip-and-pan"),
+                        HelpRow::new(
+                            format!("{} / {}", k(Action::HalfPageDown), k(Action::HalfPageUp)),
+                            "half page down / up",
+                        ),
+                        HelpRow {
+                            key: format!("{} / {}", k(Action::NextHunk), k(Action::PrevHunk)),
+                            desc: format!("next / prev hunk{hunk_note}"),
+                        },
+                        HelpRow::new(format!("{} / tab", k(Action::ToFiles)), "focus the files"),
+                        HelpRow::new(k(Action::ToggleView), "toggle diff / source view"),
                     ];
                     // Folding lives in source view only: the diff already
                     // shows just its hunks.
                     if self.view == ViewMode::Source {
-                        rows.push(HelpRow::new("f", "fold the selection / the block under the cursor"));
-                        rows.push(HelpRow::new("F", "unfold everything in this file"));
+                        rows.push(HelpRow::new(
+                            k(Action::Fold),
+                            "fold the selection / the block under the cursor",
+                        ));
+                        rows.push(HelpRow::new(
+                            k(Action::UnfoldAll),
+                            "unfold everything in this file",
+                        ));
                     }
                     if !self.active_folds().is_empty() {
                         rows.push(HelpRow::new("enter", "expand the fold under the cursor"));
@@ -2597,23 +2655,29 @@ impl<'a> App<'a> {
                 name: "Annotate",
                 current: false,
                 rows: vec![
-                    HelpRow::new("v", "start / clear a selection"),
-                    HelpRow::new("c", "comment on selection or cursor line"),
+                    HelpRow::new(k(Action::Select), "start / clear a selection"),
+                    HelpRow::new(k(Action::Comment), "comment on selection or cursor line"),
                     HelpRow::new("  ctrl+t", "cycle the tag"),
                     HelpRow::new("  enter", "save the comment"),
                     HelpRow::new("  esc", "cancel the comment"),
-                    HelpRow::new("c (annotated line)", "edit the comment"),
-                    HelpRow::new("x", "delete annotation at cursor"),
+                    HelpRow::new(
+                        format!("{} (annotated line)", k(Action::Comment)),
+                        "edit the comment",
+                    ),
+                    HelpRow::new(k(Action::DeleteAnnotation), "delete annotation at cursor"),
                 ],
             },
             HelpSection {
                 name: "Layout & views",
                 current: false,
                 rows: vec![
-                    HelpRow::new("b", "show / hide the files pane"),
-                    HelpRow::new("[ / ]", "shrink / widen the files pane"),
-                    HelpRow::new("z", "zoom the pane"),
-                    HelpRow::new("?", "toggle this help"),
+                    HelpRow::new(k(Action::ToggleFiles), "show / hide the files pane"),
+                    HelpRow::new(
+                        format!("{} / {}", k(Action::FilesNarrower), k(Action::FilesWider)),
+                        "shrink / widen the files pane",
+                    ),
+                    HelpRow::new(k(Action::Zoom), "zoom the pane"),
+                    HelpRow::new(k(Action::Help), "toggle this help"),
                 ],
             },
             HelpSection {
@@ -2621,7 +2685,7 @@ impl<'a> App<'a> {
                 current: false,
                 rows: vec![
                     HelpRow::new("wheel", "scroll the files or the diff"),
-                    HelpRow { key: "horiz. wheel", desc: format!("pan the diff{pan_note}") },
+                    HelpRow { key: "horiz. wheel".to_string(), desc: format!("pan the diff{pan_note}") },
                     HelpRow::new("click", "select a file / move the cursor"),
                     HelpRow::new("drag", "select a range in the diff"),
                     HelpRow::new("drag the divider", "resize the file list"),
@@ -2671,13 +2735,15 @@ impl<'a> App<'a> {
 }
 
 struct HelpRow {
-    key: &'static str,
+    /// Owned, not `&'static`: most labels are composed from the active
+    /// keymap's bindings at overlay time.
+    key: String,
     desc: String,
 }
 
 impl HelpRow {
-    fn new(key: &'static str, desc: &str) -> Self {
-        HelpRow { key, desc: desc.to_string() }
+    fn new(key: impl Into<String>, desc: &str) -> Self {
+        HelpRow { key: key.into(), desc: desc.to_string() }
     }
 }
 
@@ -2837,8 +2903,17 @@ fn summary_footer_text(buf: &str, width: usize) -> String {
 /// (`path:line`, diff focus) or `files (n)` (navigator focus); it comes
 /// FIRST so it's what survives if the pane is too narrow for the rest, the
 /// same "position outlives the hints" convention the old footer used.
-fn slim_footer_text(context: &str, width: usize) -> String {
-    let hints = " \u{b7} a approve \u{b7} r request changes \u{b7} q cancel \u{b7} ? help";
+fn slim_footer_text(context: &str, keymap: &Keymap, width: usize) -> String {
+    // Hints carry the ACTIVE bindings, like the `?` overlay: a remapped
+    // pane must not advertise keys it no longer listens to.
+    let k = |action: Action| keymap.label(action);
+    let hints = format!(
+        " \u{b7} {} approve \u{b7} {} request changes \u{b7} {} cancel \u{b7} {} help",
+        k(Action::Approve),
+        k(Action::RequestChanges),
+        k(Action::Cancel),
+        k(Action::Help)
+    );
     let full = format!(" {context}{hints}");
     if str_cols(&full) <= width {
         return full;
@@ -2865,7 +2940,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 Focus::Navigator => format!("files ({})", app.files().len()),
                 Focus::Diff => app.cursor_position().unwrap_or_default(),
             };
-            slim_footer_text(&context, area.width as usize)
+            slim_footer_text(&context, &app.keymap, area.width as usize)
         }
     };
     let footer = Paragraph::new(text).style(Style::default().add_modifier(Modifier::REVERSED));
@@ -4672,7 +4747,7 @@ mod tests {
         // The slimmed non-input footer: context first, then the four
         // always-on keys, `? help` included — this is what replaced the old
         // per-focus hint sausage that used to overflow narrow panes.
-        let text = slim_footer_text("a.txt:1", 80);
+        let text = slim_footer_text("a.txt:1", &Keymap::default(), 80);
         assert_eq!(text, " a.txt:1 \u{b7} a approve \u{b7} r request changes \u{b7} q cancel \u{b7} ? help");
         assert!(str_cols(&text) <= 80);
     }
@@ -4682,13 +4757,24 @@ mod tests {
         // Position survives, key hints get cut — the same convention the
         // old (now-removed) `diff_focus_footer` used.
         let wide_enough_for_context_only = " a.txt:1".chars().count();
-        let text = slim_footer_text("a.txt:1", wide_enough_for_context_only);
+        let text = slim_footer_text("a.txt:1", &Keymap::default(), wide_enough_for_context_only);
         assert_eq!(text, " a.txt:1");
         assert!(!text.contains("approve"));
 
         // Too narrow even for the bare context: tail_fit keeps its end.
-        let text = slim_footer_text("src/very/long/nested/path/file.rs:123", 10);
+        let text = slim_footer_text("src/very/long/nested/path/file.rs:123", &Keymap::default(), 10);
         assert!(str_cols(&text) <= 10, "footer must never exceed the pane width: {text:?}");
+    }
+
+    #[test]
+    fn slim_footer_advertises_the_remapped_verdict_keys() {
+        // The footer hints come from the active keymap, like the `?` overlay:
+        // after a remap it must show the live keys, not the defaults.
+        let keymap = custom_keymap(&[("approve", "ctrl+y"), ("help", "!")]);
+        let text = slim_footer_text("a.txt:1", &keymap, 80);
+        assert!(text.contains("ctrl+y approve"), "remapped approve key must show: {text:?}");
+        assert!(text.contains("! help"), "remapped help key must show: {text:?}");
+        assert!(!text.contains(" a approve"), "released default must not show: {text:?}");
     }
 
     #[test]
@@ -6536,7 +6622,7 @@ mod tests {
         let width = 80usize;
 
         let context = app.cursor_position().expect("cursor sits on a line");
-        let text = slim_footer_text(&context, width);
+        let text = slim_footer_text(&context, &app.keymap, width);
         assert!(text.contains("? help"), "footer must advertise the new help overlay: {text:?}");
         assert!(text.contains(&context), "footer must still show the position: {text:?}");
         assert!(str_cols(&text) <= width, "footer must fit the pane: {text:?}");
@@ -7463,6 +7549,50 @@ mod tests {
             wrap_height(&placeholder, inner),
             "the map must count the wrapped placeholder's continuation rows"
         );
+    }
+
+    fn custom_keymap(pairs: &[(&str, &str)]) -> Keymap {
+        let overrides: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        Keymap::with_overrides(&overrides).expect("test keymap must be valid")
+    }
+
+    #[test]
+    fn remapped_keys_drive_the_pane_and_the_defaults_are_released() {
+        let (request, model) = long_line_fixture();
+        let mut app = long_line_app(&request, &model);
+        app.keymap = custom_keymap(&[("wrap", "W"), ("approve", "ctrl+y")]);
+        let term = Size { width: 60, height: 20 };
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE), term);
+        assert!(!app.wrap, "the default key is released once the action is remapped");
+        app.handle_key(KeyEvent::new(KeyCode::Char('W'), KeyModifiers::NONE), term);
+        assert!(app.wrap, "the remapped key drives the action");
+
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), term).is_none(),
+            "the released approve default must not finish the review"
+        );
+        let outcome =
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL), term);
+        assert!(
+            matches!(outcome, Some(Outcome { verdict: Verdict::Approve, .. })),
+            "the ctrl-remapped approve must finish the review"
+        );
+    }
+
+    #[test]
+    fn help_overlay_renders_the_active_bindings_not_the_defaults() {
+        let (request, model) = long_line_fixture();
+        let mut app = long_line_app(&request, &model);
+        app.keymap = custom_keymap(&[("wrap", "W")]);
+        let text: String =
+            app.help_lines(72).iter().map(|l| format!("{}\n", line_text(l))).collect();
+        let wrap_row = text
+            .lines()
+            .find(|l| l.contains("wrap long lines"))
+            .expect("the overlay must list the wrap action");
+        assert!(wrap_row.trim_start().starts_with('W'), "stale default in {wrap_row:?}");
     }
 
     #[test]
