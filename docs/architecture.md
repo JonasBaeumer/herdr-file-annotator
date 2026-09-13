@@ -26,6 +26,17 @@ review: `goto` navigation flows agent → pane over it, and the verdict flows
 back whenever the reviewer decides — collected by `collect_review` instead
 of a blocked tool call.
 
+## Blocked status in the herdr agent view
+
+While a review is pending, the pane reports itself to herdr's agent view as
+a blocked agent labeled `annotator` (via `herdr pane report-agent`), so the
+sidebar shows the attention dot on the review's tab — useful when agents run
+in background tabs. The entry is released when the reviewer submits a
+verdict, and herdr drops it on its own if the pane closes any other way, so
+it can never go stale. The report targets the review pane, not the coding
+agent's pane: herdr's built-in agent detection owns the lifecycle state of
+panes it recognizes and ignores external reports there.
+
 ## Install layout
 
 The plugin installs under a herdr-managed directory (e.g.
