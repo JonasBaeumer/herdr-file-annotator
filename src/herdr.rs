@@ -165,15 +165,16 @@ pub fn open_review_pane(socket_path: &str, config: &Config) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    /// Serializes the HERDR_BIN_PATH mutation: these tests swap the binary
-    /// the whole module resolves, so they must not overlap each other.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Serializes the HERDR_BIN_PATH mutation: these tests (and pane's
+    /// lifecycle tests) swap the binary the whole module resolves, so they
+    /// must not overlap each other.
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn fake_herdr(dir: &Path, exit_code: i32) -> (PathBuf, PathBuf) {
         std::fs::create_dir_all(dir).unwrap();
@@ -203,9 +204,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Like `fake_herdr`, but appends to the log — the nudge makes two CLI
-    /// calls and both argvs need to survive.
-    fn fake_herdr_appending(dir: &Path, exit_code: i32) -> (PathBuf, PathBuf) {
+    /// Like `fake_herdr`, but appends to the log — used where several CLI
+    /// calls happen in sequence and every argv needs to survive.
+    pub(crate) fn fake_herdr_appending(dir: &Path, exit_code: i32) -> (PathBuf, PathBuf) {
         std::fs::create_dir_all(dir).unwrap();
         let log = dir.join("argv.log");
         let script = dir.join("herdr-fake.sh");
