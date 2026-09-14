@@ -33,7 +33,7 @@ use syntect::easy::HighlightLines;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::parsing::{SyntaxDefinition, SyntaxReference, SyntaxSet};
 
 use crate::diff::{load_source, DiffLine, DiffModel, FileDiff, FileStatus, Origin};
 use crate::keymap::{Action, Context, Keymap};
@@ -54,6 +54,14 @@ pub struct Outcome {
 /// lifetime of the process via `OnceLock`, rather than being threaded
 /// through as owned state on `App` (which would tangle `App`'s lifetime
 /// with the highlighter's).
+///
+/// syntect's default set predates TypeScript, so `.ts`/`.tsx` files would
+/// otherwise fall back to plain text (see `syntax_for_path`). The two
+/// grammars below are bundled in `assets/syntaxes/` (machine conversions
+/// of Microsoft's MIT-licensed TypeScript-TmLanguage grammars, vendored via
+/// bat) and layered onto the defaults at startup. TSX rendering under
+/// syntect is imperfect for some expressions (upstream syntect#97) but
+/// strictly more informative than monochrome plain text.
 struct Highlighter {
     syntax_set: SyntaxSet,
     theme: Theme,
@@ -63,11 +71,32 @@ static HIGHLIGHTER: OnceLock<Highlighter> = OnceLock::new();
 
 fn highlighter() -> &'static Highlighter {
     HIGHLIGHTER.get_or_init(|| {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+        let syntax_set = bundled_syntax_set();
         let theme_set = ThemeSet::load_defaults();
         let theme = theme_set.themes["base16-eighties.dark"].clone();
         Highlighter { syntax_set, theme }
     })
+}
+
+/// Default syntax set plus the bundled TypeScript/TSX grammars, embedded
+/// at compile time (`include_str!`, since the pane runs with cwd set to the
+/// repo under review — a runtime-relative asset path would not resolve).
+/// A grammar that fails to parse is skipped with a stderr warning and the
+/// review still starts on the remaining set; highlighting must never block
+/// reviewing.
+fn bundled_syntax_set() -> SyntaxSet {
+    const BUNDLED: [(&str, &str); 2] = [
+        ("TypeScript", include_str!("../assets/syntaxes/TypeScript.sublime-syntax")),
+        ("TSX", include_str!("../assets/syntaxes/TSX.sublime-syntax")),
+    ];
+    let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+    for (label, src) in BUNDLED {
+        match SyntaxDefinition::load_from_str(src, true, None) {
+            Ok(def) => builder.add(def),
+            Err(e) => eprintln!("herdr-annotator: skipping bundled {label} grammar: {e}"),
+        }
+    }
+    builder.build()
 }
 
 /// Look up the syntax for a file by its path's extension, falling back to
@@ -6155,6 +6184,98 @@ mod tests {
         );
         assert!(
             fgs.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "expected more than one distinct token color, got {fgs:?}"
+        );
+    }
+
+    #[test]
+    fn ts_and_tsx_extensions_resolve_to_bundled_grammars() {
+        // syntect's defaults ship no TypeScript grammar, so without the
+        // bundled grammars these all fall back to plain text (see
+        // `syntax_for_path`). Pin the resolution, not just "not plain
+        // text", so a future grammar reshuffle that steals the extension
+        // fails loudly here instead of silently changing colors.
+        let hl = highlighter();
+        assert_eq!(syntax_for_path(hl, "src/app.ts").name, "TypeScript");
+        assert_eq!(syntax_for_path(hl, "src/app.mts").name, "TypeScript");
+        assert_eq!(syntax_for_path(hl, "src/app.cts").name, "TypeScript");
+        assert_eq!(
+            syntax_for_path(hl, "src/comp.tsx").name,
+            "TypeScriptReact"
+        );
+    }
+
+    #[test]
+    fn highlighted_ts_add_line_is_polychrome() {
+        let file = FileDiff {
+            path: "src/app.ts".to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            adds: 1,
+            dels: 0,
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,2 @@".to_string(),
+                old_start: 1,
+                old_count: 1,
+                new_start: 1,
+                new_count: 2,
+                lines: vec![line(
+                    Origin::Add,
+                    None,
+                    Some(2),
+                    "    const x: number = 1;",
+                )],
+            }],
+        };
+
+        let rows = highlight_file_rows(highlighter(), &file);
+        assert_eq!(rows.len(), 2);
+        let add_line = &rows[1];
+        let content: String =
+            add_line.spans[2..].iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(content, "    const x: number = 1;");
+        for span in &add_line.spans[2..] {
+            assert_eq!(span.style.bg, Some(ADD_BG));
+        }
+        // Plain-text fallback renders the whole line in one foreground;
+        // the TypeScript grammar must tokenize keywords apart from the
+        // surrounding code.
+        let fgs: Vec<_> = add_line.spans[2..]
+            .iter()
+            .map(|s| s.style.fg)
+            .collect();
+        assert!(
+            fgs.iter().all(|fg| matches!(fg, Some(Color::Rgb(..)))),
+            "expected RGB foregrounds from syntect, got {fgs:?}"
+        );
+        assert!(
+            fgs.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "expected more than one distinct token color, got {fgs:?}"
+        );
+    }
+
+    #[test]
+    fn highlighted_tsx_source_rows_tokenize_jsx() {
+        let lines = [
+            "export function Comp({ name }: { name: string }) {".to_string(),
+            "  return <div className=\"hi\">Hello {name}</div>;".to_string(),
+            "}".to_string(),
+        ];
+        let rows = highlight_source_rows(highlighter(), "src/comp.tsx", &lines);
+        assert_eq!(rows.len(), 3);
+        // Source rows are [gutter, spacer, content…]: the content spans
+        // must reproduce the line exactly.
+        let text: String =
+            rows[1].spans[2..].iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, lines[1]);
+        // The JSX tag line must carry several token colors (tags,
+        // attributes, embedded expression) rather than the single
+        // foreground of the plain-text fallback.
+        let fgs: std::collections::HashSet<_> =
+            rows[1].spans[2..].iter().map(|s| s.style.fg).collect();
+        assert!(
+            fgs.len() > 1,
             "expected more than one distinct token color, got {fgs:?}"
         );
     }
