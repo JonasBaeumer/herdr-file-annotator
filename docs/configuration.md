@@ -88,3 +88,8 @@ overlay always shows your active bindings.
 | `toggle_view` | `t` | diff | toggle diff / source view |
 | `fold` | `f` | diff | fold the selection / block (source view) |
 | `unfold_all` | `F` | diff | unfold the file (source view) |
+
+## Troubleshooting
+
+If the review pane opens without focus, check the `focus` key in the
+plugin config: `focus = true` moves the cursor into the pane at open.
