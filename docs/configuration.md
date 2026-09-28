@@ -40,9 +40,11 @@ enabled_tools = ["show_changes", "goto", "collect_review"]
 ```
 
 A disabled tool is hidden from the agent and a direct call to one is
-rejected. The list must contain only known tool names, with no duplicates —
-anything else prints one warning and the full defaults apply, like every
-other bad config value.
+rejected. The list must contain only known tool names, with no duplicates,
+and `show_changes` requires `collect_review` (a guided review's verdict is
+only retrievable through `collect_review`, so naming one without the other
+would strand the review) — anything else prints one warning and the full
+defaults apply, like every other bad config value.
 
 The config is read when the MCP server starts, so changes apply after
 restarting your agent (or reconnecting its MCP servers — `/mcp` in Claude

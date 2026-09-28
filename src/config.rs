@@ -69,8 +69,11 @@ pub struct Config {
     /// the rest and a call to a hidden tool is rejected. An explicit empty
     /// list exposes no tools. Names are validated against `ALL_TOOL_NAMES`:
     /// unknown or duplicate entries reject the whole config, same
-    /// all-or-nothing fallback as a bad `[keys]` table.
-    pub enabled_tools: Option<Vec<&'static str>>,
+    /// all-or-nothing fallback as a bad `[keys]` table. One dependency is
+    /// enforced: `show_changes` requires `collect_review`, because only
+    /// `collect_review` clears the open-review slot — without it the first
+    /// guided review would wedge the server for good.
+    pub enabled_tools: Option<Vec<String>>,
 }
 
 impl Default for Config {
@@ -190,36 +193,32 @@ fn validate(raw: RawConfig) -> Result<Config, String> {
             None => default.keymap,
             Some(pairs) => Keymap::with_overrides(pairs).map_err(|e| format!("[keys] {e}"))?,
         },
-        enabled_tools: match &raw.enabled_tools {
+        enabled_tools: match raw.enabled_tools {
             None => default.enabled_tools,
             Some(names) => {
-                for name in names {
+                let mut seen = std::collections::HashSet::new();
+                for name in &names {
                     if !ALL_TOOL_NAMES.contains(&name.as_str()) {
                         return Err(format!(
                             "[enabled_tools] unknown tool {name:?} (known tools: {ALL_TOOL_NAMES:?})"
                         ));
                     }
-                }
-                let mut seen = std::collections::HashSet::new();
-                for name in names {
-                    if !seen.insert(name.as_str()) {
+                    if !seen.insert(name.clone()) {
                         return Err(format!("[enabled_tools] duplicate entry {name:?}"));
                     }
                 }
-                // The names are already validated; mapping through
-                // ALL_TOOL_NAMES just re-anchors them as 'static slices.
-                Some(
-                    names
-                        .iter()
-                        .map(|name| {
-                            ALL_TOOL_NAMES
-                                .iter()
-                                .find(|known| **known == name.as_str())
-                                .copied()
-                                .unwrap()
-                        })
-                        .collect(),
-                )
+                // Only collect_review clears the open-review slot, so a list
+                // that lets the agent open a guided review but never collect
+                // it would wedge the server after one show_changes call.
+                if names.iter().any(|n| n == "show_changes")
+                    && !names.iter().any(|n| n == "collect_review")
+                {
+                    return Err("[enabled_tools] show_changes requires collect_review \
+                                (a guided review's verdict is only retrievable through \
+                                collect_review)"
+                        .to_string());
+                }
+                Some(names)
             }
         },
     })
@@ -230,7 +229,7 @@ impl Config {
     pub fn tool_enabled(&self, name: &str) -> bool {
         match &self.enabled_tools {
             None => true,
-            Some(list) => list.contains(&name),
+            Some(list) => list.iter().any(|n| n == name),
         }
     }
 }
@@ -325,20 +324,20 @@ mod tests {
 
         // A non-empty list exposes only the chosen tools.
         let raw: RawConfig =
-            toml::from_str(r#"enabled_tools = ["show_changes", "goto"]"#).unwrap();
+            toml::from_str(r#"enabled_tools = ["show_changes", "goto", "collect_review"]"#)
+                .unwrap();
         let config = validate(raw).unwrap();
-        assert_eq!(config.enabled_tools.as_deref(), Some(&["show_changes", "goto"][..]));
         assert!(config.tool_enabled("show_changes"));
         assert!(config.tool_enabled("goto"));
+        assert!(config.tool_enabled("collect_review"));
         assert!(!config.tool_enabled("review_changes"));
         assert!(!config.tool_enabled("focus"));
-        assert!(!config.tool_enabled("collect_review"));
 
         // An explicit empty list exposes no tools — a deliberate shutdown,
         // distinct from the key being absent (every tool).
         let none: RawConfig = toml::from_str("enabled_tools = []").unwrap();
         let config = validate(none).unwrap();
-        assert_eq!(config.enabled_tools.as_deref(), Some(&[][..]));
+        assert_eq!(config.enabled_tools, Some(Vec::new()));
         assert!(!config.tool_enabled("review_changes"));
     }
 
@@ -346,8 +345,13 @@ mod tests {
     fn enabled_tools_unknown_or_duplicate_names_reject_the_config() {
         for table in [
             r#"enabled_tools = ["review_changes", "nope"]"#,
-            r#"enabled_tools = ["show_changes", "show_changes"]"#,
+            r#"enabled_tools = ["show_changes", "show_changes", "collect_review"]"#,
             r#"enabled_tools = [""]"#,
+            // show_changes without collect_review: the verdict of a guided
+            // review would be unretrievable and the open-review slot could
+            // never be cleared — the server would wedge after one call.
+            r#"enabled_tools = ["show_changes"]"#,
+            r#"enabled_tools = ["show_changes", "goto", "focus"]"#,
         ] {
             let raw: RawConfig = toml::from_str(table).unwrap();
             let err = validate(raw);

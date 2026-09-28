@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn enabled_tools_hide_tools_from_list_and_reject_their_calls() {
         let config = Config {
-            enabled_tools: Some(vec![SHOW_CHANGES, COLLECT_REVIEW]),
+            enabled_tools: Some(vec![SHOW_CHANGES.to_string(), COLLECT_REVIEW.to_string()]),
             ..Config::default()
         };
 
@@ -862,11 +862,14 @@ mod tests {
 
     #[test]
     fn with_collect_review_disabled_the_show_changes_description_drops_the_nudge_promise() {
-        // The nudge can only be acted on through collect_review; with that
-        // tool disabled the promise must disappear along with it, even with
-        // notify_on_verdict still on.
+        // The nudge can only be acted on through collect_review, so the
+        // promise must disappear along with it, even with notify_on_verdict
+        // still on. Config validation refuses show_changes without
+        // collect_review, so this state cannot come from a config file; the
+        // descriptor gate is kept as defense in depth and pinned here via a
+        // directly-constructed Config.
         let config = Config {
-            enabled_tools: Some(vec![SHOW_CHANGES]),
+            enabled_tools: Some(vec![SHOW_CHANGES.to_string()]),
             ..Config::default()
         };
         let tools = enabled_tool_descriptors(&config);
