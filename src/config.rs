@@ -24,6 +24,16 @@ use crate::keymap::Keymap;
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_ACCEPT_TIMEOUT_SECS: u64 = 20;
 
+/// Every tool name the MCP server knows, and the single source of truth for
+/// what `enabled_tools` may name — `config.rs` and `mcp.rs` both read it.
+pub const ALL_TOOL_NAMES: &[&str] = &[
+    "review_changes",
+    "show_changes",
+    "goto",
+    "focus",
+    "collect_review",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     Split,
@@ -54,6 +64,16 @@ pub struct Config {
     /// overrides. Resolved here so an invalid table follows the same
     /// warn-and-use-defaults path as every other config problem.
     pub keymap: Keymap,
+    /// The MCP tools the server exposes. `None` (the default) means every
+    /// tool; `Some(list)` exposes only the listed tools — `tools/list` hides
+    /// the rest and a call to a hidden tool is rejected. An explicit empty
+    /// list exposes no tools. Names are validated against `ALL_TOOL_NAMES`:
+    /// unknown or duplicate entries reject the whole config, same
+    /// all-or-nothing fallback as a bad `[keys]` table. One dependency is
+    /// enforced: `show_changes` requires `collect_review`, because only
+    /// `collect_review` clears the open-review slot — without it the first
+    /// guided review would wedge the server for good.
+    pub enabled_tools: Option<Vec<String>>,
 }
 
 impl Default for Config {
@@ -67,6 +87,7 @@ impl Default for Config {
             notify_on_verdict: true,
             wrap_lines: false,
             keymap: Keymap::default(),
+            enabled_tools: None,
         }
     }
 }
@@ -84,6 +105,7 @@ struct RawConfig {
     notify_on_verdict: Option<bool>,
     wrap_lines: Option<bool>,
     keys: Option<HashMap<String, String>>,
+    enabled_tools: Option<Vec<String>>,
 }
 
 /// Load the plugin config, falling back to defaults on any problem. Never
@@ -171,7 +193,45 @@ fn validate(raw: RawConfig) -> Result<Config, String> {
             None => default.keymap,
             Some(pairs) => Keymap::with_overrides(pairs).map_err(|e| format!("[keys] {e}"))?,
         },
+        enabled_tools: match raw.enabled_tools {
+            None => default.enabled_tools,
+            Some(names) => {
+                let mut seen = std::collections::HashSet::new();
+                for name in &names {
+                    if !ALL_TOOL_NAMES.contains(&name.as_str()) {
+                        return Err(format!(
+                            "[enabled_tools] unknown tool {name:?} (known tools: {ALL_TOOL_NAMES:?})"
+                        ));
+                    }
+                    if !seen.insert(name.clone()) {
+                        return Err(format!("[enabled_tools] duplicate entry {name:?}"));
+                    }
+                }
+                // Only collect_review clears the open-review slot, so a list
+                // that lets the agent open a guided review but never collect
+                // it would wedge the server after one show_changes call.
+                if names.iter().any(|n| n == "show_changes")
+                    && !names.iter().any(|n| n == "collect_review")
+                {
+                    return Err("[enabled_tools] show_changes requires collect_review \
+                                (a guided review's verdict is only retrievable through \
+                                collect_review)"
+                        .to_string());
+                }
+                Some(names)
+            }
+        },
     })
+}
+
+impl Config {
+    /// Is the named tool exposed by this config? `None` means every tool.
+    pub fn tool_enabled(&self, name: &str) -> bool {
+        match &self.enabled_tools {
+            None => true,
+            Some(list) => list.iter().any(|n| n == name),
+        }
+    }
 }
 
 /// Resolve the plugin's config directory: prefer asking herdr itself (so we
@@ -222,6 +282,10 @@ mod tests {
         assert_eq!(config.review_timeout, None);
         assert!(config.notify_on_verdict, "the nudge is on unless the config turns it off");
         assert!(!config.wrap_lines, "clip-and-pan stays the default; wrap is opt-in");
+        assert!(
+            config.enabled_tools.is_none(),
+            "enabled_tools defaults to every tool"
+        );
     }
 
     #[test]
@@ -246,6 +310,53 @@ mod tests {
         assert_eq!(config.review_timeout, Some(Duration::from_secs(600)));
         assert!(!config.notify_on_verdict);
         assert!(config.wrap_lines);
+    }
+
+    #[test]
+    fn enabled_tools_defaults_to_every_tool_and_a_list_restricts_it() {
+        // Absent means all tools.
+        let all: RawConfig = toml::from_str("").unwrap();
+        let config = validate(all).unwrap();
+        assert!(config.enabled_tools.is_none());
+        for name in ALL_TOOL_NAMES {
+            assert!(config.tool_enabled(name));
+        }
+
+        // A non-empty list exposes only the chosen tools.
+        let raw: RawConfig =
+            toml::from_str(r#"enabled_tools = ["show_changes", "goto", "collect_review"]"#)
+                .unwrap();
+        let config = validate(raw).unwrap();
+        assert!(config.tool_enabled("show_changes"));
+        assert!(config.tool_enabled("goto"));
+        assert!(config.tool_enabled("collect_review"));
+        assert!(!config.tool_enabled("review_changes"));
+        assert!(!config.tool_enabled("focus"));
+
+        // An explicit empty list exposes no tools — a deliberate shutdown,
+        // distinct from the key being absent (every tool).
+        let none: RawConfig = toml::from_str("enabled_tools = []").unwrap();
+        let config = validate(none).unwrap();
+        assert_eq!(config.enabled_tools, Some(Vec::new()));
+        assert!(!config.tool_enabled("review_changes"));
+    }
+
+    #[test]
+    fn enabled_tools_unknown_or_duplicate_names_reject_the_config() {
+        for table in [
+            r#"enabled_tools = ["review_changes", "nope"]"#,
+            r#"enabled_tools = ["show_changes", "show_changes", "collect_review"]"#,
+            r#"enabled_tools = [""]"#,
+            // show_changes without collect_review: the verdict of a guided
+            // review would be unretrievable and the open-review slot could
+            // never be cleared — the server would wedge after one call.
+            r#"enabled_tools = ["show_changes"]"#,
+            r#"enabled_tools = ["show_changes", "goto", "focus"]"#,
+        ] {
+            let raw: RawConfig = toml::from_str(table).unwrap();
+            let err = validate(raw);
+            assert!(err.is_err(), "{table:?} must be rejected, got {err:?}");
+        }
     }
 
     #[test]

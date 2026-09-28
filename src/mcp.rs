@@ -83,7 +83,7 @@ pub fn run() -> Result<()> {
             ("initialize", Some(id)) => Some(result_frame(id, initialize_result(&params))),
             ("ping", Some(id)) => Some(result_frame(id, json!({}))),
             ("tools/list", Some(id)) => {
-                Some(result_frame(id, json!({ "tools": tool_descriptors(&config) })))
+                Some(result_frame(id, json!({ "tools": enabled_tool_descriptors(&config) })))
             }
             ("tools/call", Some(id)) => {
                 Some(result_frame(id, handle_tool_call(&params, &config, &mut active)))
@@ -153,7 +153,7 @@ fn review_input_schema() -> Value {
 /// nudge — a promise that must disappear when `notify_on_verdict = false`,
 /// or the agent waits for a prompt that never comes.
 fn tool_descriptors(config: &Config) -> Vec<Value> {
-    let nudge_promise = if config.notify_on_verdict {
+    let nudge_promise = if config.notify_on_verdict && config.tool_enabled(COLLECT_REVIEW) {
         " If the reviewer finishes while you are not polling, the server sends a short '[herdr-annotator] The reviewer finished…' prompt into your chat — when you see it, call collect_review and act on the feedback."
     } else {
         ""
@@ -247,8 +247,25 @@ fn tool_descriptors(config: &Config) -> Vec<Value> {
     ]
 }
 
+/// The `tools/list` payload: every descriptor, minus the ones the config
+/// disables. A hidden tool is not advertised, so a well-behaved client never
+/// calls it — but the call path still checks (see `handle_tool_call`).
+fn enabled_tool_descriptors(config: &Config) -> Vec<Value> {
+    tool_descriptors(config)
+        .into_iter()
+        .filter(|t| t["name"].as_str().map(|n| config.tool_enabled(n)).unwrap_or(true))
+        .collect()
+}
+
 fn handle_tool_call(params: &Value, config: &Config, active: &mut Option<ActiveReview>) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+    // Only known tools can be "disabled" — anything else falls through to
+    // the unknown-tool error below rather than disguising a typo as config.
+    if crate::config::ALL_TOOL_NAMES.contains(&name) && !config.tool_enabled(name) {
+        return tool_error(format!(
+            "tool {name:?} is disabled by the server's enabled_tools config"
+        ));
+    }
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     match name {
         REVIEW_CHANGES => handle_review_changes(&args, config, active),
@@ -568,7 +585,8 @@ fn run_review(args: &Value, config: &Config) -> Result<ReviewResult> {
 fn run_show(args: &Value, config: &Config) -> Result<ActiveReview> {
     let prepared = prepare_handoff(args, config)?;
     let collector_waiting = Arc::new(AtomicBool::new(false));
-    let notify: Option<VerdictNotify> = if config.notify_on_verdict {
+    let notify: Option<VerdictNotify> =
+        if config.notify_on_verdict && config.tool_enabled(COLLECT_REVIEW) {
         let waiting = Arc::clone(&collector_waiting);
         Some(Box::new(move |result: &ReviewResult| {
             if waiting.load(Ordering::SeqCst) {
@@ -801,6 +819,66 @@ mod tests {
             !desc(&without_nudge).contains("[herdr-annotator]"),
             "with notify_on_verdict off, the description must not promise a prompt that never comes"
         );
+    }
+
+    #[test]
+    fn enabled_tools_hide_tools_from_list_and_reject_their_calls() {
+        let config = Config {
+            enabled_tools: Some(vec![SHOW_CHANGES.to_string(), COLLECT_REVIEW.to_string()]),
+            ..Config::default()
+        };
+
+        let listed = enabled_tool_descriptors(&config);
+        let names: Vec<&str> = listed.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert_eq!(names, vec![SHOW_CHANGES, COLLECT_REVIEW]);
+
+        // A call to a hidden tool is rejected as disabled, not as unknown.
+        let mut active: Option<ActiveReview> = None;
+        let err = handle_tool_call(&json!({ "name": GOTO, "arguments": {} }), &config, &mut active);
+        assert_eq!(err["isError"], true);
+        assert!(
+            err["content"][0]["text"].as_str().unwrap().contains("enabled_tools"),
+            "{err}"
+        );
+
+        // An enabled tool passes the gate (it fails later on "no open
+        // review", proving the disabled-check didn't swallow it).
+        let collect = handle_tool_call(
+            &json!({ "name": COLLECT_REVIEW, "arguments": {} }),
+            &config,
+            &mut active,
+        );
+        assert_eq!(collect["isError"], true);
+        assert_eq!(collect["content"][0]["text"], "no open review");
+    }
+
+    #[test]
+    fn unknown_tool_names_still_report_unknown_not_disabled() {
+        let config = Config::default();
+        let mut active: Option<ActiveReview> = None;
+        let err = handle_tool_call(&json!({ "name": "fly" }), &config, &mut active);
+        assert_eq!(err["content"][0]["text"], "unknown tool: fly");
+    }
+
+    #[test]
+    fn with_collect_review_disabled_the_show_changes_description_drops_the_nudge_promise() {
+        // The nudge can only be acted on through collect_review, so the
+        // promise must disappear along with it, even with notify_on_verdict
+        // still on. Config validation refuses show_changes without
+        // collect_review, so this state cannot come from a config file; the
+        // descriptor gate is kept as defense in depth and pinned here via a
+        // directly-constructed Config.
+        let config = Config {
+            enabled_tools: Some(vec![SHOW_CHANGES.to_string()]),
+            ..Config::default()
+        };
+        let tools = enabled_tool_descriptors(&config);
+        let desc = tools
+            .iter()
+            .find(|t| t["name"] == SHOW_CHANGES)
+            .and_then(|t| t["description"].as_str())
+            .unwrap();
+        assert!(!desc.contains("[herdr-annotator]"), "{desc}");
     }
 
     #[test]

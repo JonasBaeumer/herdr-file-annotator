@@ -18,6 +18,7 @@ herdr plugin config-dir jonasbaeumer.file-annotator
 | `review_timeout_secs` | unset | If set, a review left open this long returns a `cancelled` verdict |
 | `notify_on_verdict` | `true` | Nudge the agent (a short prompt typed into its pane) when a non-blocking review finishes with no `collect_review` waiting — see [MCP tools](mcp-tools.md#automatic-continuation-the-verdict-nudge) |
 | `wrap_lines` | `false` | Start the pane with long lines wrapped to the pane width instead of clipped-and-pannable — `w` toggles it live either way, see [Controls](controls.md#diff-view) |
+| `enabled_tools` | unset | Limit which review tools the agent can call; unset loads all tools by default — see [Enabled tools](#enabled-tools) below |
 | `[keys]` | all defaults | Remap the pane's keybindings by action name — see [Custom keybindings](#custom-keybindings) below |
 
 Example — open reviews as a tab, and auto-cancel anything left open for an
@@ -27,6 +28,23 @@ hour:
 placement = "tab"
 review_timeout_secs = 3600
 ```
+
+## Enabled tools
+
+All five review tools (`review_changes`, `show_changes`, `goto`, `focus`,
+`collect_review`) are available to the agent by default. Set `enabled_tools`
+to limit it to the ones you name:
+
+```toml
+enabled_tools = ["show_changes", "goto", "collect_review"]
+```
+
+A disabled tool is hidden from the agent and a direct call to one is
+rejected. The list must contain only known tool names, with no duplicates,
+and `show_changes` requires `collect_review` (a guided review's verdict is
+only retrievable through `collect_review`, so naming one without the other
+would strand the review) — anything else prints one warning and the full
+defaults apply, like every other bad config value.
 
 The config is read when the MCP server starts, so changes apply after
 restarting your agent (or reconnecting its MCP servers — `/mcp` in Claude

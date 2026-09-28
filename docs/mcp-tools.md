@@ -29,6 +29,10 @@ Only one review — blocking or guided — can be open at a time: `review_change
 and `show_changes` each refuse to start a second one, and `goto` / `focus` /
 `collect_review` refuse to run without one already open.
 
+All five tools are available by default; the `enabled_tools` config option
+limits the agent to the ones you name — see
+[Configuration](configuration.md#enabled-tools).
+
 ## Verdict result
 
 JSON in the tool response from `review_changes`, or from a `collect_review`
