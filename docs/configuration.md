@@ -12,7 +12,7 @@ herdr plugin config-dir jonasbaeumer.file-annotator
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `placement` | `"split"` | `split` (beside the agent) or `tab` |
-| `direction` | `"right"` | Split direction: `right` or `down` |
+| `direction` | `"right"` | Split direction: `right`, `down`, or `auto` — right when the agent pane is at least twice as wide as tall in cells (roughly landscape, since a cell is about twice as tall as wide), down otherwise, decided each time a review opens |
 | `focus` | `true` | Move keyboard focus to the review pane when it opens |
 | `accept_timeout_secs` | `20` | How long the agent waits for the pane to appear |
 | `review_timeout_secs` | unset | If set, a review left open this long returns a `cancelled` verdict |

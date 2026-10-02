@@ -44,6 +44,8 @@ pub enum Placement {
 pub enum SplitDirection {
     Right,
     Down,
+    /// Right or down, chosen from the agent pane's shape each time a review opens.
+    Auto,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +166,8 @@ fn validate(raw: RawConfig) -> Result<Config, String> {
         None => default.direction,
         Some("right") => SplitDirection::Right,
         Some("down") => SplitDirection::Down,
-        Some(other) => return Err(format!("unknown direction {other:?} (expected \"right\" or \"down\")")),
+        Some("auto") => SplitDirection::Auto,
+        Some(other) => return Err(format!("unknown direction {other:?} (expected \"right\", \"down\" or \"auto\")")),
     };
 
     let focus = raw.focus.unwrap_or(default.focus);
@@ -387,6 +390,12 @@ mod tests {
     fn rejects_unknown_placement() {
         let raw: RawConfig = toml::from_str(r#"placement = "float""#).unwrap();
         assert!(validate(raw).is_err());
+    }
+
+    #[test]
+    fn parses_auto_direction() {
+        let raw: RawConfig = toml::from_str(r#"direction = "auto""#).unwrap();
+        assert_eq!(validate(raw).unwrap().direction, SplitDirection::Auto);
     }
 
     #[test]
