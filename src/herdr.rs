@@ -137,6 +137,7 @@ pub fn open_review_pane(socket_path: &str, config: &Config) -> Result<()> {
             let direction = match config.direction {
                 SplitDirection::Right => "right",
                 SplitDirection::Down => "down",
+                SplitDirection::Auto => auto_direction(&pane_id)?,
             };
             cmd.args(["--placement", "split", "--target-pane", &pane_id, "--direction", direction]);
         }
@@ -162,6 +163,48 @@ pub fn open_review_pane(socket_path: &str, config: &Config) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// A terminal cell is about twice as tall as it is wide (the exact ratio is a
+/// property of the font, which herdr does not report), so a pane is roughly
+/// landscape once `width >= height * CELL_ASPECT` in cells.
+const CELL_ASPECT: u64 = 2;
+
+/// Split along the pane's longer side, approximately: halving the long side
+/// keeps both halves closer to square than halving the short one.
+fn direction_for(width: u64, height: u64) -> &'static str {
+    if width >= height * CELL_ASPECT {
+        "right"
+    } else {
+        "down"
+    }
+}
+
+/// Measured when the review opens rather than at startup: the same agent pane
+/// is landscape on one screen and portrait on another.
+fn auto_direction(pane_id: &str) -> Result<&'static str> {
+    let output = Command::new(herdr_bin())
+        .args(["pane", "layout", "--pane", pane_id])
+        .output()
+        .context("spawning herdr CLI for pane layout")?;
+    if !output.status.success() {
+        bail!(
+            "`herdr pane layout --pane {pane_id}` failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let layout: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parsing `herdr pane layout --pane {pane_id}` output"))?;
+    let rect = layout["result"]["layout"]["panes"]
+        .as_array()
+        .and_then(|panes| panes.iter().find(|p| p["pane_id"] == pane_id))
+        .map(|p| &p["rect"])
+        .with_context(|| format!("pane {pane_id} missing from `herdr pane layout` output"))?;
+    let (Some(width), Some(height)) = (rect["width"].as_u64(), rect["height"].as_u64()) else {
+        bail!("pane {pane_id} has no width/height in `herdr pane layout` output: {rect}");
+    };
+    Ok(direction_for(width, height))
 }
 
 #[cfg(test)]
@@ -323,6 +366,120 @@ pub(crate) mod tests {
         std::env::remove_var("HERDR_BIN_PATH");
         assert!(report.is_err(), "nonzero exit must be Err so the caller can log it");
         assert!(release.is_err(), "nonzero exit must be Err so the caller can log it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A herdr stand-in that answers `pane layout` with `layout_stdout` and
+    /// `layout_exit`, exits 0 for every other command, and logs every argv.
+    fn fake_layout_herdr(dir: &Path, layout_stdout: &str, layout_exit: i32) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all(dir).unwrap();
+        let log = dir.join("argv.log");
+        let script = dir.join("herdr-fake.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = 'pane layout' ]; then\n  printf '%s\\n' '{}'\n  exit {}\nfi\nexit 0\n",
+                log.display(),
+                layout_stdout,
+                layout_exit
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, log)
+    }
+
+    /// `pane layout` output with `w:p1` at the given size, next to an
+    /// unrelated pane so the lookup has to pick by id.
+    fn layout_json(width: u64, height: u64) -> String {
+        format!(
+            r#"{{"result":{{"layout":{{"panes":[{{"pane_id":"w:p9","rect":{{"x":0,"y":0,"width":1,"height":1}}}},{{"pane_id":"w:p1","rect":{{"x":0,"y":0,"width":{width},"height":{height}}}}}]}}}}}}"#
+        )
+    }
+
+    fn auto_config() -> Config {
+        Config { direction: SplitDirection::Auto, ..Config::default() }
+    }
+
+    #[test]
+    fn direction_follows_the_cell_ratio() {
+        assert_eq!(direction_for(300, 80), "right");
+        assert_eq!(direction_for(160, 80), "right", "exactly CELL_ASPECT:1 splits right");
+        assert_eq!(direction_for(159, 80), "down");
+        assert_eq!(direction_for(137, 160), "down");
+    }
+
+    #[test]
+    fn auto_direction_measures_the_named_pane() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-layout-{}", std::process::id()));
+        let (script, _log) = fake_layout_herdr(&dir, &layout_json(300, 80), 0);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        let wide = auto_direction("w:p1");
+        let missing = auto_direction("w:p2");
+        std::env::remove_var("HERDR_BIN_PATH");
+
+        assert_eq!(wide.unwrap(), "right");
+        assert!(missing.is_err(), "an unknown pane must be an error, not a guess");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_direction_rejects_unusable_layout_output() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cases = [
+            ("not json", 0),
+            (r#"{"result":{"layout":{"panes":[{"pane_id":"w:p1","rect":{"x":0,"y":0}}]}}}"#, 0),
+            (r#"{"error":{"code":"pane_not_found","message":"pane not found"}}"#, 1),
+        ];
+        for (i, (stdout, exit)) in cases.iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!("annot-layout-bad{i}-{}", std::process::id()));
+            let (script, _log) = fake_layout_herdr(&dir, stdout, *exit);
+            std::env::set_var("HERDR_BIN_PATH", &script);
+            let result = auto_direction("w:p1");
+            std::env::remove_var("HERDR_BIN_PATH");
+            assert!(result.is_err(), "case {i} ({stdout}) must be Err, not a default direction");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn auto_split_passes_the_measured_direction_to_pane_open() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-auto-open-{}", std::process::id()));
+        let (script, log) = fake_layout_herdr(&dir, &layout_json(137, 160), 0);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        std::env::set_var("HERDR_PANE_ID", "w:p1");
+        let result = open_review_pane("/tmp/sock", &auto_config());
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_BIN_PATH");
+
+        assert!(result.is_ok(), "{result:?}");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(lines[0], "pane layout --pane w:p1");
+        assert!(
+            lines[1].starts_with("plugin pane open ") && lines[1].contains("--target-pane w:p1 --direction down"),
+            "unexpected pane open argv: {}",
+            lines[1]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_split_opens_no_pane_when_the_layout_call_fails() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("annot-auto-fail-{}", std::process::id()));
+        let (script, log) = fake_layout_herdr(&dir, "", 1);
+        std::env::set_var("HERDR_BIN_PATH", &script);
+        std::env::set_var("HERDR_PANE_ID", "w:p1");
+        let result = open_review_pane("/tmp/sock", &auto_config());
+        std::env::remove_var("HERDR_PANE_ID");
+        std::env::remove_var("HERDR_BIN_PATH");
+
+        assert!(result.is_err(), "a failed measurement must fail the open");
+        let argv = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(argv.trim(), "pane layout --pane w:p1", "no pane may be opened after it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
