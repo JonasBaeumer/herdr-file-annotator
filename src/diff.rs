@@ -167,22 +167,10 @@ pub fn load(working_dir: &str, baseline: Option<&str>) -> Result<DiffModel> {
     if ls_files_output.status.success() {
         let listing = String::from_utf8_lossy(&ls_files_output.stdout).into_owned();
         for path in listing.lines().filter(|l| !l.is_empty()) {
-            let out = match git(
-                working_dir,
-                &["diff", "--no-color", "--no-index", "--", "/dev/null", path],
-            ) {
-                Ok(out) => out,
-                Err(_) => continue,
+            let text = match untracked_diff_text(working_dir, path) {
+                Some(text) => text,
+                None => continue,
             };
-            // `--no-index` exits 1 when a diff was produced (the expected
-            // case here); anything else (missing file, permission error)
-            // means we should just skip this one file rather than fail the
-            // whole load.
-            let code = out.status.code();
-            if code != Some(1) && code != Some(0) {
-                continue;
-            }
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
             let parsed = match parse_unified(&text) {
                 Ok(parsed) => parsed,
                 Err(_) => continue,
@@ -195,6 +183,94 @@ pub fn load(working_dir: &str, baseline: Option<&str>) -> Result<DiffModel> {
     }
 
     Ok(DiffModel { files })
+}
+
+/// How long a non-regular untracked path's diff may run. For a symlink it
+/// is only the link target's text, so it ends at once unless git followed
+/// the link into a pipe.
+const SPECIAL_DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The all-added pseudo-diff for one untracked path, or None to skip it.
+///
+/// `git diff --no-index` reads a FIFO's contents, following a symlink to
+/// reach one. An untracked FIFO, or a link that resolves through
+/// `/proc/self/fd` to one of git's own pipes (an unpacked root filesystem
+/// has `dev/stdout -> fd/1`), blocks git forever, and the pane would never
+/// draw. A FIFO is skipped. A `/proc/self` link resolves in git's process,
+/// not this one, so any other non-regular path is diffed with a time limit
+/// and skipped if git is still running. A regular file is diffed as before.
+fn untracked_diff_text(working_dir: &str, path: &str) -> Option<String> {
+    let meta = std::fs::symlink_metadata(Path::new(working_dir).join(path)).ok();
+    if meta.as_ref().is_some_and(is_fifo) {
+        return None;
+    }
+    let (code, stdout) = if meta.as_ref().map_or(true, |m| m.is_file()) {
+        let out = git(
+            working_dir,
+            &["diff", "--no-color", "--no-index", "--", "/dev/null", path],
+        )
+        .ok()?;
+        (out.status.code(), out.stdout)
+    } else {
+        git_untracked_diff_timed(working_dir, path)?
+    };
+    // `--no-index` exits 1 when a diff was produced (the expected case
+    // here); anything else (missing file, permission error) means we should
+    // just skip this one file rather than fail the whole load.
+    if code != Some(1) && code != Some(0) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// Run `git diff --no-index -- /dev/null <path>`, killing it after
+/// `SPECIAL_DIFF_TIMEOUT`. stderr goes to /dev/null, so a link to git's
+/// own fd 2 reads /dev/null rather than a pipe.
+///
+/// Return None when git could not be started or was killed.
+fn git_untracked_diff_timed(working_dir: &str, path: &str) -> Option<(Option<i32>, Vec<u8>)> {
+    use std::process::Stdio;
+
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(working_dir)
+        .args(["diff", "--no-color", "--no-index", "--", "/dev/null", path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    // stdout reaches EOF when git exits (or is killed), so its read
+    // finishing is the signal that git is done.
+    match rx.recv_timeout(SPECIAL_DIFF_TIMEOUT) {
+        Ok(buf) => {
+            let status = child.wait().ok()?;
+            Some((status.code(), buf))
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_fifo(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    meta.file_type().is_fifo()
+}
+
+#[cfg(not(unix))]
+fn is_fifo(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Source view refuses to load a file larger than this: reading, copying
@@ -1011,6 +1087,137 @@ index 1111111..2222222 100644
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// Run `load` on another thread so a regression that blocks it fails
+    /// the test instead of hanging the suite. On a timeout, `fifo` (if any)
+    /// is opened for writing, which releases a git child blocked reading it
+    /// instead of leaving that process behind.
+    fn load_within(wd: &str, secs: u64, fifo: Option<&Path>) -> DiffModel {
+        let wd = wd.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(load(&wd, None));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+            Ok(result) => result.expect("load should succeed"),
+            Err(_) => {
+                if let Some(fifo) = fifo {
+                    let _ = std::fs::OpenOptions::new().write(true).open(fifo);
+                }
+                panic!("load blocked on an untracked special file");
+            }
+        }
+    }
+
+    fn mkfifo(path: &Path) {
+        let status = Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+    }
+
+    #[test]
+    fn load_untracked_symlink_shows_its_target() {
+        let repo = TempRepo::new("untracked_symlink");
+        repo.write("tracked.txt", "x\n");
+        repo.commit_all("initial commit");
+        std::os::unix::fs::symlink("some/target", repo.path.join("link")).expect("symlink");
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let model = load_within(&wd, 10, None);
+        let link = model
+            .files
+            .iter()
+            .find(|f| f.path == "link")
+            .expect("untracked symlink is listed");
+        assert_eq!(link.status, FileStatus::Untracked);
+        assert!(link.hunks.iter().any(|h| h
+            .lines
+            .iter()
+            .any(|l| l.origin == Origin::Add && l.content == "some/target")));
+    }
+
+    #[test]
+    fn load_untracked_symlink_target_with_newlines_stays_one_file() {
+        let repo = TempRepo::new("untracked_symlink_nl");
+        repo.write("tracked.txt", "x\n");
+        repo.commit_all("initial commit");
+        std::os::unix::fs::symlink("x\ndiff --git a/evil b/evil", repo.path.join("nl_link"))
+            .expect("symlink");
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let model = load_within(&wd, 10, None);
+        let paths: Vec<&str> = model.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["nl_link"], "only the link itself is listed");
+    }
+
+    #[test]
+    fn load_untracked_fifo_and_link_to_it_do_not_block() {
+        let repo = TempRepo::new("untracked_fifo");
+        repo.write("tracked.txt", "x\n");
+        repo.commit_all("initial commit");
+        mkfifo(&repo.path.join("pipe"));
+        // git follows this link into the FIFO and blocks, so it is given up on.
+        std::os::unix::fs::symlink("pipe", repo.path.join("to_pipe")).expect("symlink");
+        repo.write("new_file.txt", "brand new content\n");
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let model = load_within(&wd, 10, Some(&repo.path.join("pipe")));
+        let paths: Vec<&str> = model.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(!paths.contains(&"pipe"), "a FIFO is skipped: {paths:?}");
+        assert!(
+            !paths.contains(&"to_pipe"),
+            "a link to a FIFO is skipped: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"new_file.txt"),
+            "regular files still load: {paths:?}"
+        );
+    }
+
+    /// The /proc/self scenario needs procfs, so this test is Linux-only.
+    /// The hang-and-release mechanics it shares with other special files
+    /// are covered on every platform by
+    /// `load_untracked_fifo_and_link_to_it_do_not_block`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_untracked_proc_self_links_do_not_block() {
+        let repo = TempRepo::new("untracked_proc_self");
+        repo.write("tracked.txt", "x\n");
+        repo.commit_all("initial commit");
+        // As in an unpacked root filesystem: these resolve to git's own fds,
+        // whatever this process's fds are.
+        std::fs::create_dir(repo.path.join("dev")).expect("mkdir dev");
+        std::os::unix::fs::symlink("/proc/self/fd", repo.path.join("dev/fd")).expect("symlink");
+        std::os::unix::fs::symlink("fd/1", repo.path.join("dev/stdout")).expect("symlink");
+        std::os::unix::fs::symlink("fd/2", repo.path.join("dev/stderr")).expect("symlink");
+        repo.write("new_file.txt", "brand new content\n");
+
+        let wd = repo.path.to_str().expect("utf8 path").to_string();
+        let limit = SPECIAL_DIFF_TIMEOUT.as_secs() * 5;
+        let model = load_within(&wd, limit, None);
+        let paths: Vec<&str> = model.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            paths.contains(&"new_file.txt"),
+            "regular files still load: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"dev/stdout"),
+            "a link to git's stdout pipe is given up on: {paths:?}"
+        );
+        // git's stderr is /dev/null, so this link is shown as a link,
+        // whatever this process's stderr is.
+        let stderr = model
+            .files
+            .iter()
+            .find(|f| f.path == "dev/stderr")
+            .expect("dev/stderr is listed");
+        assert!(stderr.hunks.iter().any(|h| h
+            .lines
+            .iter()
+            .any(|l| l.origin == Origin::Add && l.content == "fd/2")));
     }
 
     #[test]
