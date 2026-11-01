@@ -2134,7 +2134,13 @@ impl<'a> App<'a> {
         match mouse.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let down = matches!(mouse.kind, MouseEventKind::ScrollDown);
-                if in_nav {
+                // Shift+wheel is the conventional horizontal scroll for mice
+                // without a tilt wheel.
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    if in_diff {
+                        self.wheel_pan(down, term_size);
+                    }
+                } else if in_nav {
                     let len = self.nav_rows().len();
                     if len == 0 {
                         return;
@@ -2203,20 +2209,26 @@ impl<'a> App<'a> {
             }
             // Up(Left) is handled unconditionally at the top of this
             // function, before the modal gates.
-            MouseEventKind::ScrollRight => {
-                if in_diff && !self.wrap {
-                    self.diff.hscroll = self
-                        .next_pan_stop(self.diff.hscroll, self.pan_step(term_size))
-                        .min(self.pan_cap());
-                }
-            }
-            MouseEventKind::ScrollLeft => {
-                if in_diff && !self.wrap {
-                    self.diff.hscroll = self.diff.hscroll.saturating_sub(self.pan_step(term_size));
+            MouseEventKind::ScrollRight | MouseEventKind::ScrollLeft => {
+                if in_diff {
+                    self.wheel_pan(matches!(mouse.kind, MouseEventKind::ScrollRight), term_size);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Horizontal wheel over the diff; a no-op in wrap mode.
+    fn wheel_pan(&mut self, right: bool, term_size: Size) {
+        if self.wrap {
+            return;
+        }
+        let step = self.pan_step(term_size);
+        self.diff.hscroll = if right {
+            self.next_pan_stop(self.diff.hscroll, step).min(self.pan_cap())
+        } else {
+            self.diff.hscroll.saturating_sub(step)
+        };
     }
 
     /// Wheel over the diff: move the viewport, and drag the cursor along
@@ -2706,7 +2718,7 @@ impl<'a> App<'a> {
                 current: false,
                 rows: vec![
                     HelpRow::new("wheel", "scroll the files or the diff"),
-                    HelpRow { key: "horiz. wheel".to_string(), desc: format!("pan the diff{pan_note}") },
+                    HelpRow { key: "shift+wheel / horiz. wheel".to_string(), desc: format!("pan the diff{pan_note}") },
                     HelpRow::new("click", "select a file / move the cursor"),
                     HelpRow::new("drag", "select a range in the diff"),
                     HelpRow::new("drag the divider", "resize the file list"),
@@ -7753,5 +7765,27 @@ mod tests {
         assert!(!app.wrap);
         app.handle_key(right, term);
         assert!(app.diff.hscroll > 0, "leaving wrap re-enables panning");
+    }
+
+    #[test]
+    fn shift_wheel_pans_the_diff_horizontally() {
+        let (request, model) = long_line_fixture();
+        let mut app = long_line_app(&request, &model);
+        let term = Size { width: 60, height: 20 };
+        let (_, diff) = body_rects(term, app.show_navigator, app.nav_width);
+        let (col, row) = (diff.x + 2, diff.y + 2);
+        let shift = |kind| MouseEvent { kind, column: col, row, modifiers: KeyModifiers::SHIFT };
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, col, row), term);
+        assert_eq!(app.diff.hscroll, 0, "a plain wheel never pans");
+
+        let scroll = app.diff.scroll;
+        app.handle_mouse(shift(MouseEventKind::ScrollDown), term);
+        assert_eq!(app.diff.scroll, scroll, "shift+wheel must not also scroll vertically");
+        let panned = app.diff.hscroll;
+        assert!(panned > 0, "shift+wheel down pans right");
+
+        app.handle_mouse(shift(MouseEventKind::ScrollUp), term);
+        assert!(app.diff.hscroll < panned, "shift+wheel up pans back left");
     }
 }
