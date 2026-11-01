@@ -2136,10 +2136,8 @@ impl<'a> App<'a> {
                 let down = matches!(mouse.kind, MouseEventKind::ScrollDown);
                 // Shift+wheel is the conventional horizontal scroll for mice
                 // without a tilt wheel.
-                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-                    if in_diff {
-                        self.wheel_pan(down, term_size);
-                    }
+                if in_diff && mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.wheel_pan(down, term_size);
                 } else if in_nav {
                     let len = self.nav_rows().len();
                     if len == 0 {
@@ -7787,5 +7785,25 @@ mod tests {
 
         app.handle_mouse(shift(MouseEventKind::ScrollUp), term);
         assert!(app.diff.hscroll < panned, "shift+wheel up pans back left");
+    }
+
+    #[test]
+    fn shift_wheel_over_the_navigator_still_moves_the_file_cursor() {
+        let request = sample_request();
+        let mut other = sample_file();
+        other.path = "src/other.rs".to_string();
+        let model: Result<DiffModel> = Ok(DiffModel { files: vec![sample_file(), other] });
+        let mut app = App::new(&request, &model);
+        let size = Size::new(120, 40);
+        let (nav, _) = body_rects(size, app.show_navigator, app.nav_width);
+        let before = app.nav_cursor;
+        let ev = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: nav.x + 2,
+            row: nav.y + 2,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        app.handle_mouse(ev, size);
+        assert_eq!(app.nav_cursor, before + 1);
     }
 }
