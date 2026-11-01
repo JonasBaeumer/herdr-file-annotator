@@ -43,15 +43,15 @@ Mouse: wheel moves the cursor, click opens a file or toggles a folder.
 | `g` / `G` | jump to top / bottom |
 | `h` / `Tab` | back to the file list |
 
-Mouse: wheel scrolls, horizontal wheel pans, click places the cursor, drag
+Mouse: wheel scrolls, shift+wheel or a horizontal wheel pans, click places the cursor, drag
 selects a range.
 
 Long lines clip with `‹` / `…` markers at the edges; pan to see the rest,
 or press `w` to wrap them to the pane width instead. Wrapped continuation
 lines are indented behind the line-number gutter, so code columns stay
 aligned and the cursor, annotations, and clicks keep addressing the whole
-logical line. While wrapped, panning is inactive (both the keys and the
-horizontal wheel) — `w` again returns to clip-and-pan. To start every review wrapped, set `wrap_lines = true` in
+logical line. While wrapped, panning is inactive (the keys, shift+wheel, and
+the horizontal wheel) — `w` again returns to clip-and-pan. To start every review wrapped, set `wrap_lines = true` in
 the [configuration](configuration.md).
 
 ## Annotating
